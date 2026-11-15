@@ -153,7 +153,7 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 			return fmt.Errorf("video2dvd: title %d VOB has an invalid sector count", i+1)
 		}
 		vobSectors := uint32(vobInfo.Size() / DVDVOBSectorSize)
-		ifo, ifoSectors, err := buildDVDVTSIFO(title, profile, records, vobSectors, menuSectors, menuRecords)
+		ifo, ifoSectors, err := buildDVDVTSIFO(title, profile, records, vobSectors, menuSectors, menuRecords, i, len(titles))
 		if err != nil {
 			return fmt.Errorf("video2dvd: build title %d IFO: %w", i+1, err)
 		}
@@ -198,7 +198,7 @@ func validateAuthoringProfile(profile Profile) error {
 	return nil
 }
 
-func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord, vobSectors, menuSectors uint32, menuRecords []dvdVOBURecord) ([]byte, uint32, error) {
+func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord, vobSectors, menuSectors uint32, menuRecords []dvdVOBURecord, titleIndex, titleCount int) ([]byte, uint32, error) {
 	if len(records) == 0 || records[0].StartSector != 0 || records[len(records)-1].EndSector+1 != vobSectors {
 		return nil, 0, errors.New("VOBU records do not cover the title VOB")
 	}
@@ -253,7 +253,11 @@ func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord
 	binary.BigEndian.PutUint16(ptt[14:16], 1) // PGN
 	copy(ifo[DVDVOBSectorSize:], ptt)
 
-	pgc := buildDVDVTSProgramChain(playbackTime, records, vobSectors, dvdJumpMenuCommand())
+	post := [][8]byte{dvdJumpMenuCommand()}
+	if titleIndex < titleCount-1 {
+		post = append([][8]byte{dvdConditionalJumpTitleCommand(titleIndex + 2)}, post...)
+	}
+	pgc := buildDVDVTSProgramChain(playbackTime, records, vobSectors, post...)
 	pgci := make([]byte, 16+len(pgc))
 	binary.BigEndian.PutUint16(pgci[0:2], 1)
 	binary.BigEndian.PutUint32(pgci[4:8], uint32(len(pgci)-1))
@@ -299,9 +303,9 @@ func copyFile(src, dst string) error {
 	return closeErr
 }
 
-func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobSectors uint32, postCommand [8]byte) []byte {
+func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobSectors uint32, postCommands ...[8]byte) []byte {
 	const headerSize = 0xec
-	const commandTableSize = 16
+	commandTableSize := 8 + len(postCommands)*8
 	const programMapSize = 2 // one program cell number, padded to an even byte count.
 	const cellPlaybackSize = 24
 	const cellPositionSize = 4
@@ -310,12 +314,14 @@ func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobS
 	copy(pgc[4:8], playbackTime[:])
 	pgc[0x0c] = 0x80 // first LPCM stream is available on private_stream_1 substream 0.
 	binary.BigEndian.PutUint16(pgc[0x00e4:0x00e6], headerSize)
-	binary.BigEndian.PutUint16(pgc[0x00e6:0x00e8], headerSize+commandTableSize)
-	binary.BigEndian.PutUint16(pgc[0x00e8:0x00ea], headerSize+commandTableSize+programMapSize)
-	binary.BigEndian.PutUint16(pgc[0x00ea:0x00ec], headerSize+commandTableSize+programMapSize+cellPlaybackSize)
+	binary.BigEndian.PutUint16(pgc[0x00e6:0x00e8], uint16(headerSize+commandTableSize))
+	binary.BigEndian.PutUint16(pgc[0x00e8:0x00ea], uint16(headerSize+commandTableSize+programMapSize))
+	binary.BigEndian.PutUint16(pgc[0x00ea:0x00ec], uint16(headerSize+commandTableSize+programMapSize+cellPlaybackSize))
 	commandTable := pgc[headerSize : headerSize+commandTableSize]
-	binary.BigEndian.PutUint16(commandTable[2:4], 1) // one post-command.
-	copy(commandTable[8:16], postCommand[:])
+	binary.BigEndian.PutUint16(commandTable[2:4], uint16(len(postCommands)))
+	for i, command := range postCommands {
+		copy(commandTable[8+i*8:16+i*8], command[:])
+	}
 	pgc[headerSize+commandTableSize] = 1
 	cell := pgc[headerSize+commandTableSize+programMapSize:]
 	copy(cell[4:8], playbackTime[:])
@@ -443,8 +449,8 @@ func buildDVDVMGMenuPGCI(menuSectors uint32, menuTime [4]byte, menuRecords []dvd
 		pageCount = 1
 		menuRecords = []dvdVOBURecord{{StartSector: 0, EndSector: menuSectors - 1}}
 	}
-	pgcs := make([][]byte, pageCount)
-	for page := range pgcs {
+	pgcs := make([][]byte, 0, pageCount+1)
+	for page := 0; page < pageCount; page++ {
 		pgc := make([]byte, 0xec+16+2+24+4)
 		pgc[2], pgc[3] = 1, 1
 		pgc[0x0c] = 0x80
@@ -464,16 +470,31 @@ func buildDVDVMGMenuPGCI(menuSectors uint32, menuTime [4]byte, menuRecords []dvd
 		binary.BigEndian.PutUint32(cell[20:24], menuRecords[page].EndSector)
 		binary.BigEndian.PutUint16(cell[24:26], 1)
 		cell[27] = 1
-		pgcs[page] = pgc
+		pgcs = append(pgcs, pgc)
 	}
-	luSize := 8 + 8*pageCount
+	// Dedicated PLAY ALL PGC: set GPRM0 and jump to title 1.
+	playAll := make([]byte, 0xec+24)
+	playAll[2], playAll[3] = 1, 1
+	binary.BigEndian.PutUint16(playAll[0x00e4:0x00e6], 0xec)
+	binary.BigEndian.PutUint16(playAll[0x00e6:0x00e8], 0x104)
+	binary.BigEndian.PutUint16(playAll[0x00e8:0x00ea], 0x104)
+	binary.BigEndian.PutUint16(playAll[0x00ea:0x00ec], 0x104)
+	commands := playAll[0xec:0x104]
+	binary.BigEndian.PutUint16(commands[0:2], 2)
+	setPlayAll := dvdSetPlayAllCommand()
+	jumpFirst := dvdJumpTitleCommand(1)
+	copy(commands[8:16], setPlayAll[:])
+	copy(commands[16:24], jumpFirst[:])
+	pgcs = append(pgcs, playAll)
+	pgcCount := len(pgcs)
+	luSize := 8 + 8*pgcCount
 	for _, pgc := range pgcs {
 		luSize += len(pgc)
 	}
 	lu := make([]byte, luSize)
-	binary.BigEndian.PutUint16(lu[0:2], uint16(pageCount))
+	binary.BigEndian.PutUint16(lu[0:2], uint16(pgcCount))
 	binary.BigEndian.PutUint32(lu[4:8], uint32(len(lu)-1))
-	pos := 8 + 8*pageCount
+	pos := 8 + 8*pgcCount
 	for i, pgc := range pgcs {
 		entry := 8 + i*8
 		binary.BigEndian.PutUint32(lu[entry:entry+4], 0x80000000|uint32(i+2))

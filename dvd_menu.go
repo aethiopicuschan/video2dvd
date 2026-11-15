@@ -17,6 +17,7 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 	if profile.Aspect == AspectRatio16x9 {
 		maxButtons = 18
 	}
+	maxButtons-- // reserve PLAY ALL on the first page
 	// Two buttons are reserved for previous/next page navigation when the
 	// menu spans more than one page.
 	if len(titles) > maxButtons {
@@ -75,17 +76,23 @@ func makeDVDMenuButtons(start, end int, profile Profile, page, pageCount int) []
 	if pageCount > 1 {
 		controls = 2
 	}
-	buttons := make([]DVDNAVButton, end-start+controls)
-	if controls != 0 {
-		buttons[0] = DVDNAVButton{XStart: 48, YStart: 52, XEnd: 300, YEnd: 76, Up: 1, Down: 3, Left: 1, Right: 1, Command: linkPGCNCommand(page)}
-		buttons[1] = DVDNAVButton{XStart: 368, YStart: 52, XEnd: 704, YEnd: 76, Up: 2, Down: 4, Left: 2, Right: 2, Command: linkPGCNCommand((page + 1) % pageCount)}
+	playAll := 0
+	if page == 0 {
+		playAll = 1
 	}
-	for i := range buttons[controls:] {
-		index := i + controls
+	buttons := make([]DVDNAVButton, end-start+controls+playAll)
+	if playAll != 0 {
+		buttons[0] = DVDNAVButton{XStart: 48, YStart: 52, XEnd: 300, YEnd: 76, Up: 1, Down: 2, Left: 1, Right: 1, Command: linkPGCNCommand(pageCount)}
+	}
+	if controls != 0 {
+		base := playAll
+		buttons[base] = DVDNAVButton{XStart: 48, YStart: 52, XEnd: 300, YEnd: 76, Up: uint8(base + 1), Down: uint8(base + 3), Left: uint8(base + 1), Right: uint8(base + 1), Command: linkPGCNCommand(page)}
+		buttons[base+1] = DVDNAVButton{XStart: 368, YStart: 52, XEnd: 704, YEnd: 76, Up: uint8(base + 2), Down: uint8(base + 4), Left: uint8(base + 2), Right: uint8(base + 2), Command: linkPGCNCommand((page + 1) % pageCount)}
+	}
+	offset := controls + playAll
+	for i := range buttons[offset:] {
+		index := i + offset
 		column, row := i/18, i%18
-		if controls != 0 {
-			index = i + controls
-		}
 		up, down := index-1, index+1
 		if row == 0 {
 			up = i + 17
@@ -121,6 +128,13 @@ func makeDVDMenuButtons(start, end int, profile Profile, page, pageCount int) []
 func dvdJumpTitleCommand(titleNumber int) [8]byte {
 	return [8]byte{0x30, 0x02, 0, 0, 0, byte(titleNumber)}
 }
+
+// dvdConditionalJumpTitleCommand jumps when GPRM0 contains the PLAY ALL flag.
+func dvdConditionalJumpTitleCommand(titleNumber int) [8]byte {
+	return [8]byte{0x30, 0xa2, 0, 0, 0, byte(titleNumber), 0, 1}
+}
+
+func dvdSetPlayAllCommand() [8]byte { return [8]byte{0x71, 0, 0, 0, 0, 1, 0, 0} }
 
 func dvdJumpMenuCommand() [8]byte {
 	return [8]byte{0x30, 0x06, 0, 0, 0, 0x42}

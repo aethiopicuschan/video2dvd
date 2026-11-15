@@ -127,7 +127,7 @@ func TestDVDMenuPGCIContainsPagePGCs(t *testing.T) {
 	menu := buildDVDVMGMenuPGCI(20, [4]byte{0, 0, 1, 0xc0}, []dvdVOBURecord{
 		{StartSector: 0, EndSector: 9}, {StartSector: 10, EndSector: 19},
 	})
-	if len(menu) < 32 || binary.BigEndian.Uint16(menu[16:18]) != 2 {
+	if len(menu) < 32 || binary.BigEndian.Uint16(menu[16:18]) != 3 {
 		t.Fatalf("menu language unit page count is invalid")
 	}
 }
