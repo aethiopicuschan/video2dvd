@@ -102,7 +102,7 @@ func DecodeMP4Video(ctx context.Context, path string, trackIndex *int, handler f
 	}
 	pendingPTS = make(map[uint64]videoSampleTiming, 16)
 	firstAccessUnit := true
-	err = demuxMP4Reader(f, stat.Size(), func(sampleTrack TrackInfo, sample SampleInfo, data io.Reader) error {
+	_, err = demuxMP4Reader(f, stat.Size(), func(sampleTrack TrackInfo, sample SampleInfo, data io.Reader) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
