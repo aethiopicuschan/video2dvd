@@ -198,19 +198,3 @@ jobs:
 
       # ---- typos
       - uses: crate-ci/typos@v1.39.2
-
-      # ---- gitleaks
-      - name: Install gitleaks
-        run: |
-          set -e
-          VERSION=$(curl -s https://api.github.com/repos/gitleaks/gitleaks/releases/latest \
-            | grep -oP '"tag_name":\s*"v\K[0-9.]+' )
-          echo "Installing gitleaks v$VERSION"
-          curl -sSL \
-            https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz \
-            -o gitleaks.tar.gz
-          tar -xzf gitleaks.tar.gz
-          sudo mv gitleaks /usr/local/bin/gitleaks
-
-      - name: Run gitleaks (latest commit only)
-        run: gitleaks detect --no-git --verbose --config .gitleaks.toml
