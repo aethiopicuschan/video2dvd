@@ -21,7 +21,7 @@ const (
 // stream into VOBUs with NAV packs and fixed-size MPEG program-stream sectors.
 // The result does not include IFO/BUP files or complete DVD navigation tables.
 func MuxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.Writer) error {
-	return muxDVDTitleVOB(ctx, title, workDir, dst, nil)
+	return muxDVDTitleVOB(ctx, title, workDir, dst, nil, nil)
 }
 
 type dvdVOBURecord struct {
@@ -29,7 +29,7 @@ type dvdVOBURecord struct {
 	EndSector   uint32
 }
 
-func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.Writer, recordVOBU func(dvdVOBURecord) error) error {
+func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.Writer, recordVOBU func(dvdVOBURecord) error, buttonPages [][]DVDNAVButton) error {
 	if ctx == nil {
 		return errors.New("video2dvd: context must not be nil")
 	}
@@ -98,6 +98,7 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 	var groupSCR uint64
 	var referenceEnds [3]uint32
 	var referenceCount int
+	menuVOBUIndex := 0
 	startVOBU := func(start time.Duration) error {
 		startTicks, err := durationToMPEGTimestamp(start)
 		if err != nil {
@@ -136,6 +137,10 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 		if uint64(nextVOBUSector)+uint64(mediaSectors)+1 > dvdVOBMaxSectors {
 			return errors.New("video2dvd: VOB title exceeds the 1 GiB single-file limit")
 		}
+		var buttons []DVDNAVButton
+		if menuVOBUIndex < len(buttonPages) {
+			buttons = buttonPages[menuVOBUIndex]
+		}
 		nav, err := BuildDVDNAVPack(DVDNAVPackInfo{
 			SCRBase:                   groupSCR,
 			LogicalBlockNumber:        nextVOBUSector,
@@ -148,6 +153,7 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 			StartPTM:                  groupStartPTS,
 			EndPTM:                    groupEndPTS,
 			CellElapsedTime:           groupCellElapsed,
+			Buttons:                   buttons,
 		})
 		if err != nil {
 			return err
@@ -163,6 +169,7 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 				return err
 			}
 		}
+		menuVOBUIndex++
 		nextVOBUSector += mediaSectors + 1
 		return nil
 	}
