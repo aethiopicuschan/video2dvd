@@ -37,6 +37,7 @@ type TrackInfo struct {
 	SampleRate            int
 	Channels              int
 	Duration              time.Duration
+	DefaultDuration       time.Duration
 	TimeScale             uint32
 }
 

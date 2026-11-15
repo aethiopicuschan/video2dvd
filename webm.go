@@ -99,6 +99,9 @@ func probeWebMReader(r io.Reader) (MP4Info, error) {
 			Duration:    info.Duration,
 			TimeScale:   1_000_000_000,
 		}
+		if source.DefaultDurationNS > 0 {
+			track.DefaultDuration = time.Duration(source.DefaultDurationNS)
+		}
 		switch source.Type {
 		case webm.TrackVideo:
 			track.Kind = TrackKindVideo
@@ -209,15 +212,85 @@ func DecodeWebMVideo(ctx context.Context, path string, trackIndex *int, handler 
 		return decodeWebMVP9(ctx, path, track, handler)
 	}
 	if track.Codec == "vp8" || track.Codec == "av1" {
-		return decodeWebMWithGoAV(ctx, path, track.Index, true, func(frame *av.Frame) error {
+		resolver := newWebMFrameDurationResolver(track.DefaultDuration, handler)
+		err := decodeWebMWithGoAV(ctx, path, track.Index, true, func(frame *av.Frame) error {
 			decoded, err := copyGoAVVideoFrame(frame)
 			if err != nil {
 				return err
 			}
-			return handler(decoded)
+			return resolver.Push(decoded)
 		})
+		if err != nil {
+			return err
+		}
+		return resolver.Finish()
 	}
 	return fmt.Errorf("video2dvd: WebM video codec %q is not supported by the built-in decoder", track.Codec)
+}
+
+type webMFrameDurationResolver struct {
+	defaultDuration time.Duration
+	previous        time.Duration
+	pending         *DecodedVideoFrame
+	handler         func(DecodedVideoFrame) error
+}
+
+func newWebMFrameDurationResolver(defaultDuration time.Duration, handler func(DecodedVideoFrame) error) *webMFrameDurationResolver {
+	return &webMFrameDurationResolver{defaultDuration: defaultDuration, handler: handler}
+}
+
+func (r *webMFrameDurationResolver) Push(frame DecodedVideoFrame) error {
+	if frame.Duration > 0 {
+		r.previous = frame.Duration
+	}
+	if r.pending == nil {
+		owned := cloneDecodedVideoFrame(frame)
+		r.pending = &owned
+		return nil
+	}
+	if r.pending.Duration <= 0 {
+		delta := frame.PTS - r.pending.PTS
+		switch {
+		case delta > 0:
+			r.pending.Duration = delta
+		case r.defaultDuration > 0:
+			r.pending.Duration = r.defaultDuration
+		case r.previous > 0:
+			r.pending.Duration = r.previous
+		default:
+			return errors.New("video2dvd: WebM frame duration is missing and cannot be inferred from the next frame PTS")
+		}
+	}
+	if r.pending.Duration <= 0 {
+		return errors.New("video2dvd: WebM frame duration could not be inferred")
+	}
+	r.previous = r.pending.Duration
+	if err := r.handler(*r.pending); err != nil {
+		return err
+	}
+	owned := cloneDecodedVideoFrame(frame)
+	r.pending = &owned
+	return nil
+}
+
+func (r *webMFrameDurationResolver) Finish() error {
+	if r.pending == nil {
+		return nil
+	}
+	if r.pending.Duration <= 0 {
+		switch {
+		case r.defaultDuration > 0:
+			r.pending.Duration = r.defaultDuration
+		case r.previous > 0:
+			r.pending.Duration = r.previous
+		default:
+			return errors.New("video2dvd: final WebM frame duration is missing and cannot be inferred")
+		}
+	}
+	if r.pending.Duration <= 0 {
+		return errors.New("video2dvd: final WebM frame duration is not positive")
+	}
+	return r.handler(*r.pending)
 }
 
 // DecodeWebMAudio sends 48 kHz stereo Opus PCM chunks from a WebM file. The
@@ -265,6 +338,7 @@ func decodeWebMVP9(ctx context.Context, path string, track TrackInfo, handler fu
 	}
 	trackID := tracks[track.Index].ID
 	decoder := vp9decoder.New()
+	resolver := newWebMFrameDurationResolver(track.DefaultDuration, handler)
 	packet := webm.Packet{Data: make([]byte, 0, maxWebMPacketBytes)}
 	previousWidth, previousHeight := 0, 0
 	decodedFrames := 0
@@ -314,13 +388,16 @@ func decodeWebMVP9(ctx context.Context, path string, track TrackInfo, handler fu
 		if packet.Invisible || !header.ShowFrame && !header.ShowExistingFrame && !hasVP9Superframe(packet.Data) {
 			continue
 		}
-		if err := handler(decoded); err != nil {
+		if err := resolver.Push(decoded); err != nil {
 			return err
 		}
 		decodedFrames++
 	}
 	if decodedFrames == 0 {
 		return errors.New("video2dvd: WebM VP9 track contains no visible frames")
+	}
+	if err := resolver.Finish(); err != nil {
+		return err
 	}
 	return ctx.Err()
 }
