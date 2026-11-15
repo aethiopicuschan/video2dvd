@@ -20,7 +20,7 @@
 
 `NewInProcessEncoder` は外部コマンドを使わずMP4からMPEG-2映像とLPCM音声を生成します。現段階のMPEG-2エンコーダーは閉じたGOPにI/Pフレームを出力し、前フレームと完全一致するマクロブロックをPフレームで省略します。変更されたマクロブロックはイントラ符号化するため動き予測は行わず、単純な量子化とあわせて圧縮効率と画質は限定的です。一般的な品質の変換にはまだ使えません。
 
-`MuxDVDTitleVOB` は1タイトル分のMPEG-2映像とLPCM音声をPTS順に多重化し、VOB用の固定長セクター列を作ります。`MPEGProgramStreamWriter` と `DVDLPCMPacketWriter` はその下位部品です。IFO/BUPとDVD NAVパックを含むオーサリングは未実装で、これだけでは再生可能なDVDになりません。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
+`MuxDVDTitleVOB` は1タイトル分のMPEG-2映像とLPCM音声をPTS順に多重化し、Iフレームから始まるVOBUごとにPCI/DSI入りのNAVパックを置きます。`MPEGProgramStreamWriter` と `DVDLPCMPacketWriter` はその下位部品で、`BuildDVDNAVPack` はNAVパック単体を構築します。IFO/BUPとディスク全体のナビゲーションテーブル生成は未実装のため、これらの部品だけでは再生可能なDVDになりません。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
 
 ## バックエンドの接続
 

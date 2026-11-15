@@ -1,6 +1,7 @@
 package mp4todvd
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -11,9 +12,14 @@ import (
 	"time"
 )
 
+const (
+	dvdVOBMaxSectors   = (1<<30)/DVDVOBSectorSize - 1
+	dvdVOBUMaxDuration = time.Second
+)
+
 // MuxDVDTitleVOB combines one MPEG-2 elementary stream and one raw DVD LPCM
-// stream into fixed-size MPEG program-stream sectors. The result is a VOB
-// media stream, but does not contain DVD navigation packs or IFO files.
+// stream into VOBUs with NAV packs and fixed-size MPEG program-stream sectors.
+// The result does not include IFO/BUP files or complete DVD navigation tables.
 func MuxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.Writer) error {
 	if ctx == nil {
 		return errors.New("mp4todvd: context must not be nil")
@@ -55,7 +61,8 @@ func MuxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 	defer audioFile.Close()
 
 	pictures := mpeg2PictureReader{ctx: ctx, src: videoFile}
-	program, err := NewMPEGProgramStreamWriter(dst)
+	mediaBuffer := &bytes.Buffer{}
+	program, err := NewMPEGProgramStreamWriter(mediaBuffer)
 	if err != nil {
 		return err
 	}
@@ -67,8 +74,91 @@ func MuxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 	if videoErr != nil {
 		return videoErr
 	}
+	firstPictureType, err := mpeg2PictureType(videoPacket)
+	if err != nil || firstPictureType != 1 || !mpeg2PictureHasSequenceHeader(videoPacket) {
+		return errors.New("mp4todvd: the first MPEG-2 picture must be an I picture with a sequence header")
+	}
 	frameNumber := int64(0)
 	var audioSampleNumber int64
+	var nextVOBUSector uint32
+	var groupStartPTS uint32
+	var groupEndPTS uint32
+	var groupStartTime time.Duration
+	var groupEndTime time.Duration
+	var groupCellElapsed [4]byte
+	var groupSCR uint64
+	var referenceEnds [3]uint32
+	var referenceCount int
+	startVOBU := func(start time.Duration) error {
+		startTicks, err := durationToMPEGTimestamp(start)
+		if err != nil {
+			return err
+		}
+		groupCellElapsed, err = dvdCellElapsedTime(start, title.FrameRateNumerator, title.FrameRateDenominator)
+		if err != nil {
+			return err
+		}
+		if !program.started || startTicks > program.scr {
+			program.scr = startTicks
+		}
+		program.started = true
+		groupSCR = program.scr
+		groupStartPTS = uint32(startTicks)
+		groupEndPTS = groupStartPTS
+		groupStartTime = start
+		groupEndTime = start
+		referenceEnds = [3]uint32{math.MaxUint32, math.MaxUint32, math.MaxUint32}
+		referenceCount = 0
+		// Account for the NAV sector before writing the VOBU's media packs.
+		step := (uint64(DVDVOBSectorSize)*90_000 + uint64(program.muxRate)*50 - 1) / (uint64(program.muxRate) * 50)
+		program.scr += step
+		mediaBuffer = &bytes.Buffer{}
+		program.dst = mediaBuffer
+		return nil
+	}
+	flushVOBU := func() error {
+		if mediaBuffer.Len() == 0 || mediaBuffer.Len()%DVDVOBSectorSize != 0 {
+			return errors.New("mp4todvd: VOBU media is empty or not sector-aligned")
+		}
+		if groupEndTime < groupStartTime || groupEndTime-groupStartTime > dvdVOBUMaxDuration {
+			return errors.New("mp4todvd: MPEG-2 GOP exceeds the DVD VOBU duration limit")
+		}
+		mediaSectors := uint32(mediaBuffer.Len() / DVDVOBSectorSize)
+		if uint64(nextVOBUSector)+uint64(mediaSectors)+1 > dvdVOBMaxSectors {
+			return errors.New("mp4todvd: VOB title exceeds the 1 GiB single-file limit")
+		}
+		nav, err := BuildDVDNAVPack(DVDNAVPackInfo{
+			SCRBase:                   groupSCR,
+			LogicalBlockNumber:        nextVOBUSector,
+			VOBUEndAddress:            mediaSectors,
+			FirstReferenceEndAddress:  referenceEnds[0],
+			SecondReferenceEndAddress: referenceEnds[1],
+			ThirdReferenceEndAddress:  referenceEnds[2],
+			VOBID:                     1,
+			CellID:                    1,
+			StartPTM:                  groupStartPTS,
+			EndPTM:                    groupEndPTS,
+			CellElapsedTime:           groupCellElapsed,
+		})
+		if err != nil {
+			return err
+		}
+		if err := writeAll(dst, nav); err != nil {
+			return err
+		}
+		if err := writeAll(dst, mediaBuffer.Bytes()); err != nil {
+			return err
+		}
+		nextVOBUSector += mediaSectors + 1
+		return nil
+	}
+	firstVideoPTS, err := dvdVideoFramePTS(frameNumber, title.FrameRateNumerator, title.FrameRateDenominator)
+	if err != nil {
+		return err
+	}
+	if err := startVOBU(firstVideoPTS); err != nil {
+		return err
+	}
 	audioChunk, haveAudio, finalAudioChunk, err := readDVDLPCMAudioChunk(audioFile, audioSampleNumber)
 	if err != nil {
 		return err
@@ -90,7 +180,7 @@ func MuxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 				return err
 			}
 		}
-		if haveAudio && (videoPacket == nil || audioChunk.Start <= videoPTS) {
+		if haveAudio && (videoPacket == nil || audioChunk.Start < videoPTS) {
 			if err := audio.WriteChunk(audioChunk); err != nil {
 				return err
 			}
@@ -115,10 +205,50 @@ func MuxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 			}
 			continue
 		}
+		pictureType, err := mpeg2PictureType(videoPacket)
+		if err != nil {
+			return err
+		}
+		if pictureType == 3 {
+			return errors.New("mp4todvd: B pictures are not supported by the DVD VOB muxer")
+		}
+		if pictureType != 1 && pictureType != 2 {
+			return fmt.Errorf("mp4todvd: unsupported MPEG-2 picture type %d", pictureType)
+		}
+		if pictureType == 1 && frameNumber > 0 {
+			if !mpeg2PictureHasSequenceHeader(videoPacket) {
+				return errors.New("mp4todvd: each VOBU I picture must include a sequence header")
+			}
+			if err := flushVOBU(); err != nil {
+				return err
+			}
+			if err := startVOBU(videoPTS); err != nil {
+				return err
+			}
+		}
+		beforeSectors := uint32(mediaBuffer.Len() / DVDVOBSectorSize)
 
 		if err := program.WritePES(0xe0, videoPTS, videoPacket); err != nil {
 			return err
 		}
+		afterSectors := uint32(mediaBuffer.Len() / DVDVOBSectorSize)
+		if afterSectors <= beforeSectors {
+			return errors.New("mp4todvd: MPEG-2 picture did not produce a VOB sector")
+		}
+		if referenceCount < len(referenceEnds) {
+			referenceEnds[referenceCount] = afterSectors
+			referenceCount++
+		}
+		nextFramePTS, err := dvdVideoFramePTS(frameNumber+1, title.FrameRateNumerator, title.FrameRateDenominator)
+		if err != nil {
+			return err
+		}
+		endTicks, err := durationToMPEGTimestamp(nextFramePTS)
+		if err != nil {
+			return err
+		}
+		groupEndPTS = uint32(endTicks)
+		groupEndTime = nextFramePTS
 		frameNumber++
 		videoPacket, err = pictures.Next()
 		if err == io.EOF {
@@ -132,7 +262,10 @@ func MuxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 			return err
 		}
 	}
-	return program.Close()
+	if err := program.Close(); err != nil {
+		return err
+	}
+	return flushVOBU()
 }
 
 func validDVDFrameRate(numerator, denominator int) bool {
@@ -161,6 +294,36 @@ func dvdVideoFramePTS(frame int64, numerator, denominator int) (time.Duration, e
 		return 0, errors.New("mp4todvd: video timestamp overflows duration")
 	}
 	return time.Duration(wholeNanos + fractionNanos), nil
+}
+
+func dvdCellElapsedTime(elapsed time.Duration, numerator, denominator int) ([4]byte, error) {
+	if elapsed < 0 || !validDVDFrameRate(numerator, denominator) {
+		return [4]byte{}, errors.New("mp4todvd: invalid DVD cell elapsed time")
+	}
+	nominalRate := int64(30)
+	frameRateCode := byte(3) // 29.97 fps time-code family.
+	if numerator == 25 && denominator == 1 {
+		nominalRate = 25
+		frameRateCode = 1
+	}
+	totalSeconds := int64(elapsed / time.Second)
+	hours := totalSeconds / 3600
+	if hours > 99 {
+		return [4]byte{}, errors.New("mp4todvd: DVD cell elapsed time exceeds 99 hours")
+	}
+	minutes := totalSeconds / 60 % 60
+	seconds := totalSeconds % 60
+	frames := int64(elapsed%time.Second) * nominalRate / int64(time.Second)
+	return [4]byte{
+		toPackedBCD(hours),
+		toPackedBCD(minutes),
+		toPackedBCD(seconds),
+		frameRateCode<<6 | byte(frames),
+	}, nil
+}
+
+func toPackedBCD(value int64) byte {
+	return byte(value/10<<4 | value%10)
 }
 
 func readDVDLPCMAudioChunk(src io.Reader, sampleNumber int64) (PCMChunk, bool, bool, error) {
@@ -192,13 +355,32 @@ func readDVDLPCMAudioChunk(src io.Reader, sampleNumber int64) (PCMChunk, bool, b
 	}, true, err == io.ErrUnexpectedEOF, nil
 }
 
+func mpeg2PictureType(picture []byte) (uint32, error) {
+	start := findMPEGStartCode(picture, 0x00, 0)
+	if start < 0 {
+		return 0, errors.New("mp4todvd: MPEG-2 picture start code not found")
+	}
+	reader := bitReader{data: picture[start+4:]}
+	if _, err := reader.read(10); err != nil {
+		return 0, err
+	}
+	return reader.read(3)
+}
+
+func mpeg2PictureHasSequenceHeader(picture []byte) bool {
+	pictureStart := findMPEGStartCode(picture, 0x00, 0)
+	sequenceStart := findMPEGStartCode(picture, 0xb3, 0)
+	return sequenceStart >= 0 && pictureStart > sequenceStart
+}
+
 type mpeg2PictureReader struct {
-	ctx          context.Context
-	src          io.Reader
-	buffer       []byte
-	searchOffset int
-	foundPicture bool
-	finished     bool
+	ctx                 context.Context
+	src                 io.Reader
+	buffer              []byte
+	searchOffset        int
+	currentPictureStart int
+	foundPicture        bool
+	finished            bool
 }
 
 func (r *mpeg2PictureReader) Next() ([]byte, error) {
@@ -211,12 +393,27 @@ func (r *mpeg2PictureReader) Next() ([]byte, error) {
 		}
 		if start := findMPEGStartCode(r.buffer, 0x00, r.searchOffset); start >= 0 {
 			if r.foundPicture {
-				picture := append([]byte(nil), r.buffer[:start]...)
-				r.buffer = append(r.buffer[:0], r.buffer[start:]...)
-				r.searchOffset = 4
+				boundary := start
+				for _, code := range [...]byte{0xb3, 0xb8} {
+					preamble := findMPEGStartCode(r.buffer, code, r.currentPictureStart+4)
+					if preamble >= 0 && preamble < boundary {
+						boundary = preamble
+					}
+				}
+				picture := append([]byte(nil), r.buffer[:boundary]...)
+				r.buffer = append(r.buffer[:0], r.buffer[boundary:]...)
+				if boundary < start {
+					r.foundPicture = false
+					r.searchOffset = 0
+					r.currentPictureStart = 0
+				} else {
+					r.searchOffset = start - boundary + 4
+					r.currentPictureStart = 0
+				}
 				return picture, nil
 			}
 			r.foundPicture = true
+			r.currentPictureStart = start
 			r.searchOffset = start + 4
 			continue
 		}

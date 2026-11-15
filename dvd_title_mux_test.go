@@ -3,6 +3,7 @@ package mp4todvd
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"io"
 	"os"
 	"path/filepath"
@@ -62,13 +63,14 @@ func TestMuxDVDTitleVOBInterleavesVideoAndLPCM(t *testing.T) {
 		U:        bytes.Repeat([]byte{128}, profile.FrameWidth*profile.FrameHeight/4),
 		V:        bytes.Repeat([]byte{128}, profile.FrameWidth*profile.FrameHeight/4),
 	}
-	if err := encoder.WriteFrame(frame); err != nil {
-		t.Fatal(err)
-	}
-	frame = cloneDecodedVideoFrame(frame)
-	frame.Y[100*frame.Width+100] = 140
-	if err := encoder.WriteFrame(frame); err != nil {
-		t.Fatal(err)
+	for i := 0; i < 16; i++ {
+		if i == 1 {
+			frame = cloneDecodedVideoFrame(frame)
+			frame.Y[100*frame.Width+100] = 140
+		}
+		if err := encoder.WriteFrame(frame); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := encoder.Close(); err != nil {
 		t.Fatal(err)
@@ -99,7 +101,7 @@ func TestMuxDVDTitleVOBInterleavesVideoAndLPCM(t *testing.T) {
 		Height:               profile.FrameHeight,
 		FrameRateNumerator:   30000,
 		FrameRateDenominator: 1001,
-		Duration:             2 * time.Second * 1001 / 30000,
+		Duration:             16 * time.Second * 1001 / 30000,
 	}
 	var vob bytes.Buffer
 	if err := MuxDVDTitleVOB(context.Background(), title, workDir, &vob); err != nil {
@@ -110,10 +112,21 @@ func TestMuxDVDTitleVOBInterleavesVideoAndLPCM(t *testing.T) {
 	}
 	var streamIDs []byte
 	var timestamps []uint64
+	var navAddresses []uint32
+	var navEnds []uint32
+	var navCellTimes [][4]byte
 	for offset := 0; offset < vob.Len(); offset += DVDVOBSectorSize {
 		sector := vob.Bytes()[offset : offset+DVDVOBSectorSize]
 		if !bytes.Equal(sector[:4], []byte{0, 0, 1, 0xba}) {
 			t.Fatalf("sector %d has no MPEG pack header", offset/DVDVOBSectorSize)
+		}
+		if bytes.Equal(sector[0x400:0x404], []byte{0, 0, 1, 0xbf}) && sector[0x406] == 1 {
+			dsi := sector[0x407:]
+			navAddresses = append(navAddresses, binary.BigEndian.Uint32(dsi[4:8]))
+			navEnds = append(navEnds, binary.BigEndian.Uint32(dsi[8:12]))
+			var elapsed [4]byte
+			copy(elapsed[:], sector[65:69])
+			navCellTimes = append(navCellTimes, elapsed)
 		}
 		if !bytes.Equal(sector[14:17], []byte{0, 0, 1}) {
 			continue
@@ -129,6 +142,12 @@ func TestMuxDVDTitleVOBInterleavesVideoAndLPCM(t *testing.T) {
 	}
 	if !bytes.Contains(streamIDs, []byte{0xe0}) || !bytes.Contains(streamIDs, []byte{0xbd}) {
 		t.Fatalf("VOB stream IDs = % x, want MPEG-2 video and private LPCM PES", streamIDs)
+	}
+	if len(navAddresses) != 2 || navAddresses[0] != 0 || navAddresses[1] != navEnds[0]+1 {
+		t.Fatalf("NAV sectors addresses=%v ends=%v, want two linked VOBUs", navAddresses, navEnds)
+	}
+	if navCellTimes[1] != [4]byte{0x00, 0x00, 0x00, 0xcf} {
+		t.Fatalf("second NAV cell elapsed time = % x, want NTSC frame 15", navCellTimes[1])
 	}
 	if len(timestamps) < 4 {
 		t.Fatalf("found only %d PES timestamps: %v", len(timestamps), timestamps)
