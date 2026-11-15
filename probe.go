@@ -20,11 +20,10 @@ const (
 	TrackKindOther TrackKind = "other"
 )
 
-// TrackInfo contains container-level metadata. Codec is the sample-entry four
-// character code; CodecConfig contains avcC data for AVC tracks or the
-// AudioSpecificConfig for AAC tracks. PixelAspectHorizontal and
-// PixelAspectVertical are the MP4 pasp values; zero means square pixels or no
-// pasp box was present.
+// TrackInfo contains container-level metadata. Codec is the MP4 sample-entry
+// code or the WebM codec name. CodecConfig contains codec-specific setup data.
+// PixelAspectHorizontal and PixelAspectVertical describe the displayed pixel
+// shape; zero means square pixels or no pixel aspect metadata was present.
 type TrackInfo struct {
 	Index                 int
 	Kind                  TrackKind
@@ -432,9 +431,6 @@ func readBoxPrefix(r io.ReaderAt, box mp4Box, minSize int) ([]byte, error) {
 		return nil, io.ErrUnexpectedEOF
 	}
 	readSize := int64(minSize)
-	if size < readSize {
-		readSize = size
-	}
 	data := make([]byte, readSize)
 	if _, err := r.ReadAt(data, box.data); err != nil {
 		return nil, err

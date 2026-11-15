@@ -13,14 +13,15 @@ import (
 // InProcessEncoder is a built-in Encoder that uses only Go code. Its current
 // MPEG-2 video coder uses I pictures and P-picture macroblock skips with a
 // simple intra quantizer and no motion estimation; use it as an experimental
-// backend rather than a quality transcoder. It converts available AAC-LC/AC-3
-// audio to LPCM and creates silent LPCM when the input has no audio track.
+// backend rather than a quality transcoder. It converts MP4 AAC-LC/AC-3 and
+// WebM Opus audio to LPCM and creates silent LPCM when the input has no audio
+// track.
 type InProcessEncoder struct{}
 
 // NewInProcessEncoder returns the built-in Encoder implementation.
 func NewInProcessEncoder() *InProcessEncoder { return &InProcessEncoder{} }
 
-// Encode turns one MP4 into DVD-compatible elementary streams in workDir.
+// Encode turns one MP4 or WebM into DVD-compatible elementary streams in workDir.
 func (e *InProcessEncoder) Encode(ctx context.Context, inputPath, workDir string, profile Profile) (EncodedTitle, error) {
 	if e == nil {
 		return EncodedTitle{}, errors.New("mp4todvd: in-process encoder is nil")
@@ -31,11 +32,11 @@ func (e *InProcessEncoder) Encode(ctx context.Context, inputPath, workDir string
 	if err := ctx.Err(); err != nil {
 		return EncodedTitle{}, err
 	}
-	info, err := ProbeMP4(inputPath)
+	info, err := ProbeMedia(inputPath)
 	if err != nil {
 		return EncodedTitle{}, err
 	}
-	videoTrack, err := selectVideoTrack(info, nil)
+	videoTrack, err := selectInputVideoTrack(info)
 	if err != nil {
 		return EncodedTitle{}, err
 	}
@@ -47,7 +48,7 @@ func (e *InProcessEncoder) Encode(ctx context.Context, inputPath, workDir string
 		duration = videoTrack.Duration
 	}
 	if duration <= 0 {
-		return EncodedTitle{}, errors.New("mp4todvd: MP4 has no usable duration")
+		return EncodedTitle{}, errors.New("mp4todvd: input has no usable duration")
 	}
 	if err := validateEncoderProfile(profile); err != nil {
 		return EncodedTitle{}, err
@@ -88,7 +89,12 @@ func (e *InProcessEncoder) Encode(ctx context.Context, inputPath, workDir string
 		_ = videoFile.Close()
 		return EncodedTitle{}, err
 	}
-	prepareErr := PrepareMP4VideoForDVD(ctx, inputPath, &videoTrack.Index, profile, sourceAspectN, sourceAspectD, FitLetterbox, videoEncoder.WriteFrame)
+	var prepareErr error
+	if videoTrack.Codec == "vp9" || videoTrack.Codec == "vp8" || videoTrack.Codec == "av1" {
+		prepareErr = PrepareWebMVideoForDVD(ctx, inputPath, &videoTrack.Index, profile, sourceAspectN, sourceAspectD, FitLetterbox, videoEncoder.WriteFrame)
+	} else {
+		prepareErr = PrepareMP4VideoForDVD(ctx, inputPath, &videoTrack.Index, profile, sourceAspectN, sourceAspectD, FitLetterbox, videoEncoder.WriteFrame)
+	}
 	closeEncoderErr := videoEncoder.Close()
 	closeVideoErr := videoFile.Close()
 	if prepareErr != nil {
@@ -109,9 +115,13 @@ func (e *InProcessEncoder) Encode(ctx context.Context, inputPath, workDir string
 	audioWriter := &sizeLimitedWriter{dst: audioFile, limit: encoderOutputLimit(profile)}
 	audioTrack, hasAudio := firstSupportedAudioTrack(info)
 	if hasAudio {
-		err = PrepareMP4AudioForDVD(ctx, inputPath, &audioTrack.Index, audioWriter)
+		if audioTrack.Codec == "opus" {
+			err = PrepareWebMAudioForDVD(ctx, inputPath, &audioTrack.Index, audioWriter)
+		} else {
+			err = PrepareMP4AudioForDVD(ctx, inputPath, &audioTrack.Index, audioWriter)
+		}
 	} else if hasAnyAudioTrack(info) {
-		err = errors.New("mp4todvd: input has audio tracks but none are supported by the built-in decoder")
+		err = errors.New("mp4todvd: input has audio tracks but none are supported by the built-in decoder (MP4 AAC-LC/AC-3, WebM Opus)")
 	} else {
 		err = writeSilentLPCM(audioWriter, duration)
 	}
@@ -166,11 +176,24 @@ func profileFrameRate(standard VideoStandard) (int, int) {
 
 func firstSupportedAudioTrack(info MP4Info) (TrackInfo, bool) {
 	for _, track := range info.Tracks {
-		if track.Kind == TrackKindAudio && (track.Codec == "mp4a" || track.Codec == "ac-3") {
+		if track.Kind == TrackKindAudio && (track.Codec == "mp4a" || track.Codec == "ac-3" || track.Codec == "opus") {
 			return track, true
 		}
 	}
 	return TrackInfo{}, false
+}
+
+func selectInputVideoTrack(info MP4Info) (TrackInfo, error) {
+	for _, track := range info.Tracks {
+		if track.Kind != TrackKindVideo {
+			continue
+		}
+		switch track.Codec {
+		case "avc1", "avc3", "vp9", "vp8", "av1":
+			return track, nil
+		}
+	}
+	return TrackInfo{}, errors.New("mp4todvd: input has no video track supported by the built-in decoder (MP4 H.264, WebM VP8/VP9/AV1)")
 }
 
 func hasAnyAudioTrack(info MP4Info) bool {
@@ -303,10 +326,7 @@ func writeSilentLPCM(dst io.Writer, duration time.Duration) error {
 	const framesPerChunk = 4096
 	silence := make([]int16, framesPerChunk*2)
 	for frames > 0 {
-		count := int64(framesPerChunk)
-		if frames < count {
-			count = frames
-		}
+		count := min(frames, int64(framesPerChunk))
 		chunk := PCMChunk{SampleRate: 48000, Channels: 2, Samples: silence[:int(count*2)]}
 		if err := WriteDVDLPCM(dst, chunk); err != nil {
 			return err

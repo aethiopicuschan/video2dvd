@@ -334,7 +334,7 @@ func validateInputs(inputs []string) ([]string, error) {
 		if !info.Mode().IsRegular() {
 			return nil, fmt.Errorf("mp4todvd: input %d (%q) is not a regular file", i+1, input)
 		}
-		movie, err := ProbeMP4(resolved)
+		movie, err := ProbeMedia(resolved)
 		if err != nil {
 			return nil, fmt.Errorf("mp4todvd: inspect input %d (%q): %w", i+1, input, err)
 		}
@@ -555,10 +555,7 @@ func filesEqual(first, second string, size int64) (bool, error) {
 	left := make([]byte, chunkSize)
 	right := make([]byte, chunkSize)
 	for offset := int64(0); offset < size; {
-		count := int64(chunkSize)
-		if size-offset < count {
-			count = size - offset
-		}
+		count := min(int64(chunkSize), size-offset)
 		if _, err := io.ReadFull(io.NewSectionReader(a, offset, count), left[:count]); err != nil {
 			return false, err
 		}
@@ -602,10 +599,7 @@ func validateVOBPacks(path, name string, size int64) error {
 	const sectorSize = 2048
 	buffer := make([]byte, sectorsPerChunk*sectorSize)
 	for offset := int64(0); offset < size; {
-		chunkSize := int64(len(buffer))
-		if size-offset < chunkSize {
-			chunkSize = size - offset
-		}
+		chunkSize := min(int64(len(buffer)), size-offset)
 		chunk := buffer[:int(chunkSize)]
 		if _, err := io.ReadFull(io.NewSectionReader(file, offset, chunkSize), chunk); err != nil {
 			return fmt.Errorf("mp4todvd: read %s packs at sector offset %d: %w", name, offset, err)
