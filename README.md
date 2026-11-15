@@ -16,11 +16,11 @@
 
 `DecodeMP4Video` は progressive 8-bit 4:2:0 H.264 をYUVフレームに、`DecodeMP4Audio` は対応する AAC-LC/AC-3 を48 kHz stereo PCMにデコードします。デコーダーは純Goの [go-264](https://github.com/rcarmo/go-264) を使い、FFmpegなどの外部コマンドは起動しません。映像デコードは未対応のinterlaced、10-bit、4:2:2/4:4:4形式をエラーにします。
 
-`PrepareMP4VideoForDVD` はH.264 MP4をデコードし、DVDラスタへのフィットとNTSC 29.97 fps／PAL 25 fpsへの間引き・反復を続けて行います。入力の表示アスペクト比は明示します。個別処理には `FitVideoFrame` と `DVDFrameRateConverter` を使えます。`PrepareMP4AudioForDVD` はAAC-LC/AC-3を48 kHz stereo LPCM音声データへ変換します。音声出力はDVD LPCM用のビッグエンディアンで、DVD用PESヘッダーやVOBへの多重化は別途必要です。
+`PrepareMP4VideoForDVD` はH.264 MP4をデコードし、DVDラスタへのフィットとNTSC 29.97 fps／PAL 25 fpsへの間引き・反復を続けて行います。入力の表示アスペクト比は明示します。個別処理には `FitVideoFrame` と `DVDFrameRateConverter` を使えます。`PrepareMP4AudioForDVD` はAAC-LC/AC-3を48 kHz stereo LPCM音声データへ変換します。`DVDLPCMPacketWriter` はPCMチャンクをDVD LPCMヘッダー付きPESにまとめ、2048バイトのプログラムストリームセクターへ書きます。
 
 `NewInProcessEncoder` は外部コマンドを使わずMP4からMPEG-2映像とLPCM音声を生成します。現段階のMPEG-2エンコーダーは閉じたGOPにI/Pフレームを出力し、前フレームと完全一致するマクロブロックをPフレームで省略します。変更されたマクロブロックはイントラ符号化するため動き予測は行わず、単純な量子化とあわせて圧縮効率と画質は限定的です。一般的な品質の変換にはまだ使えません。
 
-`MPEGProgramStreamWriter` はPESを2048バイトのMPEG-2プログラムストリームセクターへ書き込む低レベル部品です。IFO/BUP、DVD NAVパック、LPCM用DVDサブストリームヘッダーを含むオーサリングは未実装で、`Converter` 単体では再生可能なDVDを作成できません。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
+`MPEGProgramStreamWriter` と `DVDLPCMPacketWriter` は多重化用の部品です。IFO/BUPとDVD NAVパックを含むオーサリングは未実装で、`Converter` 単体では再生可能なDVDを作成できません。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
 
 ## バックエンドの接続
 
