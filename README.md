@@ -12,7 +12,13 @@
 
 `Converter` は入力ファイルの検証、クリップごとの変換処理、DVD オーサリング処理、出力の公開を管理します。中間ファイルは出力先と同じ親ディレクトリに一時作成し、処理がすべて成功した場合だけ `VIDEO_TS` ディレクトリを出力先へ移動します。
 
-MP4 のデコード、DVD 用 MPEG-2/音声へのエンコード、および IFO/VOB オーサリングは、`Encoder` と `Authorer` の実装として渡してください。このリポジトリにはこれらのメディアバックエンドは含まれていないため、`Converter` 単体では MP4 を変換できません。バックエンドは外部プロセスを使わず Go 内で処理する実装を想定しています。
+`ProbeMP4` は通常の MP4 のトラック・コーデック・解像度・音声情報・再生時間を読み取ります。`DemuxMP4` は非 fragmented MP4 の音声・映像サンプルを DTS/PTS とともに順に取り出します。H.264 の AVC 設定を取得でき、`AVCToAnnexB` と `AVCConfigToAnnexB` でNAL列とSPS/PPSを Annex B 形式に変換できます。AAC の AudioSpecificConfig も取得します。これらは圧縮データを返す段階までで、映像・音声のデコードは行いません。
+
+`DecodeMP4Video` は progressive 8-bit 4:2:0 H.264 をYUVフレームに、`DecodeMP4Audio` は対応する AAC-LC/AC-3 を48 kHz stereo PCMにデコードします。デコーダーは純Goの [go-264](https://github.com/rcarmo/go-264) を使い、FFmpegなどの外部コマンドは起動しません。映像デコードは未対応のinterlaced、10-bit、4:2:2/4:4:4形式をエラーにします。
+
+`PrepareMP4VideoForDVD` はH.264 MP4をデコードし、DVDラスタへのフィットとNTSC 29.97 fps／PAL 25 fpsへの間引き・反復を続けて行います。入力の表示アスペクト比は明示します。個別処理には `FitVideoFrame` と `DVDFrameRateConverter` を使えます。`PrepareMP4AudioForDVD` はAAC-LC/AC-3を48 kHz stereo LPCM音声データへ変換します。音声出力はDVD LPCM用のビッグエンディアンで、DVD用PESヘッダーやVOBへの多重化は別途必要です。
+
+DVD 用 MPEG-2 映像エンコード、IFO/VOBオーサリングは未実装です。`Encoder` と `Authorer` の実装もまだ含まれていないため、`Converter` 単体ではDVDを作成できません。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
 
 ## バックエンドの接続
 
@@ -35,4 +41,4 @@ err = converter.Convert(ctx,
 )
 ```
 
-出力先は既存でないパスを指定します。成功時は `disc/VIDEO_TS` 以下に DVD-Video ファイルが作成されます。エンコーダーの出力は MPEG-2 映像と AC-3、LPCM、または MPEG-1 Layer II 音声で、解像度とフレームレートは選択した DVD 規格に適合する必要があります。
+出力先は既存でないパスを指定します。成功時は `disc/VIDEO_TS` 以下に DVD-Video ファイルが作成されます。`DiscCapacityBytes` を省略すると DVD-5 の4.7 GBを上限にします。エンコーダーの出力は MPEG-2 映像と AC-3、LPCM、または MPEG-1 Layer II 音声で、解像度とフレームレートは選択した DVD 規格に適合する必要があります。
