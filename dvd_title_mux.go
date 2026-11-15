@@ -21,6 +21,15 @@ const (
 // stream into VOBUs with NAV packs and fixed-size MPEG program-stream sectors.
 // The result does not include IFO/BUP files or complete DVD navigation tables.
 func MuxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.Writer) error {
+	return muxDVDTitleVOB(ctx, title, workDir, dst, nil)
+}
+
+type dvdVOBURecord struct {
+	StartSector uint32
+	EndSector   uint32
+}
+
+func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.Writer, recordVOBU func(dvdVOBURecord) error) error {
 	if ctx == nil {
 		return errors.New("mp4todvd: context must not be nil")
 	}
@@ -148,6 +157,11 @@ func MuxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 		}
 		if err := writeAll(dst, mediaBuffer.Bytes()); err != nil {
 			return err
+		}
+		if recordVOBU != nil {
+			if err := recordVOBU(dvdVOBURecord{StartSector: nextVOBUSector, EndSector: nextVOBUSector + mediaSectors}); err != nil {
+				return err
+			}
 		}
 		nextVOBUSector += mediaSectors + 1
 		return nil

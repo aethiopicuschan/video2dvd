@@ -20,13 +20,15 @@
 
 `NewInProcessEncoder` は外部コマンドを使わずMP4からMPEG-2映像とLPCM音声を生成します。現段階のMPEG-2エンコーダーは閉じたGOPにI/Pフレームを出力し、前フレームと完全一致するマクロブロックをPフレームで省略します。変更されたマクロブロックはイントラ符号化するため動き予測は行わず、単純な量子化とあわせて圧縮効率と画質は限定的です。一般的な品質の変換にはまだ使えません。
 
-`MuxDVDTitleVOB` は1タイトル分のMPEG-2映像とLPCM音声をPTS順に多重化し、Iフレームから始まるVOBUごとにPCI/DSI入りのNAVパックを置きます。`MPEGProgramStreamWriter` と `DVDLPCMPacketWriter` はその下位部品で、`BuildDVDNAVPack` はNAVパック単体を構築します。IFO/BUPとディスク全体のナビゲーションテーブル生成は未実装のため、これらの部品だけでは再生可能なDVDになりません。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
+`MuxDVDTitleVOB` は1タイトル分のMPEG-2映像とLPCM音声をPTS順に多重化し、Iフレームから始まるVOBUごとにPCI/DSI入りのNAVパックを置きます。`MPEGProgramStreamWriter` と `DVDLPCMPacketWriter` はその下位部品で、`BuildDVDNAVPack` はNAVパック単体を構築します。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
+
+`NewInProcessAuthorer` は最大99個の入力を入力順に別々のVTS/タイトルとしてオーサリングし、VMG/VTSのIFO・BUP、PTT/PGC/セル/VOBUテーブルと各タイトルのVOBを作成します。現在はMPEG-2映像とLPCM音声に対応し、タイトルメニューや字幕は作成しません。出力は `VIDEO_TS` ディレクトリで、ISO/UDFイメージ作成や書き込みは対象外です。ディスク起動時の自動再生、複数タイトルの自動連続再生、メニュー操作は未実装です。
 
 ## バックエンドの接続
 
 ```go
-encoder := mycodec.NewEncoder()
-authorer := mydvd.NewAuthorer()
+encoder := mp4todvd.NewInProcessEncoder()
+authorer := mp4todvd.NewInProcessAuthorer()
 
 converter, err := mp4todvd.New(encoder, authorer)
 if err != nil {

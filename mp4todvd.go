@@ -121,7 +121,8 @@ type Encoder interface {
 
 // Authorer creates a DVD-Video directory (including VIDEO_TS.IFO/BUP and VOB
 // files) from the encoded titles. outputDir is an empty directory. Implementors
-// should honor context cancellation.
+// should honor context cancellation. Converter passes absolute elementary-stream
+// paths in titles.
 type Authorer interface {
 	Author(ctx context.Context, titles []EncodedTitle, outputDir string, profile Profile) error
 }
@@ -214,6 +215,14 @@ func (c *Converter) Convert(ctx context.Context, inputs []string, outputDir stri
 		if err := validateTitle(title, workDir, profile); err != nil {
 			return fmt.Errorf("mp4todvd: invalid encoded title for input %d (%q): %w", i+1, inputPath, err)
 		}
+		title.VideoPath, err = validateGeneratedFile(title.VideoPath, workDir, "video")
+		if err != nil {
+			return fmt.Errorf("mp4todvd: resolve encoded video for input %d: %w", i+1, err)
+		}
+		title.AudioPath, err = validateGeneratedFile(title.AudioPath, workDir, "audio")
+		if err != nil {
+			return fmt.Errorf("mp4todvd: resolve encoded audio for input %d: %w", i+1, err)
+		}
 		titles = append(titles, title)
 	}
 
@@ -228,7 +237,7 @@ func (c *Converter) Convert(ctx context.Context, inputs []string, outputDir stri
 	if err := c.authorer.Author(ctx, titles, videoTS, profile); err != nil {
 		return fmt.Errorf("mp4todvd: author DVD-Video: %w", err)
 	}
-	if err := validateDVDDirectory(videoTS); err != nil {
+	if err := validateDVDDirectory(videoTS, len(titles)); err != nil {
 		return err
 	}
 	usedBytes, err := directorySize(videoTS)
@@ -398,56 +407,84 @@ func validateGeneratedFile(path, workDir, kind string) (string, error) {
 	return resolved, nil
 }
 
-func validateDVDDirectory(videoTS string) error {
-	required := []string{"VIDEO_TS.IFO", "VIDEO_TS.BUP", "VTS_01_0.IFO", "VTS_01_0.BUP", "VTS_01_1.VOB"}
-	files := make(map[string]fs.FileInfo, len(required))
-	for _, name := range required {
-		path := filepath.Join(videoTS, name)
-		info, err := os.Lstat(path)
-		if err != nil {
-			return fmt.Errorf("mp4todvd: authorer did not create %s: %w", name, err)
-		}
-		if !info.Mode().IsRegular() || info.Size() == 0 {
-			return fmt.Errorf("mp4todvd: authored %s must be a non-empty regular file", name)
-		}
-		files[name] = info
+func validateDVDDirectory(videoTS string, expectedVTSCount int) error {
+	if err := validateIFOBackup(videoTS, "VIDEO_TS.IFO", "VIDEO_TS.BUP", "DVDVIDEO-VMG"); err != nil {
+		return err
 	}
-	for _, pair := range [][3]string{
-		{"VIDEO_TS.IFO", "VIDEO_TS.BUP", "DVDVIDEO-VMG"},
-		{"VTS_01_0.IFO", "VTS_01_0.BUP", "DVDVIDEO-VTS"},
-	} {
-		ifoPath := filepath.Join(videoTS, pair[0])
-		bupPath := filepath.Join(videoTS, pair[1])
-		ifoInfo, bupInfo := files[pair[0]], files[pair[1]]
-		if ifoInfo.Size()%2048 != 0 || bupInfo.Size()%2048 != 0 {
-			return fmt.Errorf("mp4todvd: %s and %s must be DVD-sector aligned", pair[0], pair[1])
+	vtsCount := 0
+	for number := 1; number <= dvdMaxTitles; number++ {
+		stem := fmt.Sprintf("VTS_%02d_0", number)
+		_, err := os.Lstat(filepath.Join(videoTS, stem+".IFO"))
+		if errors.Is(err, fs.ErrNotExist) {
+			break
 		}
-		ifo, err := os.Open(ifoPath)
 		if err != nil {
+			return fmt.Errorf("mp4todvd: inspect %s.IFO: %w", stem, err)
+		}
+		if err := validateIFOBackup(videoTS, stem+".IFO", stem+".BUP", "DVDVIDEO-VTS"); err != nil {
 			return err
 		}
-		var signature [12]byte
-		_, readErr := io.ReadFull(ifo, signature[:])
-		closeErr := ifo.Close()
-		if readErr != nil {
-			return fmt.Errorf("mp4todvd: read %s header: %w", pair[0], readErr)
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-		if string(signature[:]) != pair[2] {
-			return fmt.Errorf("mp4todvd: %s has an invalid DVD-Video signature", pair[0])
-		}
-		equal, err := filesEqual(ifoPath, bupPath, ifoInfo.Size())
+		vobName := fmt.Sprintf("VTS_%02d_1.VOB", number)
+		vobInfo, err := os.Lstat(filepath.Join(videoTS, vobName))
 		if err != nil {
-			return err
+			return fmt.Errorf("mp4todvd: authorer did not create %s: %w", vobName, err)
 		}
-		if !equal || ifoInfo.Size() != bupInfo.Size() {
-			return fmt.Errorf("mp4todvd: %s must be an exact backup of %s", pair[1], pair[0])
+		if !vobInfo.Mode().IsRegular() || vobInfo.Size() == 0 {
+			return fmt.Errorf("mp4todvd: authored %s must be a non-empty regular file", vobName)
 		}
+		vtsCount++
+	}
+	if vtsCount != expectedVTSCount {
+		return fmt.Errorf("mp4todvd: authorer created %d title sets; want %d", vtsCount, expectedVTSCount)
 	}
 	if err := validateVOBs(videoTS); err != nil {
 		return err
+	}
+	return nil
+}
+
+func validateIFOBackup(videoTS, ifoName, bupName, signatureText string) error {
+	ifoPath := filepath.Join(videoTS, ifoName)
+	bupPath := filepath.Join(videoTS, bupName)
+	ifoInfo, err := os.Lstat(ifoPath)
+	if err != nil {
+		return fmt.Errorf("mp4todvd: authorer did not create %s: %w", ifoName, err)
+	}
+	bupInfo, err := os.Lstat(bupPath)
+	if err != nil {
+		return fmt.Errorf("mp4todvd: authorer did not create %s: %w", bupName, err)
+	}
+	if !ifoInfo.Mode().IsRegular() || ifoInfo.Size() == 0 || ifoInfo.Size()%DVDVOBSectorSize != 0 {
+		return fmt.Errorf("mp4todvd: authored %s must be a non-empty sector-aligned regular file", ifoName)
+	}
+	if !bupInfo.Mode().IsRegular() || bupInfo.Size() == 0 || bupInfo.Size()%DVDVOBSectorSize != 0 {
+		return fmt.Errorf("mp4todvd: authored %s must be a non-empty sector-aligned regular file", bupName)
+	}
+	ifo, err := os.Open(ifoPath)
+	if err != nil {
+		return err
+	}
+	var signature [12]byte
+	_, readErr := io.ReadFull(ifo, signature[:])
+	closeErr := ifo.Close()
+	if readErr != nil {
+		return fmt.Errorf("mp4todvd: read %s header: %w", ifoName, readErr)
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if string(signature[:]) != signatureText {
+		return fmt.Errorf("mp4todvd: %s has an invalid DVD-Video signature", ifoName)
+	}
+	if ifoInfo.Size() != bupInfo.Size() {
+		return fmt.Errorf("mp4todvd: %s must be the same size as %s", bupName, ifoName)
+	}
+	equal, err := filesEqual(ifoPath, bupPath, ifoInfo.Size())
+	if err != nil {
+		return err
+	}
+	if !equal {
+		return fmt.Errorf("mp4todvd: %s must be an exact backup of %s", bupName, ifoName)
 	}
 	return nil
 }

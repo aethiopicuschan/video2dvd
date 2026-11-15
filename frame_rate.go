@@ -156,10 +156,12 @@ func (c *DVDFrameRateConverter) outputTimestamp(index int64) (time.Duration, err
 	if whole > math.MaxInt64/unit {
 		return 0, errors.New("mp4todvd: output timestamp overflows duration")
 	}
-	nanoseconds := whole*unit + remainder*unit/c.rateNumerator
-	if nanoseconds > math.MaxInt64 {
+	wholeNanoseconds := whole * unit
+	fractionNanoseconds := remainder * unit / c.rateNumerator
+	if fractionNanoseconds > math.MaxInt64-wholeNanoseconds {
 		return 0, errors.New("mp4todvd: output timestamp overflows duration")
 	}
+	nanoseconds := wholeNanoseconds + fractionNanoseconds
 	return time.Duration(nanoseconds), nil
 }
 
