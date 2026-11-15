@@ -58,6 +58,33 @@ func TestMPEGProgramStreamWriterRejectsInvalidIDsAndRegressingPTS(t *testing.T) 
 	}
 }
 
+func TestMPEGProgramStreamWriterClosesWithProgramEndCode(t *testing.T) {
+	var output bytes.Buffer
+	writer, err := NewMPEGProgramStreamWriter(&output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WritePES(0xe0, 0, []byte{1, 2, 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := output.Len(), 2*DVDVOBSectorSize; got != want {
+		t.Fatalf("output size = %d, want %d", got, want)
+	}
+	last := output.Bytes()[DVDVOBSectorSize:]
+	if !bytes.Equal(last[:4], []byte{0, 0, 1, 0xba}) || !bytes.Equal(last[len(last)-4:], []byte{0, 0, 1, 0xb9}) {
+		t.Fatal("final sector does not contain a pack header and program_end_code")
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("second Close returned an error: %v", err)
+	}
+	if err := writer.WritePES(0xe0, 0, []byte{4}); err == nil {
+		t.Fatal("expected a write after Close to fail")
+	}
+}
+
 func decodeTestMPEGTimestamp(value []byte) uint64 {
 	return (uint64(value[0]&0x0e) << 29) |
 		(uint64(value[1]) << 22) |

@@ -27,6 +27,7 @@ type MPEGProgramStreamWriter struct {
 	lastPTS   uint64
 	havePTS   bool
 	started   bool
+	closed    bool
 	closedErr error
 }
 
@@ -52,6 +53,9 @@ func (w *MPEGProgramStreamWriter) WritePES(streamID byte, pts time.Duration, pay
 	}
 	if w.closedErr != nil {
 		return w.closedErr
+	}
+	if w.closed {
+		return errors.New("mp4todvd: program stream writer is already closed")
 	}
 	if !validProgramStreamID(streamID) {
 		return fmt.Errorf("mp4todvd: invalid PES stream id 0x%02x", streamID)
@@ -92,6 +96,41 @@ func (w *MPEGProgramStreamWriter) WritePES(streamID byte, pts time.Duration, pay
 		first = false
 	}
 	return nil
+}
+
+// Close writes the MPEG program_end_code in its own fixed-size pack. It does
+// not close the destination writer.
+func (w *MPEGProgramStreamWriter) Close() error {
+	if w == nil || w.dst == nil {
+		return errors.New("mp4todvd: program stream writer is not configured")
+	}
+	if w.closed {
+		return w.closedErr
+	}
+	w.closed = true
+	if w.closedErr != nil {
+		return w.closedErr
+	}
+	if err := w.writeEndPack(); err != nil {
+		w.closedErr = fmt.Errorf("mp4todvd: finish program stream: %w", err)
+	}
+	return w.closedErr
+}
+
+func (w *MPEGProgramStreamWriter) writeEndPack() error {
+	var pack bytes.Buffer
+	pack.Write(buildMPEG2PackHeader(w.scr, w.muxRate))
+	paddingLength := DVDVOBSectorSize - pack.Len() - 10 // padding header and end code.
+	if paddingLength < 0 || paddingLength > 0xffff {
+		return errors.New("mp4todvd: cannot fit program end code in a DVD sector")
+	}
+	pack.Write([]byte{0, 0, 1, 0xbe, byte(paddingLength >> 8), byte(paddingLength)})
+	pack.Write(bytes.Repeat([]byte{0xff}, paddingLength))
+	pack.Write([]byte{0, 0, 1, 0xb9})
+	if pack.Len() != DVDVOBSectorSize {
+		return errors.New("mp4todvd: generated program end pack has an invalid sector size")
+	}
+	return writeAll(w.dst, pack.Bytes())
 }
 
 func (w *MPEGProgramStreamWriter) writePack(packet []byte) error {
