@@ -17,6 +17,11 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 	if profile.Aspect == AspectRatio16x9 {
 		maxButtons = 18
 	}
+	// Two buttons are reserved for previous/next page navigation when the
+	// menu spans more than one page.
+	if len(titles) > maxButtons {
+		maxButtons -= 2
+	}
 	if len(titles) == 0 {
 		return EncodedTitle{}, nil, errors.New("video2dvd: automatically generated menu requires at least one title")
 	}
@@ -33,7 +38,7 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 		var encoded bytes.Buffer
 		encoder, encodeErr := NewMPEG2VideoEncoder(&encoded, profile)
 		if encodeErr == nil {
-			encodeErr = encoder.WriteFrame(newDVDMenuFrame(profile, titles[start:end], start))
+			encodeErr = encoder.WriteFrame(newDVDMenuFrame(profile, titles[start:end], start, pages > 1))
 		}
 		if encodeErr == nil {
 			encodeErr = encoder.Close()
@@ -46,7 +51,7 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 			_ = videoFile.Close()
 			return EncodedTitle{}, nil, err
 		}
-		buttonPages = append(buttonPages, makeDVDMenuButtons(start, end, profile))
+		buttonPages = append(buttonPages, makeDVDMenuButtons(start, end, profile, page, pages))
 	}
 	if closeErr := videoFile.Close(); closeErr != nil {
 		return EncodedTitle{}, nil, closeErr
@@ -65,23 +70,35 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 	}, buttonPages, ctx.Err()
 }
 
-func makeDVDMenuButtons(start, end int, profile Profile) []DVDNAVButton {
-	buttons := make([]DVDNAVButton, end-start)
-	for i := range buttons {
+func makeDVDMenuButtons(start, end int, profile Profile, page, pageCount int) []DVDNAVButton {
+	controls := 0
+	if pageCount > 1 {
+		controls = 2
+	}
+	buttons := make([]DVDNAVButton, end-start+controls)
+	if controls != 0 {
+		buttons[0] = DVDNAVButton{XStart: 48, YStart: 52, XEnd: 300, YEnd: 76, Up: 1, Down: 3, Left: 1, Right: 1, Command: linkPGCNCommand(page)}
+		buttons[1] = DVDNAVButton{XStart: 368, YStart: 52, XEnd: 704, YEnd: 76, Up: 2, Down: 4, Left: 2, Right: 2, Command: linkPGCNCommand((page + 1) % pageCount)}
+	}
+	for i := range buttons[controls:] {
+		index := i + controls
 		column, row := i/18, i%18
-		up, down := i-1, i+1
+		if controls != 0 {
+			index = i + controls
+		}
+		up, down := index-1, index+1
 		if row == 0 {
 			up = i + 17
 		}
 		if row == 17 || down >= len(buttons) || down/18 != column {
-			down = i - row
+			down = index - row
 		}
-		leftIndex, rightIndex := i, i
-		if column == 0 && i+18 < len(buttons) {
-			rightIndex = i + 18
+		leftIndex, rightIndex := index, index
+		if column == 0 && i+18 < len(buttons)-controls {
+			rightIndex = index + 18
 		}
 		if column == 1 {
-			leftIndex = i - 18
+			leftIndex = index - 18
 		}
 		left, right := 48, 672
 		if column == 1 {
@@ -90,8 +107,8 @@ func makeDVDMenuButtons(start, end int, profile Profile) []DVDNAVButton {
 		if profile.Aspect == AspectRatio16x9 {
 			left, right = 48, 672
 		}
-		top := 92 + row*20
-		buttons[i] = DVDNAVButton{
+		top := 94 + row*20
+		buttons[index] = DVDNAVButton{
 			XStart: left, YStart: top, XEnd: right, YEnd: top + 16,
 			Up: uint8(up + 1), Down: uint8(down + 1),
 			Left: uint8(leftIndex + 1), Right: uint8(rightIndex + 1),
@@ -109,6 +126,10 @@ func dvdJumpMenuCommand() [8]byte {
 	return [8]byte{0x30, 0x06, 0, 0, 0, 0x42}
 }
 
+func linkPGCNCommand(pgcn int) [8]byte {
+	return [8]byte{0x20, 0x04, 0, 0, 0, 0, 0, byte(pgcn + 1)}
+}
+
 func menuFrameRateNumerator(standard VideoStandard) int {
 	if standard == VideoStandardPAL {
 		return 25
@@ -123,7 +144,7 @@ func menuFrameRateDenominator(standard VideoStandard) int {
 	return 1001
 }
 
-func newDVDMenuFrame(profile Profile, titles []EncodedTitle, start int) DecodedVideoFrame {
+func newDVDMenuFrame(profile Profile, titles []EncodedTitle, start int, pageControls bool) DecodedVideoFrame {
 	frame := DecodedVideoFrame{Width: profile.FrameWidth, Height: profile.FrameHeight, Duration: time.Second,
 		Y: make([]byte, profile.FrameWidth*profile.FrameHeight), U: make([]byte, profile.FrameWidth*profile.FrameHeight/4), V: make([]byte, profile.FrameWidth*profile.FrameHeight/4)}
 	background := profile.MenuBackgroundLuma
@@ -145,6 +166,10 @@ func newDVDMenuFrame(profile Profile, titles []EncodedTitle, start int) DecodedV
 		textLuma = 220
 	}
 	drawDVDMenuText(&frame, 48, 24, strings.ToUpper(title), textLuma)
+	if pageControls {
+		drawDVDMenuText(&frame, 56, 54, "PREV", textLuma)
+		drawDVDMenuText(&frame, 376, 54, "NEXT", textLuma)
+	}
 	if start == 0 {
 		drawDVDMenuText(&frame, 56, 54, "PLAY ALL", textLuma)
 	}
