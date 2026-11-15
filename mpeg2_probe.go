@@ -36,10 +36,7 @@ func ProbeMPEG2Video(path string) (MPEG2VideoInfo, error) {
 	if !info.Mode().IsRegular() {
 		return MPEG2VideoInfo{}, errors.New("mp4todvd: MPEG-2 video stream is not a regular file")
 	}
-	scanSize := info.Size()
-	if scanSize > maxMPEG2HeaderScan {
-		scanSize = maxMPEG2HeaderScan
-	}
+	scanSize := min(info.Size(), maxMPEG2HeaderScan)
 	data := make([]byte, int(scanSize))
 	if _, err := io.ReadFull(io.NewSectionReader(f, 0, scanSize), data); err != nil && err != io.EOF {
 		return MPEG2VideoInfo{}, err
@@ -186,7 +183,7 @@ func (r *bitReader) read(count int) (uint32, error) {
 		return 0, io.ErrUnexpectedEOF
 	}
 	var value uint32
-	for i := 0; i < count; i++ {
+	for i := range count {
 		position := r.bit + i
 		value = value<<1 | uint32((r.data[position/8]>>(7-position%8))&1)
 	}

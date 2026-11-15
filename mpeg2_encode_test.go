@@ -143,7 +143,7 @@ func TestMPEG2VideoEncoderUsesPredictivePicturesForUnchangedMacroblocks(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		if i == 2 {
 			frame = cloneDecodedVideoFrame(frame)
 			for y := 160; y < 176; y++ {

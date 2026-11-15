@@ -119,12 +119,9 @@ func evenDimension(value float64) int {
 
 func scalePlaneBilinear(src []byte, srcStride, srcHeight int, dst []byte, dstStride, dstHeight int,
 	srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH int) {
-	for y := 0; y < dstH; y++ {
+	for y := range dstH {
 		fy := float64(srcY) + (float64(y)+0.5)*float64(srcH)/float64(dstH) - 0.5
-		y0 := int(fy)
-		if y0 < srcY {
-			y0 = srcY
-		}
+		y0 := max(int(fy), srcY)
 		y1 := y0 + 1
 		maxY := srcY + srcH - 1
 		if y1 > maxY {
@@ -134,12 +131,9 @@ func scalePlaneBilinear(src []byte, srcStride, srcHeight int, dst []byte, dstStr
 		if wy < 0 {
 			wy = 0
 		}
-		for x := 0; x < dstW; x++ {
+		for x := range dstW {
 			fx := float64(srcX) + (float64(x)+0.5)*float64(srcW)/float64(dstW) - 0.5
-			x0 := int(fx)
-			if x0 < srcX {
-				x0 = srcX
-			}
+			x0 := max(int(fx), srcX)
 			x1 := x0 + 1
 			maxX := srcX + srcW - 1
 			if x1 > maxX {

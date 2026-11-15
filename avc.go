@@ -49,7 +49,7 @@ func AVCParameterSets(config []byte) ([][]byte, [][]byte, error) {
 
 func readAVCNALUnits(config []byte, position *int, count int) ([][]byte, error) {
 	units := make([][]byte, 0, count)
-	for i := 0; i < count; i++ {
+	for range count {
 		if len(config)-*position < 2 {
 			return nil, fmt.Errorf("%w: truncated parameter-set length", ErrInvalidAVC)
 		}

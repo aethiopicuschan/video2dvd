@@ -36,12 +36,12 @@ var mpeg2ZigZag = [64]int{
 
 func buildMPEG2DCTBasis() [8][8]float64 {
 	var basis [8][8]float64
-	for frequency := 0; frequency < 8; frequency++ {
+	for frequency := range 8 {
 		normalization := 1.0
 		if frequency == 0 {
 			normalization = 1 / math.Sqrt2
 		}
-		for position := 0; position < 8; position++ {
+		for position := range 8 {
 			basis[frequency][position] = normalization * math.Cos(float64((2*position+1)*frequency)*math.Pi/16)
 		}
 	}
@@ -148,7 +148,7 @@ func (e *MPEG2VideoEncoder) encodeIntraPicture(frame DecodedVideoFrame, blocks [
 		writeMPEG2GOPHeader(&bits, e.frameNo, e.frameRate)
 	}
 	writeMPEG2PictureHeader(&bits, uint16(e.frameNo%15), 1)
-	for row := 0; row < mbHeight; row++ {
+	for row := range mbHeight {
 		writeMPEG2IntraSlice(&bits, blocks, row, mbWidth, quantizer, includeAC)
 	}
 	return bits.bytes()
@@ -157,7 +157,7 @@ func (e *MPEG2VideoEncoder) encodeIntraPicture(frame DecodedVideoFrame, blocks [
 func (e *MPEG2VideoEncoder) encodePredictivePicture(frame, reference DecodedVideoFrame, blocks []mpeg2IntraBlock, mbWidth, mbHeight, quantizer int, includeAC bool) []byte {
 	var bits mpeg2BitWriter
 	writeMPEG2PictureHeader(&bits, uint16(e.frameNo%15), 2)
-	for row := 0; row < mbHeight; row++ {
+	for row := range mbHeight {
 		writeMPEG2PredictiveSlice(&bits, frame, reference, blocks, row, mbWidth, quantizer, includeAC)
 	}
 	return bits.bytes()
@@ -256,7 +256,7 @@ func writeMPEG2PictureHeader(bits *mpeg2BitWriter, temporalReference uint16, pic
 
 	bits.startCode(0xb5)
 	bits.write(8, 4) // picture_coding_extension_identifier
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		bits.write(1, 4) // f_code (unused for I pictures)
 	}
 	bits.write(0, 2) // intra_dc_precision
@@ -281,10 +281,10 @@ type mpeg2IntraBlock struct {
 
 func collectMPEG2IntraBlocks(frame DecodedVideoFrame, mbWidth, mbHeight int) []mpeg2IntraBlock {
 	blocks := make([]mpeg2IntraBlock, 0, mbWidth*mbHeight*6)
-	for mbRow := 0; mbRow < mbHeight; mbRow++ {
-		for mbColumn := 0; mbColumn < mbWidth; mbColumn++ {
+	for mbRow := range mbHeight {
+		for mbColumn := range mbWidth {
 			baseX, baseY := mbColumn*16, mbRow*16
-			for block := 0; block < 4; block++ {
+			for block := range 4 {
 				x := baseX + (block%2)*8
 				y := baseY + (block/2)*8
 				blocks = append(blocks, analyzeMPEG2Block(frame.Y, frame.Width, x, y, false))
@@ -303,27 +303,27 @@ func analyzeMPEG2Block(plane []byte, stride, x, y int, chroma bool) mpeg2IntraBl
 	block.chroma = chroma
 	var source, temporary [8][8]float64
 	sum := 0
-	for row := 0; row < 8; row++ {
-		for column := 0; column < 8; column++ {
+	for row := range 8 {
+		for column := range 8 {
 			value := int(plane[(y+row)*stride+x+column])
 			sum += value
 			source[row][column] = float64(value - 128)
 		}
 	}
 	block.dc = (sum+32)/64 - 128
-	for row := 0; row < 8; row++ {
-		for horizontal := 0; horizontal < 8; horizontal++ {
+	for row := range 8 {
+		for horizontal := range 8 {
 			var value float64
-			for column := 0; column < 8; column++ {
+			for column := range 8 {
 				value += source[row][column] * mpeg2DCTBasis[horizontal][column]
 			}
 			temporary[row][horizontal] = value
 		}
 	}
-	for vertical := 0; vertical < 8; vertical++ {
-		for horizontal := 0; horizontal < 8; horizontal++ {
+	for vertical := range 8 {
+		for horizontal := range 8 {
 			var value float64
-			for row := 0; row < 8; row++ {
+			for row := range 8 {
 				value += temporary[row][horizontal] * mpeg2DCTBasis[vertical][row]
 			}
 			block.coeff[vertical*8+horizontal] = value * 0.25
@@ -337,11 +337,11 @@ func writeMPEG2IntraSlice(bits *mpeg2BitWriter, blocks []mpeg2IntraBlock, row, m
 	bits.write(uint64(quantizer), 5) // linear quantizer_scale_code.
 	bits.write(0, 1)                 // extra_bit_slice
 	lastY, lastCb, lastCr := 128, 128, 128
-	for column := 0; column < mbWidth; column++ {
+	for column := range mbWidth {
 		bits.write(1, 1) // macroblock_address_increment = 1
 		bits.write(1, 1) // I-picture macroblock_type = intra
 		blockIndex := (row*mbWidth + column) * 6
-		for block := 0; block < 4; block++ {
+		for block := range 4 {
 			lastY = writeMPEG2Block(bits, blocks[blockIndex+block], lastY, quantizer, includeAC)
 		}
 		lastCb = writeMPEG2Block(bits, blocks[blockIndex+4], lastCb, quantizer, includeAC)
@@ -357,7 +357,7 @@ func writeMPEG2PredictiveSlice(bits *mpeg2BitWriter, frame, reference DecodedVid
 	bits.write(0, 1) // extra_bit_slice
 	lastY, lastCb, lastCr := 128, 128, 128
 	lastColumn := -1
-	for column := 0; column < mbWidth; column++ {
+	for column := range mbWidth {
 		// Keep both slice edges coded so skipped macroblocks are represented
 		// between coded addresses rather than left implicit at the slice end.
 		changed := column == 0 || column == mbWidth-1 || !sameMPEG2Macroblock(frame, reference, row, column)
@@ -370,7 +370,7 @@ func writeMPEG2PredictiveSlice(bits *mpeg2BitWriter, frame, reference DecodedVid
 		}
 		bits.write(0b00011, 5) // P-picture macroblock_type = intra.
 		blockIndex := (row*mbWidth + column) * 6
-		for block := 0; block < 4; block++ {
+		for block := range 4 {
 			lastY = writeMPEG2Block(bits, blocks[blockIndex+block], lastY, quantizer, includeAC)
 		}
 		lastCb = writeMPEG2Block(bits, blocks[blockIndex+4], lastCb, quantizer, includeAC)
@@ -391,7 +391,7 @@ func sameMPEG2Macroblock(first, second DecodedVideoFrame, row, column int) bool 
 }
 
 func samePlaneRectangle(first, second []byte, stride, x, y, width, height int) bool {
-	for row := 0; row < height; row++ {
+	for row := range height {
 		start := (y+row)*stride + x
 		if !bytes.Equal(first[start:start+width], second[start:start+width]) {
 			return false
@@ -469,7 +469,7 @@ func mpeg2MagnitudeBits(value int) int {
 	if value < 0 {
 		value = -value
 	}
-	for size := 0; size < 12; size++ {
+	for size := range 12 {
 		if value < 1<<size {
 			return size
 		}

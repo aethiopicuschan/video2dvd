@@ -287,7 +287,7 @@ func copyPlane(dst, src []byte, width, height, stride int) error {
 	if width <= 0 || height <= 0 || stride < width || len(dst) != width*height || len(src) < (height-1)*stride+width {
 		return errors.New("mp4todvd: decoder returned a truncated frame plane")
 	}
-	for y := 0; y < height; y++ {
+	for y := range height {
 		copy(dst[y*width:(y+1)*width], src[y*stride:y*stride+width])
 	}
 	return nil

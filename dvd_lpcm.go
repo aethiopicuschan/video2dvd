@@ -23,10 +23,7 @@ func WriteDVDLPCM(dst io.Writer, chunk PCMChunk) error {
 	const samplesPerBuffer = 4096
 	buffer := make([]byte, samplesPerBuffer*2)
 	for offset := 0; offset < len(chunk.Samples); {
-		count := len(chunk.Samples) - offset
-		if count > samplesPerBuffer {
-			count = samplesPerBuffer
-		}
+		count := min(len(chunk.Samples)-offset, samplesPerBuffer)
 		for i, sample := range chunk.Samples[offset : offset+count] {
 			binary.BigEndian.PutUint16(buffer[i*2:], uint16(sample))
 		}

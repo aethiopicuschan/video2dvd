@@ -63,7 +63,7 @@ func TestMuxDVDTitleVOBInterleavesVideoAndLPCM(t *testing.T) {
 		U:        bytes.Repeat([]byte{128}, profile.FrameWidth*profile.FrameHeight/4),
 		V:        bytes.Repeat([]byte{128}, profile.FrameWidth*profile.FrameHeight/4),
 	}
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		if i == 1 {
 			frame = cloneDecodedVideoFrame(frame)
 			frame.Y[100*frame.Width+100] = 140

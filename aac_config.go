@@ -84,7 +84,7 @@ func esDescriptorChildren(payload []byte) ([]byte, error) {
 func readDescriptor(data []byte) ([]byte, []byte, error) {
 	length := 0
 	position := 0
-	for bytesRead := 0; bytesRead < 4; bytesRead++ {
+	for range 4 {
 		if position >= len(data) {
 			return nil, nil, errors.New("mp4todvd: truncated descriptor length")
 		}

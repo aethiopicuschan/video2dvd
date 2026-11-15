@@ -83,10 +83,7 @@ func (w *MPEGProgramStreamWriter) WritePES(streamID byte, pts time.Duration, pay
 			optionalHeader += ptsLength
 		}
 		maxPayload := DVDVOBSectorSize - 14 - 6 - optionalHeader - 6
-		count := len(payload)
-		if count > maxPayload {
-			count = maxPayload
-		}
+		count := min(len(payload), maxPayload)
 		packet := buildPESPacket(streamID, ptsTicks, first, payload[:count])
 		if err := w.writePack(packet); err != nil {
 			w.closedErr = fmt.Errorf("mp4todvd: write program stream pack: %w", err)

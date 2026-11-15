@@ -90,10 +90,7 @@ func (w *DVDLPCMPacketWriter) WriteChunk(chunk PCMChunk) error {
 	packetSamples := dvdLPCMFramesPerPacket * dvdLPCMSamplesPerFrame * 2
 	for offset := 0; offset < len(chunk.Samples); {
 		needed := packetSamples - len(w.pending)
-		count := len(chunk.Samples) - offset
-		if count > needed {
-			count = needed
-		}
+		count := min(len(chunk.Samples)-offset, needed)
 		w.pending = append(w.pending, chunk.Samples[offset:offset+count]...)
 		offset += count
 		if len(w.pending) == packetSamples {

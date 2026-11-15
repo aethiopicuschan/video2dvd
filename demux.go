@@ -381,7 +381,7 @@ func parseSyncSamples(r io.ReaderAt, box mp4Box) (map[uint32]struct{}, error) {
 	}
 	samples := make(map[uint32]struct{}, entryCount)
 	var previous uint32
-	for i := uint32(0); i < entryCount; i++ {
+	for i := range entryCount {
 		number := binary.BigEndian.Uint32(data[8+i*4 : 12+i*4])
 		if number == 0 || number <= previous {
 			return nil, errors.New("stss sample numbers must be positive and increasing")
@@ -479,7 +479,7 @@ func emitTrackSamples(r io.ReaderAt, fileSize int64, track TrackInfo, tables sam
 		}
 	}
 	var dts int64
-	for i := 0; i < sampleCount; i++ {
+	for i := range sampleCount {
 		if descriptionIndices[i] != 1 {
 			return fmt.Errorf("sample %d uses unsupported sample description %d", i+1, descriptionIndices[i])
 		}

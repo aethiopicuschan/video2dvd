@@ -403,7 +403,7 @@ func refreshUDFTag(descriptor []byte) {
 	binary.LittleEndian.PutUint16(descriptor[8:10], crcCCITT(descriptor[16:16+crcLength]))
 	descriptor[4] = 0
 	var checksum byte
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		checksum += descriptor[i]
 	}
 	descriptor[4] = checksum
@@ -481,7 +481,7 @@ func patchDVDImageIFO(image *os.File, locations map[string]udf.Location, titleCo
 	if binary.BigEndian.Uint16(table[0:2]) != uint16(titleCount) {
 		return errors.New("mp4todvd: VMGI title count does not match VIDEO_TS")
 	}
-	for i := 0; i < titleCount; i++ {
+	for i := range titleCount {
 		stem := fmt.Sprintf("VTS_%02d", i+1)
 		ifo := locations[stem+"_0.IFO"]
 		vob := locations[stem+"_1.VOB"]
@@ -695,10 +695,7 @@ func isoFileRecords(identifier string, loc udf.Location) ([][]byte, error) {
 	sector := loc.Sector
 	var records [][]byte
 	for remaining > 0 {
-		length := remaining
-		if length > maxExtentBytes {
-			length = maxExtentBytes
-		}
+		length := min(remaining, maxExtentBytes)
 		flags := byte(0)
 		if remaining > length {
 			flags = 0x80 // ISO 9660 multi-extent file record.
