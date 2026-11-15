@@ -79,6 +79,24 @@ func TestMPEG2VideoEncoderRejectsEmptyStream(t *testing.T) {
 	}
 }
 
+func TestMPEG2VideoEncoderHonorsConfiguredBitrate(t *testing.T) {
+	profile, err := (Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9, VideoBitrate: 4_000_000}).profile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoder, err := NewMPEG2VideoEncoder(&bytes.Buffer{}, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := 4_000_000 * 1001 / (8 * 30000); encoder.frameBytes != want {
+		t.Fatalf("frame budget = %d, want %d", encoder.frameBytes, want)
+	}
+	profile.VideoBitrate = 9_000_000
+	if _, err := NewMPEG2VideoEncoder(&bytes.Buffer{}, profile); err == nil {
+		t.Fatal("expected rejection of bitrate above DVD-safe limit")
+	}
+}
+
 func TestMPEG2VideoEncoderCodesACAndStaysWithinFrameBudget(t *testing.T) {
 	profile, err := (Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9}).profile()
 	if err != nil {

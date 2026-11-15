@@ -8,7 +8,18 @@ import (
 	"math"
 )
 
-const mpeg2VideoBitrate = 7_000_000
+const (
+	mpeg2VideoBitrate    = 8_000_000
+	mpeg2MinVideoBitrate = 2_000_000
+	mpeg2MaxVideoBitrate = 8_500_000
+)
+
+func profileVideoBitrate(profile Profile) int {
+	if profile.VideoBitrate == 0 {
+		return mpeg2VideoBitrate
+	}
+	return profile.VideoBitrate
+}
 
 var mpeg2DCTBasis = buildMPEG2DCTBasis()
 
@@ -75,13 +86,17 @@ func NewMPEG2VideoEncoder(dst io.Writer, profile Profile) (*MPEG2VideoEncoder, e
 		return nil, err
 	}
 	encoder := &MPEG2VideoEncoder{dst: dst, profile: profile}
+	bitrate := profileVideoBitrate(profile)
+	if bitrate < mpeg2MinVideoBitrate || bitrate > mpeg2MaxVideoBitrate {
+		return nil, fmt.Errorf("video2dvd: video bitrate must be between %d and %d bit/s", mpeg2MinVideoBitrate, mpeg2MaxVideoBitrate)
+	}
 	switch profile.Standard {
 	case VideoStandardNTSC:
 		encoder.frameRate = 30
-		encoder.frameBytes = mpeg2VideoBitrate * 1001 / (8 * 30000)
+		encoder.frameBytes = bitrate * 1001 / (8 * 30000)
 	case VideoStandardPAL:
 		encoder.frameRate = 25
-		encoder.frameBytes = mpeg2VideoBitrate / (8 * 25)
+		encoder.frameBytes = bitrate / (8 * 25)
 	default:
 		return nil, ErrInvalidProfile
 	}
@@ -215,12 +230,12 @@ func writeMPEG2SequenceHeader(bits *mpeg2BitWriter, profile Profile) {
 		frameRateCode = 3 // 25/1
 	}
 	bits.write(frameRateCode, 4)
-	bits.write(mpeg2VideoBitrate/400, 18) // Maximum video rate in units of 400 bit/s.
-	bits.write(1, 1)                      // marker_bit
-	bits.write(112, 10)                   // 224 KiB video buffering verifier.
-	bits.write(0, 1)                      // constrained_parameters_flag
-	bits.write(0, 1)                      // load_intra_quantiser_matrix
-	bits.write(0, 1)                      // load_non_intra_quantiser_matrix
+	bits.write(uint64(profileVideoBitrate(profile)/400), 18) // Maximum video rate in units of 400 bit/s.
+	bits.write(1, 1)                                         // marker_bit
+	bits.write(112, 10)                                      // 224 KiB video buffering verifier.
+	bits.write(0, 1)                                         // constrained_parameters_flag
+	bits.write(0, 1)                                         // load_intra_quantiser_matrix
+	bits.write(0, 1)                                         // load_non_intra_quantiser_matrix
 
 	bits.startCode(0xb5)
 	bits.write(1, 4)    // sequence_extension_identifier

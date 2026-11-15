@@ -54,6 +54,7 @@ type Profile struct {
 	MenuTitle          string
 	MenuBackgroundLuma uint8
 	MenuTextLuma       uint8
+	VideoBitrate       int
 }
 
 // Options controls conversion and DVD authoring. The zero value selects NTSC,
@@ -65,6 +66,7 @@ type Options struct {
 	MenuTitle          string
 	MenuBackgroundLuma uint8
 	MenuTextLuma       uint8
+	VideoBitrate       int
 }
 
 func (o Options) profile() (Profile, error) {
@@ -86,9 +88,9 @@ func (o Options) profile() (Profile, error) {
 
 	switch o.Standard {
 	case VideoStandardNTSC:
-		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 480, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma}, nil
+		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 480, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma, VideoBitrate: o.VideoBitrate}, nil
 	case VideoStandardPAL:
-		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 576, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma}, nil
+		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 576, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma, VideoBitrate: o.VideoBitrate}, nil
 	default:
 		return Profile{}, ErrInvalidProfile
 	}

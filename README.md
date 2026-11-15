@@ -73,4 +73,4 @@ err = converter.ConvertSources(ctx,
 
 同じファイル内の映像・音声トラックを選ぶ場合も `MediaInput` の `VideoTrackIndex` と `AudioTrackIndex` を設定できます。未指定時は、デコーダーが対応する最初のトラックを選びます。
 
-出力先は既存でないパスを指定します。`Convert` の成功時は `disc/VIDEO_TS` 以下に DVD-Video ファイルが作成されます。`ConvertISO` はISOイメージファイルを作ります。すでに作成したディレクトリは `WriteDVDISO(ctx, "./disc/VIDEO_TS", "./disc.iso")` でイメージ化できます。`DiscCapacityBytes` を省略するとDVD-5の4.7 GBを上限にし、ISO/UDFの管理領域も含めて判定します。エンコーダーの出力は MPEG-2 映像と AC-3、LPCM、または MPEG-1 Layer II 音声で、解像度とフレームレートは選択した DVD 規格に適合する必要があります。
+出力先は既存でないパスを指定します。`Convert` の成功時は `disc/VIDEO_TS` 以下に DVD-Video ファイルが作成されます。`ConvertISO` はISOイメージファイルを作ります。すでに作成したディレクトリは `WriteDVDISO(ctx, "./disc/VIDEO_TS", "./disc.iso")` でイメージ化できます。`DiscCapacityBytes` を省略するとDVD-5の4.7 GBを上限にし、ISO/UDFの管理領域も含めて判定します。`Options.VideoBitrate` は映像ビットレート（2〜8.5 Mbps）を指定でき、省略時は8 Mbpsです。エンコーダーの出力は MPEG-2 映像と AC-3、LPCM、または MPEG-1 Layer II 音声で、解像度とフレームレートは選択した DVD 規格に適合する必要があります。
