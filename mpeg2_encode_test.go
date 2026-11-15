@@ -124,3 +124,83 @@ func TestMPEG2VideoEncoderCodesACAndStaysWithinFrameBudget(t *testing.T) {
 		t.Fatalf("output size %d exceeds one-frame budget %d plus sequence end", output.Len(), encoder.frameBytes)
 	}
 }
+
+func TestMPEG2VideoEncoderUsesPredictivePicturesForUnchangedMacroblocks(t *testing.T) {
+	profile, err := (Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9}).profile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := DecodedVideoFrame{
+		Width:    profile.FrameWidth,
+		Height:   profile.FrameHeight,
+		Duration: time.Second * 1001 / 30000,
+		Y:        bytes.Repeat([]byte{96}, profile.FrameWidth*profile.FrameHeight),
+		U:        bytes.Repeat([]byte{128}, profile.FrameWidth*profile.FrameHeight/4),
+		V:        bytes.Repeat([]byte{128}, profile.FrameWidth*profile.FrameHeight/4),
+	}
+	var output bytes.Buffer
+	encoder, err := NewMPEG2VideoEncoder(&output, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if i == 2 {
+			frame = cloneDecodedVideoFrame(frame)
+			for y := 160; y < 176; y++ {
+				for x := 320; x < 336; x++ {
+					frame.Y[y*frame.Width+x]++
+				}
+			}
+		}
+		if err := encoder.WriteFrame(frame); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := encoder.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	types, sizes := mpeg2TestPictureTypesAndSizes(output.Bytes())
+	if len(types) != 3 {
+		t.Fatalf("found %d pictures, want 3", len(types))
+	}
+	if types[0] != 1 || types[1] != 2 || types[2] != 2 {
+		t.Fatalf("picture types = %v, want I, P, P", types)
+	}
+	if sizes[1] >= sizes[0] {
+		t.Fatalf("unchanged P picture size %d should be smaller than I picture size %d", sizes[1], sizes[0])
+	}
+	if sizes[2] <= sizes[1] {
+		t.Fatalf("P picture with a changed macroblock size %d should exceed unchanged P picture size %d", sizes[2], sizes[1])
+	}
+}
+
+func mpeg2TestPictureTypesAndSizes(stream []byte) ([]uint32, []int) {
+	var types []uint32
+	var sizes []int
+	for position := 0; position+4 <= len(stream); position++ {
+		if !bytes.Equal(stream[position:position+4], []byte{0, 0, 1, 0}) {
+			continue
+		}
+		if position+6 > len(stream) {
+			break
+		}
+		reader := bitReader{data: stream[position+4:]}
+		_, _ = reader.read(10)
+		pictureType, err := reader.read(3)
+		if err != nil {
+			break
+		}
+		end := len(stream)
+		for next := position + 4; next+4 <= len(stream); next++ {
+			if bytes.Equal(stream[next:next+4], []byte{0, 0, 1, 0}) || bytes.Equal(stream[next:next+4], []byte{0, 0, 1, 0xb7}) {
+				end = next
+				break
+			}
+		}
+		types = append(types, pictureType)
+		sizes = append(sizes, end-position)
+		position = end - 1
+	}
+	return types, sizes
+}

@@ -1,6 +1,7 @@
 package mp4todvd
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -48,9 +49,10 @@ func buildMPEG2DCTBasis() [8][8]float64 {
 }
 
 // MPEG2VideoEncoder writes a DVD-raster MPEG-2 elementary stream from planar
-// YUV 4:2:0 frames. It emits closed GOPs containing I pictures and codes full
-// intra DCT blocks with an escape-based run/level writer. Its simple quantizer
-// and lack of inter-frame prediction limit quality and compression efficiency.
+// YUV 4:2:0 frames. It emits closed GOPs containing I pictures and P pictures;
+// P pictures skip macroblocks that exactly match the previous input frame and
+// code changed macroblocks intra. Its simple quantizer and lack of motion
+// estimation limit quality and compression efficiency.
 //
 // The writer does not close dst. Call Close after the final frame to write the
 // MPEG sequence-end code.
@@ -60,6 +62,7 @@ type MPEG2VideoEncoder struct {
 	frameRate  int
 	frameBytes int
 	frameNo    int64
+	reference  *DecodedVideoFrame
 	closed     bool
 	writeErr   error
 }
@@ -108,21 +111,32 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 	mbWidth := frame.Width / 16
 	mbHeight := frame.Height / 16
 	blocks := collectMPEG2IntraBlocks(frame, mbWidth, mbHeight)
+	isIntra := e.reference == nil || e.frameNo%15 == 0
 	var encoded []byte
 	for quantizer := 1; quantizer <= 31; quantizer++ {
-		encoded = e.encodeIntraPicture(frame, blocks, mbWidth, mbHeight, quantizer, true)
+		if isIntra {
+			encoded = e.encodeIntraPicture(frame, blocks, mbWidth, mbHeight, quantizer, true)
+		} else {
+			encoded = e.encodePredictivePicture(frame, *e.reference, blocks, mbWidth, mbHeight, quantizer, true)
+		}
 		if len(encoded) <= e.frameBytes {
 			break
 		}
 	}
 	if len(encoded) > e.frameBytes {
 		// At the upper quantizer limit, retain the DC image as a bounded fallback.
-		encoded = e.encodeIntraPicture(frame, blocks, mbWidth, mbHeight, 31, false)
+		if isIntra {
+			encoded = e.encodeIntraPicture(frame, blocks, mbWidth, mbHeight, 31, false)
+		} else {
+			encoded = e.encodePredictivePicture(frame, *e.reference, blocks, mbWidth, mbHeight, 31, false)
+		}
 	}
 	if err := writeAll(e.dst, encoded); err != nil {
 		e.writeErr = fmt.Errorf("mp4todvd: write MPEG-2 picture %d: %w", e.frameNo, err)
 		return e.writeErr
 	}
+	reference := cloneDecodedVideoFrame(frame)
+	e.reference = &reference
 	e.frameNo++
 	return nil
 }
@@ -133,9 +147,18 @@ func (e *MPEG2VideoEncoder) encodeIntraPicture(frame DecodedVideoFrame, blocks [
 		writeMPEG2SequenceHeader(&bits, e.profile)
 		writeMPEG2GOPHeader(&bits, e.frameNo, e.frameRate)
 	}
-	writeMPEG2PictureHeader(&bits, uint16(e.frameNo%15))
+	writeMPEG2PictureHeader(&bits, uint16(e.frameNo%15), 1)
 	for row := 0; row < mbHeight; row++ {
 		writeMPEG2IntraSlice(&bits, blocks, row, mbWidth, quantizer, includeAC)
+	}
+	return bits.bytes()
+}
+
+func (e *MPEG2VideoEncoder) encodePredictivePicture(frame, reference DecodedVideoFrame, blocks []mpeg2IntraBlock, mbWidth, mbHeight, quantizer int, includeAC bool) []byte {
+	var bits mpeg2BitWriter
+	writeMPEG2PictureHeader(&bits, uint16(e.frameNo%15), 2)
+	for row := 0; row < mbHeight; row++ {
+		writeMPEG2PredictiveSlice(&bits, frame, reference, blocks, row, mbWidth, quantizer, includeAC)
 	}
 	return bits.bytes()
 }
@@ -216,12 +239,20 @@ func writeMPEG2GOPHeader(bits *mpeg2BitWriter, frameNo int64, nominalRate int) {
 	bits.write(0, 1) // broken_link
 }
 
-func writeMPEG2PictureHeader(bits *mpeg2BitWriter, temporalReference uint16) {
+func writeMPEG2PictureHeader(bits *mpeg2BitWriter, temporalReference uint16, pictureType uint8) {
 	bits.startCode(0x00)
 	bits.write(uint64(temporalReference), 10)
-	bits.write(1, 3)       // I picture
+	bits.write(uint64(pictureType), 3)
 	bits.write(0xffff, 16) // vbv_delay
-	bits.write(0, 1)       // extra_bit_picture
+	if pictureType == 2 || pictureType == 3 {
+		bits.write(0, 1) // full_pel_forward_vector
+		bits.write(1, 3) // forward_f_code
+	}
+	if pictureType == 3 {
+		bits.write(0, 1) // full_pel_backward_vector
+		bits.write(1, 3) // backward_f_code
+	}
+	bits.write(0, 1) // extra_bit_picture
 
 	bits.startCode(0xb5)
 	bits.write(8, 4) // picture_coding_extension_identifier
@@ -317,6 +348,76 @@ func writeMPEG2IntraSlice(bits *mpeg2BitWriter, blocks []mpeg2IntraBlock, row, m
 		lastCr = writeMPEG2Block(bits, blocks[blockIndex+5], lastCr, quantizer, includeAC)
 	}
 	bits.align()
+}
+
+func writeMPEG2PredictiveSlice(bits *mpeg2BitWriter, frame, reference DecodedVideoFrame, blocks []mpeg2IntraBlock,
+	row, mbWidth, quantizer int, includeAC bool) {
+	bits.startCode(byte(row + 1))
+	bits.write(uint64(quantizer), 5)
+	bits.write(0, 1) // extra_bit_slice
+	lastY, lastCb, lastCr := 128, 128, 128
+	lastColumn := -1
+	for column := 0; column < mbWidth; column++ {
+		// Keep both slice edges coded so skipped macroblocks are represented
+		// between coded addresses rather than left implicit at the slice end.
+		changed := column == 0 || column == mbWidth-1 || !sameMPEG2Macroblock(frame, reference, row, column)
+		if !changed {
+			continue
+		}
+		writeMPEG2MacroblockAddressIncrement(bits, column-lastColumn)
+		if column-lastColumn > 1 {
+			lastY, lastCb, lastCr = 128, 128, 128
+		}
+		bits.write(0b00011, 5) // P-picture macroblock_type = intra.
+		blockIndex := (row*mbWidth + column) * 6
+		for block := 0; block < 4; block++ {
+			lastY = writeMPEG2Block(bits, blocks[blockIndex+block], lastY, quantizer, includeAC)
+		}
+		lastCb = writeMPEG2Block(bits, blocks[blockIndex+4], lastCb, quantizer, includeAC)
+		lastCr = writeMPEG2Block(bits, blocks[blockIndex+5], lastCr, quantizer, includeAC)
+		lastColumn = column
+	}
+	bits.align()
+}
+
+func sameMPEG2Macroblock(first, second DecodedVideoFrame, row, column int) bool {
+	left, top := column*16, row*16
+	if !samePlaneRectangle(first.Y, second.Y, first.Width, left, top, 16, 16) {
+		return false
+	}
+	left, top = column*8, row*8
+	return samePlaneRectangle(first.U, second.U, first.Width/2, left, top, 8, 8) &&
+		samePlaneRectangle(first.V, second.V, first.Width/2, left, top, 8, 8)
+}
+
+func samePlaneRectangle(first, second []byte, stride, x, y, width, height int) bool {
+	for row := 0; row < height; row++ {
+		start := (y+row)*stride + x
+		if !bytes.Equal(first[start:start+width], second[start:start+width]) {
+			return false
+		}
+	}
+	return true
+}
+
+var mpeg2MacroblockAddressCodes = [...]string{
+	"", "1", "011", "010", "0011", "0010", "00011", "00010",
+	"0000111", "0000110", "00001011", "00001010", "00001001", "00001000",
+	"00000111", "00000110", "0000010111", "0000010110", "0000010101", "0000010100",
+	"0000010011", "0000010010", "00000100011", "00000100010", "00000100001", "00000100000",
+	"00000011111", "00000011110", "00000011101", "00000011100", "00000011011", "00000011010",
+	"00000011001", "00000011000",
+}
+
+func writeMPEG2MacroblockAddressIncrement(bits *mpeg2BitWriter, increment int) {
+	for increment > 33 {
+		bits.write(0b00000001000, 11) // macroblock_escape adds 33.
+		increment -= 33
+	}
+	code := mpeg2MacroblockAddressCodes[increment]
+	for _, bit := range code {
+		bits.write(uint64(bit-'0'), 1)
+	}
 }
 
 func writeMPEG2Block(bits *mpeg2BitWriter, block mpeg2IntraBlock, predictor, quantizer int, includeAC bool) int {
