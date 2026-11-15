@@ -1,8 +1,9 @@
 package video2dvd
 
 import (
+	"bytes"
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,39 +12,61 @@ import (
 
 const dvdMenuMaxButtons = 36
 
-func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Profile, workDir string) (EncodedTitle, []DVDNAVButton, error) {
+func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Profile, workDir string) (EncodedTitle, [][]DVDNAVButton, error) {
 	maxButtons := dvdMenuMaxButtons
 	if profile.Aspect == AspectRatio16x9 {
 		maxButtons = 18
 	}
-	if len(titles) == 0 || len(titles) > maxButtons {
-		return EncodedTitle{}, nil, fmt.Errorf("video2dvd: automatically generated menu supports 1 to %d titles", maxButtons)
+	if len(titles) == 0 {
+		return EncodedTitle{}, nil, errors.New("video2dvd: automatically generated menu requires at least one title")
 	}
-	frame := newDVDMenuFrame(profile, titles)
+	pages := (len(titles) + maxButtons - 1) / maxButtons
 	videoPath := filepath.Join(workDir, "menu.m2v")
 	videoFile, err := os.Create(videoPath)
 	if err != nil {
 		return EncodedTitle{}, nil, err
 	}
-	encoder, err := NewMPEG2VideoEncoder(videoFile, profile)
-	if err == nil {
-		err = encoder.WriteFrame(frame)
+	buttonPages := make([][]DVDNAVButton, 0, pages)
+	for page := range pages {
+		start := page * maxButtons
+		end := min(len(titles), start+maxButtons)
+		var encoded bytes.Buffer
+		encoder, encodeErr := NewMPEG2VideoEncoder(&encoded, profile)
+		if encodeErr == nil {
+			encodeErr = encoder.WriteFrame(newDVDMenuFrame(profile, titles[start:end], start))
+		}
+		if encodeErr == nil {
+			encodeErr = encoder.Close()
+		}
+		if encodeErr != nil {
+			_ = videoFile.Close()
+			return EncodedTitle{}, nil, encodeErr
+		}
+		if _, err := videoFile.Write(encoded.Bytes()); err != nil {
+			_ = videoFile.Close()
+			return EncodedTitle{}, nil, err
+		}
+		buttonPages = append(buttonPages, makeDVDMenuButtons(start, end, profile))
 	}
-	if err == nil {
-		err = encoder.Close()
-	}
-	closeErr := videoFile.Close()
-	if err != nil {
-		return EncodedTitle{}, nil, err
-	}
-	if closeErr != nil {
+	if closeErr := videoFile.Close(); closeErr != nil {
 		return EncodedTitle{}, nil, closeErr
 	}
 	audioPath := filepath.Join(workDir, "menu.lpcm")
 	if err := os.WriteFile(audioPath, []byte{0, 0, 0, 0}, 0o600); err != nil {
 		return EncodedTitle{}, nil, err
 	}
-	buttons := make([]DVDNAVButton, len(titles))
+	return EncodedTitle{
+		VideoPath: videoPath, AudioPath: audioPath,
+		VideoCodec: VideoCodecMPEG2, AudioCodec: AudioCodecLPCM,
+		Aspect: profile.Aspect, Width: profile.FrameWidth, Height: profile.FrameHeight,
+		FrameRateNumerator:   menuFrameRateNumerator(profile.Standard),
+		FrameRateDenominator: menuFrameRateDenominator(profile.Standard),
+		Duration:             time.Duration(pages) * time.Second,
+	}, buttonPages, ctx.Err()
+}
+
+func makeDVDMenuButtons(start, end int, profile Profile) []DVDNAVButton {
+	buttons := make([]DVDNAVButton, end-start)
 	for i := range buttons {
 		column, row := i/18, i%18
 		up, down := i-1, i+1
@@ -64,22 +87,18 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 		if column == 1 {
 			left, right = 368, 704
 		}
+		if profile.Aspect == AspectRatio16x9 {
+			left, right = 48, 672
+		}
 		top := 92 + row*20
 		buttons[i] = DVDNAVButton{
 			XStart: left, YStart: top, XEnd: right, YEnd: top + 16,
 			Up: uint8(up + 1), Down: uint8(down + 1),
 			Left: uint8(leftIndex + 1), Right: uint8(rightIndex + 1),
-			Command: dvdJumpTitleCommand(i + 1),
+			Command: dvdJumpTitleCommand(start + i + 1),
 		}
 	}
-	return EncodedTitle{
-		VideoPath: videoPath, AudioPath: audioPath,
-		VideoCodec: VideoCodecMPEG2, AudioCodec: AudioCodecLPCM,
-		Aspect: profile.Aspect, Width: profile.FrameWidth, Height: profile.FrameHeight,
-		FrameRateNumerator:   menuFrameRateNumerator(profile.Standard),
-		FrameRateDenominator: menuFrameRateDenominator(profile.Standard),
-		Duration:             time.Second,
-	}, buttons, ctx.Err()
+	return buttons
 }
 
 func dvdJumpTitleCommand(titleNumber int) [8]byte {
@@ -104,7 +123,7 @@ func menuFrameRateDenominator(standard VideoStandard) int {
 	return 1001
 }
 
-func newDVDMenuFrame(profile Profile, titles []EncodedTitle) DecodedVideoFrame {
+func newDVDMenuFrame(profile Profile, titles []EncodedTitle, start int) DecodedVideoFrame {
 	frame := DecodedVideoFrame{Width: profile.FrameWidth, Height: profile.FrameHeight, Duration: time.Second,
 		Y: make([]byte, profile.FrameWidth*profile.FrameHeight), U: make([]byte, profile.FrameWidth*profile.FrameHeight/4), V: make([]byte, profile.FrameWidth*profile.FrameHeight/4)}
 	for i := range frame.Y {
@@ -122,7 +141,7 @@ func newDVDMenuFrame(profile Profile, titles []EncodedTitle) DecodedVideoFrame {
 		if column == 1 {
 			x = 376
 		}
-		drawDVDMenuText(&frame, x, 94+row*20, padMenuNumber(i+1)+" "+name, 210)
+		drawDVDMenuText(&frame, x, 94+row*20, padMenuNumber(start+i+1)+" "+name, 210)
 	}
 	return frame
 }
