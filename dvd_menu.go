@@ -60,7 +60,11 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 }
 
 func dvdJumpTitleCommand(titleNumber int) [8]byte {
-	return [8]byte{0x30, 0x02, byte(titleNumber)}
+	return [8]byte{0x30, 0x02, 0, 0, 0, byte(titleNumber)}
+}
+
+func dvdJumpMenuCommand() [8]byte {
+	return [8]byte{0x30, 0x06, 0, 0, 0, 0x42}
 }
 
 func menuFrameRateNumerator(standard VideoStandard) int {

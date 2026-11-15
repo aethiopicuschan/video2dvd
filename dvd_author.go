@@ -235,7 +235,7 @@ func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord
 	binary.BigEndian.PutUint16(ptt[14:16], 1) // PGN
 	copy(ifo[DVDVOBSectorSize:], ptt)
 
-	pgc := buildDVDVTSProgramChain(playbackTime, records, vobSectors)
+	pgc := buildDVDVTSProgramChain(playbackTime, records, vobSectors, dvdJumpMenuCommand())
 	pgci := make([]byte, 16+len(pgc))
 	binary.BigEndian.PutUint16(pgci[0:2], 1)
 	binary.BigEndian.PutUint32(pgci[4:8], uint32(len(pgci)-1))
@@ -262,20 +262,25 @@ func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord
 	return ifo, ifoSectors, nil
 }
 
-func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobSectors uint32) []byte {
+func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobSectors uint32, postCommand [8]byte) []byte {
 	const headerSize = 0xec
+	const commandTableSize = 16
 	const programMapSize = 2 // one program cell number, padded to an even byte count.
 	const cellPlaybackSize = 24
 	const cellPositionSize = 4
-	pgc := make([]byte, headerSize+programMapSize+cellPlaybackSize+cellPositionSize)
+	pgc := make([]byte, headerSize+commandTableSize+programMapSize+cellPlaybackSize+cellPositionSize)
 	pgc[2], pgc[3] = 1, 1
 	copy(pgc[4:8], playbackTime[:])
 	pgc[0x0c] = 0x80 // first LPCM stream is available on private_stream_1 substream 0.
-	binary.BigEndian.PutUint16(pgc[0x00E6:0x00E8], headerSize)
-	binary.BigEndian.PutUint16(pgc[0x00E8:0x00EA], headerSize+programMapSize)
-	binary.BigEndian.PutUint16(pgc[0x00EA:0x00EC], headerSize+programMapSize+cellPlaybackSize)
-	pgc[headerSize] = 1
-	cell := pgc[headerSize+programMapSize:]
+	binary.BigEndian.PutUint16(pgc[0x00e4:0x00e6], headerSize)
+	binary.BigEndian.PutUint16(pgc[0x00e6:0x00e8], headerSize+commandTableSize)
+	binary.BigEndian.PutUint16(pgc[0x00e8:0x00ea], headerSize+commandTableSize+programMapSize)
+	binary.BigEndian.PutUint16(pgc[0x00ea:0x00ec], headerSize+commandTableSize+programMapSize+cellPlaybackSize)
+	commandTable := pgc[headerSize : headerSize+commandTableSize]
+	binary.BigEndian.PutUint16(commandTable[2:4], 1) // one post-command.
+	copy(commandTable[8:16], postCommand[:])
+	pgc[headerSize+commandTableSize] = 1
+	cell := pgc[headerSize+commandTableSize+programMapSize:]
 	copy(cell[4:8], playbackTime[:])
 	binary.BigEndian.PutUint32(cell[8:12], records[0].StartSector)
 	binary.BigEndian.PutUint32(cell[16:20], records[len(records)-1].StartSector)

@@ -24,7 +24,7 @@
 
 `MuxDVDTitleVOB` は1タイトル分のMPEG-2映像とLPCM音声をPTS順に多重化し、Iフレームから始まるVOBUごとにPCI/DSI入りのNAVパックを置きます。`MPEGProgramStreamWriter` と `DVDLPCMPacketWriter` はその下位部品で、`BuildDVDNAVPack` はNAVパック単体を構築します。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
 
-`NewInProcessAuthorer` はDVD規格上の最大99個の入力を入力順に別々のVTS/タイトルとしてオーサリングし、各入力動画を1タイトル・1チャプターとして登録します。自動生成タイトルメニューは1ページ最大18タイトルに対応し、動画ファイル名を `VIDEO_TS.VOB` に表示して、DVDリモコンの方向キーと決定ボタンで各タイトルへ移動できます。19タイトル以上の複数ページメニュー、字幕は未対応です。VMG/VTSのIFO・BUP、PTT/PGC/セル/VOBUテーブルと各タイトルのVOBも作成します。`WriteDVDISO` は `VIDEO_TS` をISO 9660とUDF 1.02の両方から読めるDVD-Videoイメージにまとめます。UDFの実ファイル配置に基づいてIFO内のセクタ参照を確定し、ISOメタデータを含めた容量も確認します。UDFの記述には純Goの [go-sdk-winmediafoundry UDF package](https://pkg.go.dev/github.com/deploymenttheory/go-sdk-winmediafoundry/pkg/udf) を使い、外部プロセスは起動しません。ディスクへの書き込みは未実装です。
+`NewInProcessAuthorer` はDVD規格上の最大99個の入力を入力順に別々のVTS/タイトルとしてオーサリングし、各入力動画を1タイトル・1チャプターとして登録します。自動生成タイトルメニューは動画ファイル名を `VIDEO_TS.VOB` に表示し、DVDリモコンの方向キーと決定ボタンで各タイトルへ移動できます。タイトル再生終了後はタイトルメニューへ戻ります。1ページに収まる最大18タイトルに対応し、複数ページメニューと字幕は未対応です。VMG/VTSのIFO・BUP、PTT/PGC/セル/VOBUテーブルと各タイトルのVOBも作成します。`WriteDVDISO` は `VIDEO_TS` をISO 9660とUDF 1.02の両方から読めるDVD-Videoイメージにまとめます。UDFの実ファイル配置に基づいてIFO内のセクタ参照を確定し、ISOメタデータを含めた容量も確認します。UDFの記述には純Goの [go-sdk-winmediafoundry UDF package](https://pkg.go.dev/github.com/deploymenttheory/go-sdk-winmediafoundry/pkg/udf) を使い、外部プロセスは起動しません。ディスクへの書き込みは未実装です。
 
 ## バックエンドの接続
 
