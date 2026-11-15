@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"encoding/binary"
@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-var ErrInvalidMP4 = errors.New("mp4todvd: invalid or unsupported MP4 container")
+var ErrInvalidMP4 = errors.New("video2dvd: invalid or unsupported MP4 container")
 
 // TrackKind identifies the media carried by an MP4 track.
 type TrackKind string
@@ -58,12 +58,12 @@ type mp4Box struct {
 func ProbeMP4(path string) (MP4Info, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return MP4Info{}, fmt.Errorf("mp4todvd: open MP4: %w", err)
+		return MP4Info{}, fmt.Errorf("video2dvd: open MP4: %w", err)
 	}
 	defer f.Close()
 	stat, err := f.Stat()
 	if err != nil {
-		return MP4Info{}, fmt.Errorf("mp4todvd: stat MP4: %w", err)
+		return MP4Info{}, fmt.Errorf("video2dvd: stat MP4: %w", err)
 	}
 	if !stat.Mode().IsRegular() {
 		return MP4Info{}, fmt.Errorf("%w: input is not a regular file", ErrInvalidMP4)

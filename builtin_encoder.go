@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"context"
@@ -30,16 +30,16 @@ func (e *InProcessEncoder) Encode(ctx context.Context, inputPath, workDir string
 // selected tracks in a shared file.
 func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, workDir string, profile Profile) (EncodedTitle, error) {
 	if e == nil {
-		return EncodedTitle{}, errors.New("mp4todvd: in-process encoder is nil")
+		return EncodedTitle{}, errors.New("video2dvd: in-process encoder is nil")
 	}
 	if ctx == nil {
-		return EncodedTitle{}, errors.New("mp4todvd: context must not be nil")
+		return EncodedTitle{}, errors.New("video2dvd: context must not be nil")
 	}
 	if err := ctx.Err(); err != nil {
 		return EncodedTitle{}, err
 	}
 	if input.VideoPath == "" {
-		return EncodedTitle{}, errors.New("mp4todvd: video input path is required")
+		return EncodedTitle{}, errors.New("video2dvd: video input path is required")
 	}
 	if input.AudioPath == "" {
 		input.AudioPath = input.VideoPath
@@ -53,14 +53,14 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		return EncodedTitle{}, err
 	}
 	if videoTrack.Width <= 0 || videoTrack.Height <= 0 {
-		return EncodedTitle{}, errors.New("mp4todvd: video track has invalid dimensions")
+		return EncodedTitle{}, errors.New("video2dvd: video track has invalid dimensions")
 	}
 	duration := info.Duration
 	if duration <= 0 {
 		duration = videoTrack.Duration
 	}
 	if duration <= 0 {
-		return EncodedTitle{}, errors.New("mp4todvd: input has no usable duration")
+		return EncodedTitle{}, errors.New("video2dvd: input has no usable duration")
 	}
 	if err := validateEncoderProfile(profile); err != nil {
 		return EncodedTitle{}, err
@@ -69,7 +69,7 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		return EncodedTitle{}, err
 	}
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
-		return EncodedTitle{}, fmt.Errorf("mp4todvd: create encoder work directory: %w", err)
+		return EncodedTitle{}, fmt.Errorf("video2dvd: create encoder work directory: %w", err)
 	}
 	videoPath := filepath.Join(workDir, "video.m2v")
 	audioPath := filepath.Join(workDir, "audio.lpcm")
@@ -88,7 +88,7 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 
 	videoFile, err := os.OpenFile(videoPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return EncodedTitle{}, fmt.Errorf("mp4todvd: create MPEG-2 output: %w", err)
+		return EncodedTitle{}, fmt.Errorf("video2dvd: create MPEG-2 output: %w", err)
 	}
 	videoCreated = true
 	videoEncoder, err := NewMPEG2VideoEncoder(&sizeLimitedWriter{dst: videoFile, limit: encoderOutputLimit(profile)}, profile)
@@ -110,18 +110,18 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 	closeEncoderErr := videoEncoder.Close()
 	closeVideoErr := videoFile.Close()
 	if prepareErr != nil {
-		return EncodedTitle{}, fmt.Errorf("mp4todvd: prepare DVD video: %w", prepareErr)
+		return EncodedTitle{}, fmt.Errorf("video2dvd: prepare DVD video: %w", prepareErr)
 	}
 	if closeEncoderErr != nil {
 		return EncodedTitle{}, closeEncoderErr
 	}
 	if closeVideoErr != nil {
-		return EncodedTitle{}, fmt.Errorf("mp4todvd: close MPEG-2 output: %w", closeVideoErr)
+		return EncodedTitle{}, fmt.Errorf("video2dvd: close MPEG-2 output: %w", closeVideoErr)
 	}
 
 	audioFile, err := os.OpenFile(audioPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
-		return EncodedTitle{}, fmt.Errorf("mp4todvd: create LPCM output: %w", err)
+		return EncodedTitle{}, fmt.Errorf("video2dvd: create LPCM output: %w", err)
 	}
 	audioCreated = true
 	audioWriter := &sizeLimitedWriter{dst: audioFile, limit: encoderOutputLimit(profile)}
@@ -130,7 +130,7 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		audioInfo, err = ProbeMedia(input.AudioPath)
 		if err != nil {
 			_ = audioFile.Close()
-			return EncodedTitle{}, fmt.Errorf("mp4todvd: inspect audio source: %w", err)
+			return EncodedTitle{}, fmt.Errorf("video2dvd: inspect audio source: %w", err)
 		}
 	}
 	audioTrack, hasAudio := firstSupportedAudioTrack(audioInfo, input.AudioTrackIndex)
@@ -146,17 +146,17 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 			err = DecodeMP4Audio(ctx, input.AudioPath, &audioTrack.Index, audioTimeline.WriteChunk)
 		}
 	} else if hasAnyAudioTrack(audioInfo) {
-		err = errors.New("mp4todvd: input has audio tracks but none are supported by the built-in decoder (MP4 AAC-LC/AC-3, WebM Opus)")
+		err = errors.New("video2dvd: input has audio tracks but none are supported by the built-in decoder (MP4 AAC-LC/AC-3, WebM Opus)")
 	}
 	if err == nil {
 		err = audioTimeline.Finish()
 	}
 	closeAudioErr := audioFile.Close()
 	if err != nil {
-		return EncodedTitle{}, fmt.Errorf("mp4todvd: prepare DVD audio: %w", err)
+		return EncodedTitle{}, fmt.Errorf("video2dvd: prepare DVD audio: %w", err)
 	}
 	if closeAudioErr != nil {
-		return EncodedTitle{}, fmt.Errorf("mp4todvd: close LPCM output: %w", closeAudioErr)
+		return EncodedTitle{}, fmt.Errorf("video2dvd: close LPCM output: %w", closeAudioErr)
 	}
 	if err := ctx.Err(); err != nil {
 		return EncodedTitle{}, err
@@ -227,18 +227,18 @@ func selectInputVideoTrack(info MP4Info, requested *int) (TrackInfo, error) {
 				continue
 			}
 			if track.Kind != TrackKindVideo || !supportedInputVideoCodec(track.Codec) {
-				return TrackInfo{}, fmt.Errorf("mp4todvd: track %d is not a supported video track", *requested)
+				return TrackInfo{}, fmt.Errorf("video2dvd: track %d is not a supported video track", *requested)
 			}
 			return track, nil
 		}
-		return TrackInfo{}, fmt.Errorf("mp4todvd: video track index %d is out of range", *requested)
+		return TrackInfo{}, fmt.Errorf("video2dvd: video track index %d is out of range", *requested)
 	}
 	for _, track := range info.Tracks {
 		if track.Kind == TrackKindVideo && supportedInputVideoCodec(track.Codec) {
 			return track, nil
 		}
 	}
-	return TrackInfo{}, errors.New("mp4todvd: input has no video track supported by the built-in decoder (MP4 H.264, WebM VP8/VP9/AV1)")
+	return TrackInfo{}, errors.New("video2dvd: input has no video track supported by the built-in decoder (MP4 H.264, WebM VP8/VP9/AV1)")
 }
 
 func selectInputAudioTrack(info MP4Info, requested *int) (TrackInfo, error) {
@@ -249,12 +249,12 @@ func selectInputAudioTrack(info MP4Info, requested *int) (TrackInfo, error) {
 	if requested != nil {
 		for _, track := range info.Tracks {
 			if track.Index == *requested {
-				return TrackInfo{}, fmt.Errorf("mp4todvd: track %d is not a supported audio track", *requested)
+				return TrackInfo{}, fmt.Errorf("video2dvd: track %d is not a supported audio track", *requested)
 			}
 		}
-		return TrackInfo{}, fmt.Errorf("mp4todvd: audio track index %d is out of range", *requested)
+		return TrackInfo{}, fmt.Errorf("video2dvd: audio track index %d is out of range", *requested)
 	}
-	return TrackInfo{}, errors.New("mp4todvd: no supported audio track (MP4 AAC-LC/AC-3, WebM Opus)")
+	return TrackInfo{}, errors.New("video2dvd: no supported audio track (MP4 AAC-LC/AC-3, WebM Opus)")
 }
 
 func supportedInputVideoCodec(codec string) bool {
@@ -286,14 +286,14 @@ func hasAnyAudioTrack(info MP4Info) bool {
 
 func trackDisplayAspect(track TrackInfo) (int, int, error) {
 	if track.Width <= 0 || track.Height <= 0 {
-		return 0, 0, errors.New("mp4todvd: video track has invalid display dimensions")
+		return 0, 0, errors.New("video2dvd: video track has invalid display dimensions")
 	}
 	horizontal, vertical := uint64(track.PixelAspectHorizontal), uint64(track.PixelAspectVertical)
 	if horizontal == 0 && vertical == 0 {
 		horizontal, vertical = 1, 1
 	}
 	if horizontal == 0 || vertical == 0 {
-		return 0, 0, errors.New("mp4todvd: video track has an incomplete pixel aspect ratio")
+		return 0, 0, errors.New("video2dvd: video track has an incomplete pixel aspect ratio")
 	}
 	numerator := uint64(track.Width) * horizontal
 	denominator := uint64(track.Height) * vertical
@@ -301,7 +301,7 @@ func trackDisplayAspect(track TrackInfo) (int, int, error) {
 	numerator, denominator = numerator/divisor, denominator/divisor
 	maxInt := uint64(^uint(0) >> 1)
 	if numerator > maxInt || denominator > maxInt {
-		return 0, 0, errors.New("mp4todvd: video display aspect ratio is too large")
+		return 0, 0, errors.New("video2dvd: video display aspect ratio is too large")
 	}
 	return int(numerator), int(denominator), nil
 }
@@ -337,7 +337,7 @@ func checkEstimatedTitleSize(duration time.Duration, capacity int64) error {
 
 func estimateRateBytes(duration time.Duration, bytesPerSecond int64) (int64, error) {
 	if duration <= 0 || bytesPerSecond <= 0 {
-		return 0, errors.New("mp4todvd: invalid duration or byte rate")
+		return 0, errors.New("video2dvd: invalid duration or byte rate")
 	}
 	seconds := int64(duration / time.Second)
 	remainder := int64(duration % time.Second)
@@ -364,7 +364,7 @@ func (w *sizeLimitedWriter) Write(data []byte) (int, error) {
 		return 0, nil
 	}
 	if w == nil || w.dst == nil || w.limit < 0 {
-		return 0, errors.New("mp4todvd: invalid size-limited writer")
+		return 0, errors.New("video2dvd: invalid size-limited writer")
 	}
 	remaining := w.limit - w.written
 	if remaining <= 0 {
@@ -374,7 +374,7 @@ func (w *sizeLimitedWriter) Write(data []byte) (int, error) {
 		count := int(remaining)
 		n, err := w.dst.Write(data[:count])
 		if n < 0 || n > count {
-			return 0, errors.New("mp4todvd: writer returned an invalid byte count")
+			return 0, errors.New("video2dvd: writer returned an invalid byte count")
 		}
 		if n > 0 {
 			w.written += int64(n)
@@ -386,7 +386,7 @@ func (w *sizeLimitedWriter) Write(data []byte) (int, error) {
 	}
 	n, err := w.dst.Write(data)
 	if n < 0 || n > len(data) {
-		return 0, errors.New("mp4todvd: writer returned an invalid byte count")
+		return 0, errors.New("video2dvd: writer returned an invalid byte count")
 	}
 	w.written += int64(n)
 	if err == nil && n != len(data) {

@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"bytes"

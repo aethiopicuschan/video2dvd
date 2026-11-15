@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"encoding/binary"
@@ -35,10 +35,10 @@ type DVDNAVPackInfo struct {
 // generate the corresponding IFO navigation tables.
 func BuildDVDNAVPack(info DVDNAVPackInfo) ([]byte, error) {
 	if info.VOBID == 0 || info.CellID == 0 {
-		return nil, errors.New("mp4todvd: DVD NAV pack requires nonzero VOB and cell IDs")
+		return nil, errors.New("video2dvd: DVD NAV pack requires nonzero VOB and cell IDs")
 	}
 	if info.SCRBase > maxMPEGTimestamp {
-		return nil, errors.New("mp4todvd: DVD NAV SCR exceeds the MPEG 33-bit range")
+		return nil, errors.New("video2dvd: DVD NAV SCR exceeds the MPEG 33-bit range")
 	}
 	pack := make([]byte, DVDVOBSectorSize)
 	copy(pack, buildMPEG2PackHeader(info.SCRBase, defaultProgramMuxRate/50))
@@ -71,7 +71,7 @@ func BuildDVDNAVPack(info DVDNAVPackInfo) ([]byte, error) {
 // WriteDVDNAVPack writes one fixed-size navigation pack without closing dst.
 func WriteDVDNAVPack(dst io.Writer, info DVDNAVPackInfo) error {
 	if dst == nil {
-		return errors.New("mp4todvd: DVD NAV destination writer is required")
+		return errors.New("video2dvd: DVD NAV destination writer is required")
 	}
 	pack, err := BuildDVDNAVPack(info)
 	if err != nil {

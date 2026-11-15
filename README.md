@@ -1,10 +1,10 @@
-# mp4todvd
+# video2dvd
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-brightgreen?style=flat-square)](/LICENSE)
-[![Go Reference](https://pkg.go.dev/badge/github.com/aethiopicuschan/mp4todvd.svg)](https://pkg.go.dev/github.com/aethiopicuschan/mp4todvd)
-[![Go Report Card](https://goreportcard.com/badge/github.com/aethiopicuschan/mp4todvd)](https://goreportcard.com/report/github.com/aethiopicuschan/mp4todvd)
-[![CI](https://github.com/aethiopicuschan/mp4todvd/actions/workflows/ci.yaml/badge.svg)](https://github.com/aethiopicuschan/mp4todvd/actions/workflows/ci.yaml)
-[![codecov](https://codecov.io/gh/aethiopicuschan/mp4todvd/graph/badge.svg?token=hUdXoeMoFl)](https://codecov.io/gh/aethiopicuschan/mp4todvd)
+[![Go Reference](https://pkg.go.dev/badge/github.com/aethiopicuschan/video2dvd.svg)](https://pkg.go.dev/github.com/aethiopicuschan/video2dvd)
+[![Go Report Card](https://goreportcard.com/badge/github.com/aethiopicuschan/video2dvd)](https://goreportcard.com/report/github.com/aethiopicuschan/video2dvd)
+[![CI](https://github.com/aethiopicuschan/video2dvd/actions/workflows/ci.yaml/badge.svg)](https://github.com/aethiopicuschan/video2dvd/actions/workflows/ci.yaml)
+[![codecov](https://codecov.io/gh/aethiopicuschan/video2dvd/graph/badge.svg?token=gV5qlDuFTw)](https://codecov.io/gh/aethiopicuschan/video2dvd)
 
 複数の MP4/WebM から DVD-Video ディレクトリを作成するための Go ライブラリ API です。FFmpeg などの外部コマンドは起動しません。
 
@@ -29,10 +29,10 @@
 ## バックエンドの接続
 
 ```go
-encoder := mp4todvd.NewInProcessEncoder()
-authorer := mp4todvd.NewInProcessAuthorer()
+encoder := video2dvd.NewInProcessEncoder()
+authorer := video2dvd.NewInProcessAuthorer()
 
-converter, err := mp4todvd.New(encoder, authorer)
+converter, err := video2dvd.New(encoder, authorer)
 if err != nil {
 	return err
 }
@@ -40,9 +40,9 @@ if err != nil {
 err = converter.Convert(ctx,
 	[]string{"part-1.mp4", "part-2.mp4"},
 	"./disc",
-	mp4todvd.Options{
-		Standard: mp4todvd.VideoStandardNTSC,
-		Aspect:   mp4todvd.AspectRatio16x9,
+	video2dvd.Options{
+		Standard: video2dvd.VideoStandardNTSC,
+		Aspect:   video2dvd.AspectRatio16x9,
 	},
 )
 ```
@@ -53,7 +53,7 @@ ISOイメージまで作成する場合は `ConvertISO` を使います。
 err = converter.ConvertISO(ctx,
 	[]string{"part-1.mp4", "part-2.mp4"},
 	"./disc.iso",
-	mp4todvd.Options{Standard: mp4todvd.VideoStandardNTSC},
+	video2dvd.Options{Standard: video2dvd.VideoStandardNTSC},
 )
 ```
 
@@ -61,13 +61,13 @@ YouTube ダウンローダーが映像と音声を別ファイルに保存した
 
 ```go
 err = converter.ConvertSources(ctx,
-	[]mp4todvd.MediaInput{{
+	[]video2dvd.MediaInput{{
 		VideoPath:   "video-only.webm",
 		AudioPath:   "audio-only.webm",
 		AudioOffset: 250 * time.Millisecond,
 	}},
 	"./disc",
-	mp4todvd.Options{Standard: mp4todvd.VideoStandardNTSC},
+	video2dvd.Options{Standard: video2dvd.VideoStandardNTSC},
 )
 ```
 

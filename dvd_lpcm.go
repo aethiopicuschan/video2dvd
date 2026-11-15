@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"encoding/binary"
@@ -12,13 +12,13 @@ import (
 // essence in private_stream_1 PES packets and add each packet's LPCM headers.
 func WriteDVDLPCM(dst io.Writer, chunk PCMChunk) error {
 	if dst == nil {
-		return errors.New("mp4todvd: LPCM writer is required")
+		return errors.New("video2dvd: LPCM writer is required")
 	}
 	if chunk.SampleRate != 48000 || chunk.Channels != 2 {
-		return errors.New("mp4todvd: DVD LPCM requires 48 kHz stereo PCM")
+		return errors.New("video2dvd: DVD LPCM requires 48 kHz stereo PCM")
 	}
 	if len(chunk.Samples)%2 != 0 {
-		return errors.New("mp4todvd: interleaved stereo PCM must contain complete sample pairs")
+		return errors.New("video2dvd: interleaved stereo PCM must contain complete sample pairs")
 	}
 	const samplesPerBuffer = 4096
 	buffer := make([]byte, samplesPerBuffer*2)
@@ -39,7 +39,7 @@ func writeAll(dst io.Writer, data []byte) error {
 	for len(data) > 0 {
 		n, err := dst.Write(data)
 		if n < 0 || n > len(data) {
-			return errors.New("mp4todvd: writer returned an invalid byte count")
+			return errors.New("video2dvd: writer returned an invalid byte count")
 		}
 		data = data[n:]
 		if err != nil {

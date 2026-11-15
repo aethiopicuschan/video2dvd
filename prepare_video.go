@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"context"
@@ -20,7 +20,7 @@ func PrepareMP4VideoForDVD(
 	handler func(DecodedVideoFrame) error,
 ) error {
 	if handler == nil {
-		return errors.New("mp4todvd: DVD video frame handler is required")
+		return errors.New("video2dvd: DVD video frame handler is required")
 	}
 	rateConverter, err := NewDVDFrameRateConverter(profile, handler)
 	if err != nil {

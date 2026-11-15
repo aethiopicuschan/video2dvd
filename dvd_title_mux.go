@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"bytes"
@@ -31,16 +31,16 @@ type dvdVOBURecord struct {
 
 func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.Writer, recordVOBU func(dvdVOBURecord) error) error {
 	if ctx == nil {
-		return errors.New("mp4todvd: context must not be nil")
+		return errors.New("video2dvd: context must not be nil")
 	}
 	if dst == nil {
-		return errors.New("mp4todvd: VOB destination writer is required")
+		return errors.New("video2dvd: VOB destination writer is required")
 	}
 	if title.VideoCodec != VideoCodecMPEG2 || title.AudioCodec != AudioCodecLPCM {
-		return errors.New("mp4todvd: VOB muxer requires MPEG-2 video and LPCM audio")
+		return errors.New("video2dvd: VOB muxer requires MPEG-2 video and LPCM audio")
 	}
 	if !validDVDFrameRate(title.FrameRateNumerator, title.FrameRateDenominator) {
-		return fmt.Errorf("mp4todvd: unsupported DVD frame rate %d/%d", title.FrameRateNumerator, title.FrameRateDenominator)
+		return fmt.Errorf("video2dvd: unsupported DVD frame rate %d/%d", title.FrameRateNumerator, title.FrameRateDenominator)
 	}
 	videoPath, err := validateGeneratedFile(title.VideoPath, workDir, "video")
 	if err != nil {
@@ -56,7 +56,7 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 	}
 	if videoInfo.Width != title.Width || videoInfo.Height != title.Height || videoInfo.Aspect != title.Aspect ||
 		videoInfo.FrameRateNumerator*title.FrameRateDenominator != title.FrameRateNumerator*videoInfo.FrameRateDenominator {
-		return errors.New("mp4todvd: MPEG-2 stream metadata does not match the encoded title")
+		return errors.New("video2dvd: MPEG-2 stream metadata does not match the encoded title")
 	}
 	videoFile, err := os.Open(videoPath)
 	if err != nil {
@@ -78,14 +78,14 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 	audio := &DVDLPCMPacketWriter{program: program, substream: 0xa0}
 	videoPacket, videoErr := pictures.Next()
 	if videoErr == io.EOF {
-		return errors.New("mp4todvd: MPEG-2 stream contains no pictures")
+		return errors.New("video2dvd: MPEG-2 stream contains no pictures")
 	}
 	if videoErr != nil {
 		return videoErr
 	}
 	firstPictureType, err := mpeg2PictureType(videoPacket)
 	if err != nil || firstPictureType != 1 || !mpeg2PictureHasSequenceHeader(videoPacket) {
-		return errors.New("mp4todvd: the first MPEG-2 picture must be an I picture with a sequence header")
+		return errors.New("video2dvd: the first MPEG-2 picture must be an I picture with a sequence header")
 	}
 	frameNumber := int64(0)
 	var audioSampleNumber int64
@@ -127,14 +127,14 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 	}
 	flushVOBU := func() error {
 		if mediaBuffer.Len() == 0 || mediaBuffer.Len()%DVDVOBSectorSize != 0 {
-			return errors.New("mp4todvd: VOBU media is empty or not sector-aligned")
+			return errors.New("video2dvd: VOBU media is empty or not sector-aligned")
 		}
 		if groupEndTime < groupStartTime || groupEndTime-groupStartTime > dvdVOBUMaxDuration {
-			return errors.New("mp4todvd: MPEG-2 GOP exceeds the DVD VOBU duration limit")
+			return errors.New("video2dvd: MPEG-2 GOP exceeds the DVD VOBU duration limit")
 		}
 		mediaSectors := uint32(mediaBuffer.Len() / DVDVOBSectorSize)
 		if uint64(nextVOBUSector)+uint64(mediaSectors)+1 > dvdVOBMaxSectors {
-			return errors.New("mp4todvd: VOB title exceeds the 1 GiB single-file limit")
+			return errors.New("video2dvd: VOB title exceeds the 1 GiB single-file limit")
 		}
 		nav, err := BuildDVDNAVPack(DVDNAVPackInfo{
 			SCRBase:                   groupSCR,
@@ -224,14 +224,14 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 			return err
 		}
 		if pictureType == 3 {
-			return errors.New("mp4todvd: B pictures are not supported by the DVD VOB muxer")
+			return errors.New("video2dvd: B pictures are not supported by the DVD VOB muxer")
 		}
 		if pictureType != 1 && pictureType != 2 {
-			return fmt.Errorf("mp4todvd: unsupported MPEG-2 picture type %d", pictureType)
+			return fmt.Errorf("video2dvd: unsupported MPEG-2 picture type %d", pictureType)
 		}
 		if pictureType == 1 && frameNumber > 0 {
 			if !mpeg2PictureHasSequenceHeader(videoPacket) {
-				return errors.New("mp4todvd: each VOBU I picture must include a sequence header")
+				return errors.New("video2dvd: each VOBU I picture must include a sequence header")
 			}
 			if err := flushVOBU(); err != nil {
 				return err
@@ -247,7 +247,7 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 		}
 		afterSectors := uint32(mediaBuffer.Len() / DVDVOBSectorSize)
 		if afterSectors <= beforeSectors {
-			return errors.New("mp4todvd: MPEG-2 picture did not produce a VOB sector")
+			return errors.New("video2dvd: MPEG-2 picture did not produce a VOB sector")
 		}
 		if referenceCount < len(referenceEnds) {
 			referenceEnds[referenceCount] = afterSectors
@@ -288,31 +288,31 @@ func validDVDFrameRate(numerator, denominator int) bool {
 
 func dvdVideoFramePTS(frame int64, numerator, denominator int) (time.Duration, error) {
 	if frame < 0 || !validDVDFrameRate(numerator, denominator) {
-		return 0, errors.New("mp4todvd: invalid MPEG-2 frame timestamp")
+		return 0, errors.New("video2dvd: invalid MPEG-2 frame timestamp")
 	}
 	whole := frame / int64(numerator)
 	remainder := frame % int64(numerator)
 	if whole > math.MaxInt64/int64(denominator) {
-		return 0, errors.New("mp4todvd: video timestamp overflows duration")
+		return 0, errors.New("video2dvd: video timestamp overflows duration")
 	}
 	wholeSeconds := whole * int64(denominator)
 	fraction := remainder * int64(denominator)
 	wholeSeconds += fraction / int64(numerator)
 	fraction %= int64(numerator)
 	if wholeSeconds > math.MaxInt64/int64(time.Second) {
-		return 0, errors.New("mp4todvd: video timestamp overflows duration")
+		return 0, errors.New("video2dvd: video timestamp overflows duration")
 	}
 	wholeNanos := wholeSeconds * int64(time.Second)
 	fractionNanos := fraction * int64(time.Second) / int64(numerator)
 	if fractionNanos > math.MaxInt64-wholeNanos {
-		return 0, errors.New("mp4todvd: video timestamp overflows duration")
+		return 0, errors.New("video2dvd: video timestamp overflows duration")
 	}
 	return time.Duration(wholeNanos + fractionNanos), nil
 }
 
 func dvdCellElapsedTime(elapsed time.Duration, numerator, denominator int) ([4]byte, error) {
 	if elapsed < 0 || !validDVDFrameRate(numerator, denominator) {
-		return [4]byte{}, errors.New("mp4todvd: invalid DVD cell elapsed time")
+		return [4]byte{}, errors.New("video2dvd: invalid DVD cell elapsed time")
 	}
 	nominalRate := int64(30)
 	frameRateCode := byte(3) // 29.97 fps time-code family.
@@ -323,7 +323,7 @@ func dvdCellElapsedTime(elapsed time.Duration, numerator, denominator int) ([4]b
 	totalSeconds := int64(elapsed / time.Second)
 	hours := totalSeconds / 3600
 	if hours > 99 {
-		return [4]byte{}, errors.New("mp4todvd: DVD cell elapsed time exceeds 99 hours")
+		return [4]byte{}, errors.New("video2dvd: DVD cell elapsed time exceeds 99 hours")
 	}
 	minutes := totalSeconds / 60 % 60
 	seconds := totalSeconds % 60
@@ -351,7 +351,7 @@ func readDVDLPCMAudioChunk(src io.Reader, sampleNumber int64) (PCMChunk, bool, b
 		return PCMChunk{}, false, false, err
 	}
 	if n%4 != 0 {
-		return PCMChunk{}, false, false, errors.New("mp4todvd: LPCM input ends in an incomplete stereo sample")
+		return PCMChunk{}, false, false, errors.New("video2dvd: LPCM input ends in an incomplete stereo sample")
 	}
 	samples := make([]int16, n/2)
 	for i := range samples {
@@ -372,7 +372,7 @@ func readDVDLPCMAudioChunk(src io.Reader, sampleNumber int64) (PCMChunk, bool, b
 func mpeg2PictureType(picture []byte) (uint32, error) {
 	start := findMPEGStartCode(picture, 0x00, 0)
 	if start < 0 {
-		return 0, errors.New("mp4todvd: MPEG-2 picture start code not found")
+		return 0, errors.New("video2dvd: MPEG-2 picture start code not found")
 	}
 	reader := bitReader{data: picture[start+4:]}
 	if _, err := reader.read(10); err != nil {

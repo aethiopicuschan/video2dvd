@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"errors"
@@ -9,21 +9,21 @@ import (
 // an ISO BMFF esds full box.
 func extractAACAudioSpecificConfig(esds []byte) ([]byte, error) {
 	if len(esds) < 5 {
-		return nil, errors.New("mp4todvd: truncated esds box")
+		return nil, errors.New("video2dvd: truncated esds box")
 	}
 	config, found, err := findAACConfigDescriptor(esds[4:], 0)
 	if err != nil {
 		return nil, err
 	}
 	if !found || len(config) == 0 {
-		return nil, errors.New("mp4todvd: esds has no AAC AudioSpecificConfig")
+		return nil, errors.New("video2dvd: esds has no AAC AudioSpecificConfig")
 	}
 	return config, nil
 }
 
 func findAACConfigDescriptor(data []byte, depth int) ([]byte, bool, error) {
 	if depth > 4 {
-		return nil, false, errors.New("mp4todvd: esds descriptor nesting is too deep")
+		return nil, false, errors.New("video2dvd: esds descriptor nesting is too deep")
 	}
 	for len(data) > 0 {
 		tag := data[0]
@@ -45,7 +45,7 @@ func findAACConfigDescriptor(data []byte, depth int) ([]byte, bool, error) {
 			}
 		case 0x04:
 			if len(payload) < 13 {
-				return nil, false, errors.New("mp4todvd: truncated decoder configuration descriptor")
+				return nil, false, errors.New("video2dvd: truncated decoder configuration descriptor")
 			}
 			if config, found, err := findAACConfigDescriptor(payload[13:], depth+1); found || err != nil {
 				return config, found, err
@@ -57,7 +57,7 @@ func findAACConfigDescriptor(data []byte, depth int) ([]byte, bool, error) {
 
 func esDescriptorChildren(payload []byte) ([]byte, error) {
 	if len(payload) < 3 {
-		return nil, errors.New("mp4todvd: truncated ES descriptor")
+		return nil, errors.New("video2dvd: truncated ES descriptor")
 	}
 	flags := payload[2]
 	position := 3
@@ -66,7 +66,7 @@ func esDescriptorChildren(payload []byte) ([]byte, error) {
 	}
 	if flags&0x40 != 0 {
 		if position >= len(payload) {
-			return nil, errors.New("mp4todvd: truncated ES descriptor URL")
+			return nil, errors.New("video2dvd: truncated ES descriptor URL")
 		}
 		urlLength := int(payload[position])
 		position++
@@ -76,7 +76,7 @@ func esDescriptorChildren(payload []byte) ([]byte, error) {
 		position += 2
 	}
 	if position > len(payload) {
-		return nil, errors.New("mp4todvd: truncated optional ES descriptor fields")
+		return nil, errors.New("video2dvd: truncated optional ES descriptor fields")
 	}
 	return payload[position:], nil
 }
@@ -86,20 +86,20 @@ func readDescriptor(data []byte) ([]byte, []byte, error) {
 	position := 0
 	for range 4 {
 		if position >= len(data) {
-			return nil, nil, errors.New("mp4todvd: truncated descriptor length")
+			return nil, nil, errors.New("video2dvd: truncated descriptor length")
 		}
 		value := data[position]
 		position++
 		if length > (int(^uint(0)>>1) >> 7) {
-			return nil, nil, errors.New("mp4todvd: descriptor length overflows int")
+			return nil, nil, errors.New("video2dvd: descriptor length overflows int")
 		}
 		length = (length << 7) | int(value&0x7f)
 		if value&0x80 == 0 {
 			if length > len(data)-position {
-				return nil, nil, fmt.Errorf("mp4todvd: descriptor length %d exceeds esds data", length)
+				return nil, nil, fmt.Errorf("video2dvd: descriptor length %d exceeds esds data", length)
 			}
 			return data[position : position+length], data[position+length:], nil
 		}
 	}
-	return nil, nil, errors.New("mp4todvd: descriptor length uses more than four bytes")
+	return nil, nil, errors.New("video2dvd: descriptor length uses more than four bytes")
 }

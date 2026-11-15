@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"bytes"
@@ -69,7 +69,7 @@ type MPEG2VideoEncoder struct {
 // frames. It writes the sequence header with the first GOP.
 func NewMPEG2VideoEncoder(dst io.Writer, profile Profile) (*MPEG2VideoEncoder, error) {
 	if dst == nil {
-		return nil, errors.New("mp4todvd: MPEG-2 destination writer is required")
+		return nil, errors.New("video2dvd: MPEG-2 destination writer is required")
 	}
 	if err := validateEncoderProfile(profile); err != nil {
 		return nil, err
@@ -92,10 +92,10 @@ func NewMPEG2VideoEncoder(dst io.Writer, profile Profile) (*MPEG2VideoEncoder, e
 // already be fitted and timestamp-resampled to the selected DVD profile.
 func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 	if e == nil || e.dst == nil {
-		return errors.New("mp4todvd: MPEG-2 encoder is not configured")
+		return errors.New("video2dvd: MPEG-2 encoder is not configured")
 	}
 	if e.closed {
-		return errors.New("mp4todvd: MPEG-2 encoder is already closed")
+		return errors.New("video2dvd: MPEG-2 encoder is already closed")
 	}
 	if e.writeErr != nil {
 		return e.writeErr
@@ -104,7 +104,7 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 		return err
 	}
 	if frame.Width != e.profile.FrameWidth || frame.Height != e.profile.FrameHeight {
-		return fmt.Errorf("mp4todvd: MPEG-2 encoder requires %dx%d frames", e.profile.FrameWidth, e.profile.FrameHeight)
+		return fmt.Errorf("video2dvd: MPEG-2 encoder requires %dx%d frames", e.profile.FrameWidth, e.profile.FrameHeight)
 	}
 	mbWidth := frame.Width / 16
 	mbHeight := frame.Height / 16
@@ -141,7 +141,7 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 		}
 	}
 	if err := writeAll(e.dst, encoded); err != nil {
-		e.writeErr = fmt.Errorf("mp4todvd: write MPEG-2 picture %d: %w", e.frameNo, err)
+		e.writeErr = fmt.Errorf("video2dvd: write MPEG-2 picture %d: %w", e.frameNo, err)
 		return e.writeErr
 	}
 	var reference DecodedVideoFrame
@@ -180,7 +180,7 @@ func (e *MPEG2VideoEncoder) encodePredictivePicture(macroblocks []mpeg2Predictiv
 // Close finishes the elementary stream. It does not close the destination.
 func (e *MPEG2VideoEncoder) Close() error {
 	if e == nil || e.dst == nil {
-		return errors.New("mp4todvd: MPEG-2 encoder is not configured")
+		return errors.New("video2dvd: MPEG-2 encoder is not configured")
 	}
 	if e.closed {
 		return e.writeErr
@@ -190,13 +190,13 @@ func (e *MPEG2VideoEncoder) Close() error {
 		return e.writeErr
 	}
 	if e.frameNo == 0 {
-		e.writeErr = errors.New("mp4todvd: MPEG-2 stream contains no video frames")
+		e.writeErr = errors.New("video2dvd: MPEG-2 stream contains no video frames")
 		return e.writeErr
 	}
 	var bits mpeg2BitWriter
 	bits.startCode(0xb7)
 	if err := writeAll(e.dst, bits.bytes()); err != nil {
-		e.writeErr = fmt.Errorf("mp4todvd: finish MPEG-2 stream: %w", err)
+		e.writeErr = fmt.Errorf("video2dvd: finish MPEG-2 stream: %w", err)
 	}
 	return e.writeErr
 }

@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"context"
@@ -43,19 +43,19 @@ type PCMChunk struct {
 // are delivered in presentation order and own their pixel buffers.
 func DecodeMP4Video(ctx context.Context, path string, trackIndex *int, handler func(DecodedVideoFrame) error) error {
 	if ctx == nil {
-		return errors.New("mp4todvd: context must not be nil")
+		return errors.New("video2dvd: context must not be nil")
 	}
 	if handler == nil {
-		return errors.New("mp4todvd: video frame handler is required")
+		return errors.New("video2dvd: video frame handler is required")
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: open MP4: %w", err)
+		return fmt.Errorf("video2dvd: open MP4: %w", err)
 	}
 	defer f.Close()
 	stat, err := f.Stat()
 	if err != nil {
-		return fmt.Errorf("mp4todvd: stat MP4: %w", err)
+		return fmt.Errorf("video2dvd: stat MP4: %w", err)
 	}
 	info, err := ProbeMP4Reader(f, stat.Size())
 	if err != nil {
@@ -66,10 +66,10 @@ func DecodeMP4Video(ctx context.Context, path string, trackIndex *int, handler f
 		return err
 	}
 	if track.Codec != "avc1" && track.Codec != "avc3" {
-		return fmt.Errorf("mp4todvd: video codec %q is not supported by the built-in decoder", track.Codec)
+		return fmt.Errorf("video2dvd: video codec %q is not supported by the built-in decoder", track.Codec)
 	}
 	if len(track.CodecConfig) == 0 || track.NALLengthSize == 0 {
-		return errors.New("mp4todvd: AVC track has no decoder configuration")
+		return errors.New("video2dvd: AVC track has no decoder configuration")
 	}
 	parameterSets, err := AVCConfigToAnnexB(track.CodecConfig)
 	if err != nil {
@@ -80,7 +80,7 @@ func DecodeMP4Video(ctx context.Context, path string, trackIndex *int, handler f
 	decoder, err = h264decode.NewStreamDecoder(h264decode.StreamConfig{OutputOrder: true}, func(frame *h264frame.Frame) error {
 		timing, ok := pendingPTS[frame.Tag]
 		if !ok {
-			return fmt.Errorf("mp4todvd: decoder returned unknown sample tag %d", frame.Tag)
+			return fmt.Errorf("video2dvd: decoder returned unknown sample tag %d", frame.Tag)
 		}
 		delete(pendingPTS, frame.Tag)
 		ptsTime, err := ticksToDuration(timing.pts, track.TimeScale)
@@ -98,7 +98,7 @@ func DecodeMP4Video(ctx context.Context, path string, trackIndex *int, handler f
 		return handler(decoded)
 	})
 	if err != nil {
-		return fmt.Errorf("mp4todvd: create H.264 decoder: %w", err)
+		return fmt.Errorf("video2dvd: create H.264 decoder: %w", err)
 	}
 	pendingPTS = make(map[uint64]videoSampleTiming, 16)
 	firstAccessUnit := true
@@ -136,10 +136,10 @@ func DecodeMP4Video(ctx context.Context, path string, trackIndex *int, handler f
 		return err
 	}
 	if firstAccessUnit {
-		return errors.New("mp4todvd: H.264 track contains no samples")
+		return errors.New("video2dvd: H.264 track contains no samples")
 	}
 	if err := decoder.Drain(); err != nil {
-		return fmt.Errorf("mp4todvd: finish H.264 stream: %w", err)
+		return fmt.Errorf("video2dvd: finish H.264 stream: %w", err)
 	}
 	return ctx.Err()
 }
@@ -149,19 +149,19 @@ func DecodeMP4Video(ctx context.Context, path string, trackIndex *int, handler f
 // track. Audio payloads and edit-list timing are validated by the decoder.
 func DecodeMP4Audio(ctx context.Context, path string, trackIndex *int, handler func(PCMChunk) error) error {
 	if ctx == nil {
-		return errors.New("mp4todvd: context must not be nil")
+		return errors.New("video2dvd: context must not be nil")
 	}
 	if handler == nil {
-		return errors.New("mp4todvd: PCM handler is required")
+		return errors.New("video2dvd: PCM handler is required")
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: open MP4: %w", err)
+		return fmt.Errorf("video2dvd: open MP4: %w", err)
 	}
 	defer f.Close()
 	stat, err := f.Stat()
 	if err != nil {
-		return fmt.Errorf("mp4todvd: stat MP4: %w", err)
+		return fmt.Errorf("video2dvd: stat MP4: %w", err)
 	}
 	info, err := ProbeMP4Reader(f, stat.Size())
 	if err != nil {
@@ -181,7 +181,7 @@ func DecodeMP4Audio(ctx context.Context, path string, trackIndex *int, handler f
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("mp4todvd: open audio decoder: %w", err)
+		return fmt.Errorf("video2dvd: open audio decoder: %w", err)
 	}
 	defer decoder.Close()
 	buffer := make([]int16, 8192)
@@ -202,7 +202,7 @@ func DecodeMP4Audio(ctx context.Context, path string, trackIndex *int, handler f
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("mp4todvd: decode audio: %w", err)
+			return fmt.Errorf("video2dvd: decode audio: %w", err)
 		}
 		if n == 0 {
 			return io.ErrNoProgress
@@ -215,19 +215,19 @@ func selectVideoTrack(info MP4Info, requested *int) (TrackInfo, error) {
 		for _, track := range info.Tracks {
 			if track.Index == *requested {
 				if track.Kind != TrackKindVideo {
-					return TrackInfo{}, fmt.Errorf("mp4todvd: track %d is not video", *requested)
+					return TrackInfo{}, fmt.Errorf("video2dvd: track %d is not video", *requested)
 				}
 				return track, nil
 			}
 		}
-		return TrackInfo{}, fmt.Errorf("mp4todvd: video track index %d is out of range", *requested)
+		return TrackInfo{}, fmt.Errorf("video2dvd: video track index %d is out of range", *requested)
 	}
 	for _, track := range info.Tracks {
 		if track.Kind == TrackKindVideo && (track.Codec == "avc1" || track.Codec == "avc3") {
 			return track, nil
 		}
 	}
-	return TrackInfo{}, errors.New("mp4todvd: no supported H.264 video track")
+	return TrackInfo{}, errors.New("video2dvd: no supported H.264 video track")
 }
 
 func selectAudioTrack(info MP4Info, requested *int) (TrackInfo, error) {
@@ -235,19 +235,19 @@ func selectAudioTrack(info MP4Info, requested *int) (TrackInfo, error) {
 		for _, track := range info.Tracks {
 			if track.Index == *requested {
 				if track.Kind != TrackKindAudio {
-					return TrackInfo{}, fmt.Errorf("mp4todvd: track %d is not audio", *requested)
+					return TrackInfo{}, fmt.Errorf("video2dvd: track %d is not audio", *requested)
 				}
 				return track, nil
 			}
 		}
-		return TrackInfo{}, fmt.Errorf("mp4todvd: audio track index %d is out of range", *requested)
+		return TrackInfo{}, fmt.Errorf("video2dvd: audio track index %d is out of range", *requested)
 	}
 	for _, track := range info.Tracks {
 		if track.Kind == TrackKindAudio && (track.Codec == "mp4a" || track.Codec == "ac-3") {
 			return track, nil
 		}
 	}
-	return TrackInfo{}, errors.New("mp4todvd: no supported AAC or AC-3 audio track")
+	return TrackInfo{}, errors.New("video2dvd: no supported AAC or AC-3 audio track")
 }
 
 type videoSampleTiming struct {
@@ -257,10 +257,10 @@ type videoSampleTiming struct {
 
 func copyDecodedFrame(frame *h264frame.Frame, pts, duration time.Duration) (DecodedVideoFrame, error) {
 	if frame == nil || frame.Width <= 0 || frame.Height <= 0 || frame.Width%2 != 0 || frame.Height%2 != 0 {
-		return DecodedVideoFrame{}, errors.New("mp4todvd: decoder returned an invalid YUV 4:2:0 frame")
+		return DecodedVideoFrame{}, errors.New("video2dvd: decoder returned an invalid YUV 4:2:0 frame")
 	}
 	if frame.StrideY < frame.Width || frame.StrideC < frame.Width/2 {
-		return DecodedVideoFrame{}, errors.New("mp4todvd: decoder returned invalid plane strides")
+		return DecodedVideoFrame{}, errors.New("video2dvd: decoder returned invalid plane strides")
 	}
 	result := DecodedVideoFrame{
 		PTS:      pts,
@@ -285,7 +285,7 @@ func copyDecodedFrame(frame *h264frame.Frame, pts, duration time.Duration) (Deco
 
 func copyPlane(dst, src []byte, width, height, stride int) error {
 	if width <= 0 || height <= 0 || stride < width || len(dst) != width*height || len(src) < (height-1)*stride+width {
-		return errors.New("mp4todvd: decoder returned a truncated frame plane")
+		return errors.New("video2dvd: decoder returned a truncated frame plane")
 	}
 	for y := range height {
 		copy(dst[y*width:(y+1)*width], src[y*stride:y*stride+width])
@@ -295,7 +295,7 @@ func copyPlane(dst, src []byte, width, height, stride int) error {
 
 func ticksToDuration(ticks int64, timeScale uint32) (time.Duration, error) {
 	if timeScale == 0 {
-		return 0, errors.New("mp4todvd: zero media time scale")
+		return 0, errors.New("video2dvd: zero media time scale")
 	}
 	negative := ticks < 0
 	absolute := uint64(ticks)
@@ -306,11 +306,11 @@ func ticksToDuration(ticks int64, timeScale uint32) (time.Duration, error) {
 	remainder := absolute % uint64(timeScale)
 	maxInt64 := uint64(^uint64(0) >> 1)
 	if seconds > maxInt64/uint64(time.Second) {
-		return 0, errors.New("mp4todvd: presentation timestamp overflows duration")
+		return 0, errors.New("video2dvd: presentation timestamp overflows duration")
 	}
 	nanoseconds := seconds*uint64(time.Second) + remainder*uint64(time.Second)/uint64(timeScale)
 	if nanoseconds > maxInt64 {
-		return 0, errors.New("mp4todvd: presentation timestamp overflows duration")
+		return 0, errors.New("video2dvd: presentation timestamp overflows duration")
 	}
 	duration := time.Duration(nanoseconds)
 	if negative {

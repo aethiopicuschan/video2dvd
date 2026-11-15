@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"errors"
@@ -34,7 +34,7 @@ func ProbeMPEG2Video(path string) (MPEG2VideoInfo, error) {
 		return MPEG2VideoInfo{}, err
 	}
 	if !info.Mode().IsRegular() {
-		return MPEG2VideoInfo{}, errors.New("mp4todvd: MPEG-2 video stream is not a regular file")
+		return MPEG2VideoInfo{}, errors.New("video2dvd: MPEG-2 video stream is not a regular file")
 	}
 	scanSize := min(info.Size(), maxMPEG2HeaderScan)
 	data := make([]byte, int(scanSize))
@@ -47,7 +47,7 @@ func ProbeMPEG2Video(path string) (MPEG2VideoInfo, error) {
 func parseMPEG2VideoHeaders(data []byte) (MPEG2VideoInfo, error) {
 	sequence := findMPEGStartCode(data, 0xb3, 0)
 	if sequence < 0 || len(data)-sequence < 8 {
-		return MPEG2VideoInfo{}, errors.New("mp4todvd: MPEG-2 sequence header not found")
+		return MPEG2VideoInfo{}, errors.New("video2dvd: MPEG-2 sequence header not found")
 	}
 	sequenceBits := uint32(data[sequence+4])<<24 | uint32(data[sequence+5])<<16 | uint32(data[sequence+6])<<8 | uint32(data[sequence+7])
 	width := int(sequenceBits >> 20)
@@ -55,7 +55,7 @@ func parseMPEG2VideoHeaders(data []byte) (MPEG2VideoInfo, error) {
 	aspectCode := int((sequenceBits >> 4) & 0x0f)
 	frameRateCode := int(sequenceBits & 0x0f)
 	if width == 0 || height == 0 {
-		return MPEG2VideoInfo{}, errors.New("mp4todvd: invalid MPEG-2 sequence dimensions")
+		return MPEG2VideoInfo{}, errors.New("video2dvd: invalid MPEG-2 sequence dimensions")
 	}
 	var aspect AspectRatio
 	switch aspectCode {
@@ -64,21 +64,21 @@ func parseMPEG2VideoHeaders(data []byte) (MPEG2VideoInfo, error) {
 	case 3:
 		aspect = AspectRatio16x9
 	default:
-		return MPEG2VideoInfo{}, fmt.Errorf("mp4todvd: unsupported MPEG-2 display aspect code %d", aspectCode)
+		return MPEG2VideoInfo{}, fmt.Errorf("video2dvd: unsupported MPEG-2 display aspect code %d", aspectCode)
 	}
 	numerator, denominator, ok := mpegFrameRate(frameRateCode)
 	if !ok {
-		return MPEG2VideoInfo{}, fmt.Errorf("mp4todvd: unsupported MPEG-2 frame-rate code %d", frameRateCode)
+		return MPEG2VideoInfo{}, fmt.Errorf("video2dvd: unsupported MPEG-2 frame-rate code %d", frameRateCode)
 	}
 
 	extension := findMPEGStartCode(data, 0xb5, sequence+8)
 	if extension < 0 || len(data)-extension < 10 {
-		return MPEG2VideoInfo{}, errors.New("mp4todvd: MPEG-2 sequence extension not found")
+		return MPEG2VideoInfo{}, errors.New("video2dvd: MPEG-2 sequence extension not found")
 	}
 	bits := bitReader{data: data[extension+4:]}
 	extensionID, err := bits.read(4)
 	if err != nil || extensionID != 1 {
-		return MPEG2VideoInfo{}, errors.New("mp4todvd: invalid MPEG-2 sequence extension")
+		return MPEG2VideoInfo{}, errors.New("video2dvd: invalid MPEG-2 sequence extension")
 	}
 	profileLevel, err := bits.read(8)
 	if err != nil {
@@ -89,7 +89,7 @@ func parseMPEG2VideoHeaders(data []byte) (MPEG2VideoInfo, error) {
 	}
 	chroma, err := bits.read(2)
 	if err != nil || chroma != 1 {
-		return MPEG2VideoInfo{}, errors.New("mp4todvd: DVD video requires 4:2:0 MPEG-2 video")
+		return MPEG2VideoInfo{}, errors.New("video2dvd: DVD video requires 4:2:0 MPEG-2 video")
 	}
 	widthExtension, err := bits.read(2)
 	if err != nil {
@@ -105,7 +105,7 @@ func parseMPEG2VideoHeaders(data []byte) (MPEG2VideoInfo, error) {
 		return MPEG2VideoInfo{}, err
 	}
 	if marker, markerErr := bits.read(1); markerErr != nil || marker != 1 {
-		return MPEG2VideoInfo{}, errors.New("mp4todvd: invalid MPEG-2 sequence-extension marker")
+		return MPEG2VideoInfo{}, errors.New("video2dvd: invalid MPEG-2 sequence-extension marker")
 	}
 	if _, err = bits.read(8); err != nil { // vbv_buffer_size_extension
 		return MPEG2VideoInfo{}, err
@@ -128,7 +128,7 @@ func parseMPEG2VideoHeaders(data []byte) (MPEG2VideoInfo, error) {
 	profileCode := int((profileLevel >> 4) & 0x07)
 	levelCode := int(profileLevel & 0x0f)
 	if profileCode != 4 || levelCode != 8 {
-		return MPEG2VideoInfo{}, fmt.Errorf("mp4todvd: DVD requires MPEG-2 Main Profile at Main Level, got profile %d level %d", profileCode, levelCode)
+		return MPEG2VideoInfo{}, fmt.Errorf("video2dvd: DVD requires MPEG-2 Main Profile at Main Level, got profile %d level %d", profileCode, levelCode)
 	}
 	return MPEG2VideoInfo{
 		Width:                width,

@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"encoding/binary"
@@ -58,16 +58,16 @@ type compositionRun struct {
 // order. It does not decode samples or convert H.264 length prefixes to Annex B.
 func DemuxMP4(path string, handler SampleHandler) (MP4Info, error) {
 	if handler == nil {
-		return MP4Info{}, errors.New("mp4todvd: sample handler is required")
+		return MP4Info{}, errors.New("video2dvd: sample handler is required")
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return MP4Info{}, fmt.Errorf("mp4todvd: open MP4: %w", err)
+		return MP4Info{}, fmt.Errorf("video2dvd: open MP4: %w", err)
 	}
 	defer f.Close()
 	stat, err := f.Stat()
 	if err != nil {
-		return MP4Info{}, fmt.Errorf("mp4todvd: stat MP4: %w", err)
+		return MP4Info{}, fmt.Errorf("video2dvd: stat MP4: %w", err)
 	}
 	return demuxMP4Reader(f, stat.Size(), handler)
 }
@@ -107,10 +107,10 @@ func demuxMP4Reader(r io.ReaderAt, size int64, handler SampleHandler) (MP4Info, 
 		}
 		tables, err := parseSampleTables(r, child)
 		if err != nil {
-			return MP4Info{}, fmt.Errorf("mp4todvd: track %d sample tables: %w", trackIndex, err)
+			return MP4Info{}, fmt.Errorf("video2dvd: track %d sample tables: %w", trackIndex, err)
 		}
 		if err := emitTrackSamples(r, size, track, tables, handler); err != nil {
-			return MP4Info{}, fmt.Errorf("mp4todvd: track %d: %w", trackIndex, err)
+			return MP4Info{}, fmt.Errorf("video2dvd: track %d: %w", trackIndex, err)
 		}
 	}
 	return info, nil

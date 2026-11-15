@@ -1,9 +1,9 @@
-// Package mp4todvd provides APIs for preparing DVD-compatible media and
+// Package video2dvd provides APIs for preparing DVD-compatible media and
 // orchestrating DVD-Video directory creation from MP4 and WebM media.
 //
 // The package itself does not start external processes. It includes a basic
 // in-process Encoder; DVD directory generation still requires an Authorer.
-package mp4todvd
+package video2dvd
 
 import (
 	"bytes"
@@ -19,10 +19,10 @@ import (
 )
 
 var (
-	ErrNoInputs       = errors.New("mp4todvd: at least one input file is required")
-	ErrOutputExists   = errors.New("mp4todvd: output path already exists")
-	ErrInvalidProfile = errors.New("mp4todvd: invalid DVD profile")
-	ErrDiscCapacity   = errors.New("mp4todvd: authored DVD exceeds configured capacity")
+	ErrNoInputs       = errors.New("video2dvd: at least one input file is required")
+	ErrOutputExists   = errors.New("video2dvd: output path already exists")
+	ErrInvalidProfile = errors.New("video2dvd: invalid DVD profile")
+	ErrDiscCapacity   = errors.New("video2dvd: authored DVD exceeds configured capacity")
 )
 
 const DVD5CapacityBytes int64 = 4_700_000_000
@@ -160,10 +160,10 @@ type Converter struct {
 // backends. It does not select defaults or invoke external commands.
 func New(encoder Encoder, authorer Authorer) (*Converter, error) {
 	if encoder == nil {
-		return nil, errors.New("mp4todvd: encoder is required")
+		return nil, errors.New("video2dvd: encoder is required")
 	}
 	if authorer == nil {
-		return nil, errors.New("mp4todvd: authorer is required")
+		return nil, errors.New("video2dvd: authorer is required")
 	}
 	return &Converter{encoder: encoder, authorer: authorer}, nil
 }
@@ -182,10 +182,10 @@ func (c *Converter) Convert(ctx context.Context, inputs []string, outputDir stri
 // independent audio sources. Each MediaInput becomes one DVD title.
 func (c *Converter) ConvertSources(ctx context.Context, inputs []MediaInput, outputDir string, options Options) error {
 	if c == nil || c.encoder == nil || c.authorer == nil {
-		return errors.New("mp4todvd: converter is not configured")
+		return errors.New("video2dvd: converter is not configured")
 	}
 	if ctx == nil {
-		return errors.New("mp4todvd: context must not be nil")
+		return errors.New("video2dvd: context must not be nil")
 	}
 	if len(inputs) == 0 {
 		return ErrNoInputs
@@ -201,34 +201,34 @@ func (c *Converter) ConvertSources(ctx context.Context, inputs []MediaInput, out
 	}
 	outputDir, err = filepath.Abs(outputDir)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: resolve output path: %w", err)
+		return fmt.Errorf("video2dvd: resolve output path: %w", err)
 	}
 	parent := filepath.Dir(outputDir)
 	parentInfo, err := os.Stat(parent)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: inspect output parent: %w", err)
+		return fmt.Errorf("video2dvd: inspect output parent: %w", err)
 	}
 	if !parentInfo.IsDir() {
-		return fmt.Errorf("mp4todvd: output parent %q is not a directory", parent)
+		return fmt.Errorf("video2dvd: output parent %q is not a directory", parent)
 	}
 	if _, err := os.Lstat(outputDir); err == nil {
 		return fmt.Errorf("%w: %s", ErrOutputExists, outputDir)
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("mp4todvd: inspect output path: %w", err)
+		return fmt.Errorf("video2dvd: inspect output path: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	stageRoot, err := os.MkdirTemp(parent, ".mp4todvd-")
+	stageRoot, err := os.MkdirTemp(parent, ".video2dvd-")
 	if err != nil {
-		return fmt.Errorf("mp4todvd: create staging directory: %w", err)
+		return fmt.Errorf("video2dvd: create staging directory: %w", err)
 	}
 	defer os.RemoveAll(stageRoot)
 
 	encodedRoot := filepath.Join(stageRoot, "encoded")
 	if err := os.Mkdir(encodedRoot, 0o700); err != nil {
-		return fmt.Errorf("mp4todvd: create encoded directory: %w", err)
+		return fmt.Errorf("video2dvd: create encoded directory: %w", err)
 	}
 	titles := make([]EncodedTitle, 0, len(mediaInputs))
 	for i, input := range mediaInputs {
@@ -237,7 +237,7 @@ func (c *Converter) ConvertSources(ctx context.Context, inputs []MediaInput, out
 		}
 		workDir := filepath.Join(encodedRoot, fmt.Sprintf("title-%03d", i+1))
 		if err := os.Mkdir(workDir, 0o700); err != nil {
-			return fmt.Errorf("mp4todvd: create work directory for input %d: %w", i+1, err)
+			return fmt.Errorf("video2dvd: create work directory for input %d: %w", i+1, err)
 		}
 		var title EncodedTitle
 		if streamEncoder, ok := c.encoder.(StreamEncoder); ok {
@@ -245,21 +245,21 @@ func (c *Converter) ConvertSources(ctx context.Context, inputs []MediaInput, out
 		} else if input.AudioPath == input.VideoPath && input.VideoTrackIndex == nil && input.AudioTrackIndex == nil && input.AudioOffset == 0 {
 			title, err = c.encoder.Encode(ctx, input.VideoPath, workDir, profile)
 		} else {
-			err = errors.New("mp4todvd: encoder does not support separate media streams or track selection")
+			err = errors.New("video2dvd: encoder does not support separate media streams or track selection")
 		}
 		if err != nil {
-			return fmt.Errorf("mp4todvd: encode input %d (%q): %w", i+1, input.VideoPath, err)
+			return fmt.Errorf("video2dvd: encode input %d (%q): %w", i+1, input.VideoPath, err)
 		}
 		if err := validateTitle(title, workDir, profile); err != nil {
-			return fmt.Errorf("mp4todvd: invalid encoded title for input %d (%q): %w", i+1, input.VideoPath, err)
+			return fmt.Errorf("video2dvd: invalid encoded title for input %d (%q): %w", i+1, input.VideoPath, err)
 		}
 		title.VideoPath, err = validateGeneratedFile(title.VideoPath, workDir, "video")
 		if err != nil {
-			return fmt.Errorf("mp4todvd: resolve encoded video for input %d: %w", i+1, err)
+			return fmt.Errorf("video2dvd: resolve encoded video for input %d: %w", i+1, err)
 		}
 		title.AudioPath, err = validateGeneratedFile(title.AudioPath, workDir, "audio")
 		if err != nil {
-			return fmt.Errorf("mp4todvd: resolve encoded audio for input %d: %w", i+1, err)
+			return fmt.Errorf("video2dvd: resolve encoded audio for input %d: %w", i+1, err)
 		}
 		titles = append(titles, title)
 	}
@@ -267,20 +267,20 @@ func (c *Converter) ConvertSources(ctx context.Context, inputs []MediaInput, out
 	dvdRoot := filepath.Join(stageRoot, "dvd")
 	videoTS := filepath.Join(dvdRoot, "VIDEO_TS")
 	if err := os.Mkdir(dvdRoot, 0o700); err != nil {
-		return fmt.Errorf("mp4todvd: create DVD root directory: %w", err)
+		return fmt.Errorf("video2dvd: create DVD root directory: %w", err)
 	}
 	if err := os.Mkdir(videoTS, 0o700); err != nil {
-		return fmt.Errorf("mp4todvd: create VIDEO_TS directory: %w", err)
+		return fmt.Errorf("video2dvd: create VIDEO_TS directory: %w", err)
 	}
 	if err := c.authorer.Author(ctx, titles, videoTS, profile); err != nil {
-		return fmt.Errorf("mp4todvd: author DVD-Video: %w", err)
+		return fmt.Errorf("video2dvd: author DVD-Video: %w", err)
 	}
 	if err := validateDVDDirectory(videoTS, len(titles)); err != nil {
 		return err
 	}
 	usedBytes, err := directorySize(videoTS)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: measure authored DVD: %w", err)
+		return fmt.Errorf("video2dvd: measure authored DVD: %w", err)
 	}
 	if usedBytes > profile.DiscCapacityBytes {
 		return fmt.Errorf("%w: %d bytes used, limit is %d", ErrDiscCapacity, usedBytes, profile.DiscCapacityBytes)
@@ -291,10 +291,10 @@ func (c *Converter) ConvertSources(ctx context.Context, inputs []MediaInput, out
 	if _, err := os.Lstat(outputDir); err == nil {
 		return fmt.Errorf("%w: %s", ErrOutputExists, outputDir)
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("mp4todvd: inspect output path before publish: %w", err)
+		return fmt.Errorf("video2dvd: inspect output path before publish: %w", err)
 	}
 	if err := os.Rename(dvdRoot, outputDir); err != nil {
-		return fmt.Errorf("mp4todvd: publish DVD-Video directory: %w", err)
+		return fmt.Errorf("video2dvd: publish DVD-Video directory: %w", err)
 	}
 	return nil
 }
@@ -313,7 +313,7 @@ func (c *Converter) ConvertISO(ctx context.Context, inputs []string, outputISO s
 // ConvertSourcesISO creates a DVD-Video UDF bridge image from media sources.
 func (c *Converter) ConvertSourcesISO(ctx context.Context, inputs []MediaInput, outputISO string, options Options) error {
 	if ctx == nil {
-		return errors.New("mp4todvd: context must not be nil")
+		return errors.New("video2dvd: context must not be nil")
 	}
 	profile, err := options.profile()
 	if err != nil {
@@ -321,24 +321,24 @@ func (c *Converter) ConvertSourcesISO(ctx context.Context, inputs []MediaInput, 
 	}
 	outputISO, err = filepath.Abs(outputISO)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: resolve image path: %w", err)
+		return fmt.Errorf("video2dvd: resolve image path: %w", err)
 	}
 	if _, err := os.Lstat(outputISO); err == nil {
 		return fmt.Errorf("%w: %s", ErrOutputExists, outputISO)
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("mp4todvd: inspect image path: %w", err)
+		return fmt.Errorf("video2dvd: inspect image path: %w", err)
 	}
 	parent := filepath.Dir(outputISO)
 	parentInfo, err := os.Stat(parent)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: inspect image parent: %w", err)
+		return fmt.Errorf("video2dvd: inspect image parent: %w", err)
 	}
 	if !parentInfo.IsDir() {
-		return fmt.Errorf("mp4todvd: image parent %q is not a directory", parent)
+		return fmt.Errorf("video2dvd: image parent %q is not a directory", parent)
 	}
-	stageRoot, err := os.MkdirTemp(parent, ".mp4todvd-iso-")
+	stageRoot, err := os.MkdirTemp(parent, ".video2dvd-iso-")
 	if err != nil {
-		return fmt.Errorf("mp4todvd: create conversion staging directory: %w", err)
+		return fmt.Errorf("video2dvd: create conversion staging directory: %w", err)
 	}
 	defer os.RemoveAll(stageRoot)
 
@@ -354,7 +354,7 @@ func (c *Converter) ConvertSourcesISO(ctx context.Context, inputs []MediaInput, 
 		return err
 	}
 	if err := os.Rename(stagedISO, outputISO); err != nil {
-		return fmt.Errorf("mp4todvd: publish DVD image: %w", err)
+		return fmt.Errorf("video2dvd: publish DVD image: %w", err)
 	}
 	return nil
 }
@@ -378,26 +378,26 @@ func validateMediaInputs(inputs []MediaInput) ([]MediaInput, error) {
 		}
 		videoInfo, err := ProbeMedia(videoPath)
 		if err != nil {
-			return nil, fmt.Errorf("mp4todvd: inspect video input %d (%q): %w", i+1, input.VideoPath, err)
+			return nil, fmt.Errorf("video2dvd: inspect video input %d (%q): %w", i+1, input.VideoPath, err)
 		}
 		if _, err := selectInputVideoTrack(videoInfo, input.VideoTrackIndex); err != nil {
-			return nil, fmt.Errorf("mp4todvd: video input %d (%q): %w", i+1, input.VideoPath, err)
+			return nil, fmt.Errorf("video2dvd: video input %d (%q): %w", i+1, input.VideoPath, err)
 		}
 		audioInfo := videoInfo
 		if audioPath != videoPath {
 			audioInfo, err = ProbeMedia(audioPath)
 			if err != nil {
-				return nil, fmt.Errorf("mp4todvd: inspect audio input %d (%q): %w", i+1, input.AudioPath, err)
+				return nil, fmt.Errorf("video2dvd: inspect audio input %d (%q): %w", i+1, input.AudioPath, err)
 			}
 		}
 		if input.AudioTrackIndex != nil || audioPath != videoPath {
 			if _, err := selectInputAudioTrack(audioInfo, input.AudioTrackIndex); err != nil {
-				return nil, fmt.Errorf("mp4todvd: audio input %d (%q): %w", i+1, audioPath, err)
+				return nil, fmt.Errorf("video2dvd: audio input %d (%q): %w", i+1, audioPath, err)
 			}
 		}
 		key := videoPath + "\x00" + audioPath
 		if _, ok := seen[key]; ok {
-			return nil, fmt.Errorf("mp4todvd: input %d duplicates an earlier video/audio source pair", i+1)
+			return nil, fmt.Errorf("video2dvd: input %d duplicates an earlier video/audio source pair", i+1)
 		}
 		seen[key] = struct{}{}
 		input.VideoPath = videoPath
@@ -409,22 +409,22 @@ func validateMediaInputs(inputs []MediaInput) ([]MediaInput, error) {
 
 func resolveMediaPath(path string, inputNumber int, kind string) (string, error) {
 	if strings.TrimSpace(path) == "" {
-		return "", fmt.Errorf("mp4todvd: input %d has an empty %s path", inputNumber, kind)
+		return "", fmt.Errorf("video2dvd: input %d has an empty %s path", inputNumber, kind)
 	}
 	absPath, err := filepath.Abs(path)
 	if err != nil {
-		return "", fmt.Errorf("mp4todvd: resolve %s input %d: %w", kind, inputNumber, err)
+		return "", fmt.Errorf("video2dvd: resolve %s input %d: %w", kind, inputNumber, err)
 	}
 	resolved, err := filepath.EvalSymlinks(absPath)
 	if err != nil {
-		return "", fmt.Errorf("mp4todvd: resolve %s input %d (%q): %w", kind, inputNumber, path, err)
+		return "", fmt.Errorf("video2dvd: resolve %s input %d (%q): %w", kind, inputNumber, path, err)
 	}
 	info, err := os.Stat(resolved)
 	if err != nil {
-		return "", fmt.Errorf("mp4todvd: inspect %s input %d (%q): %w", kind, inputNumber, path, err)
+		return "", fmt.Errorf("video2dvd: inspect %s input %d (%q): %w", kind, inputNumber, path, err)
 	}
 	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("mp4todvd: %s input %d (%q) is not a regular file", kind, inputNumber, path)
+		return "", fmt.Errorf("video2dvd: %s input %d (%q) is not a regular file", kind, inputNumber, path)
 	}
 	return resolved, nil
 }
@@ -542,7 +542,7 @@ func validateDVDDirectory(videoTS string, expectedVTSCount int) error {
 			break
 		}
 		if err != nil {
-			return fmt.Errorf("mp4todvd: inspect %s.IFO: %w", stem, err)
+			return fmt.Errorf("video2dvd: inspect %s.IFO: %w", stem, err)
 		}
 		if err := validateIFOBackup(videoTS, stem+".IFO", stem+".BUP", "DVDVIDEO-VTS"); err != nil {
 			return err
@@ -550,15 +550,15 @@ func validateDVDDirectory(videoTS string, expectedVTSCount int) error {
 		vobName := fmt.Sprintf("VTS_%02d_1.VOB", number)
 		vobInfo, err := os.Lstat(filepath.Join(videoTS, vobName))
 		if err != nil {
-			return fmt.Errorf("mp4todvd: authorer did not create %s: %w", vobName, err)
+			return fmt.Errorf("video2dvd: authorer did not create %s: %w", vobName, err)
 		}
 		if !vobInfo.Mode().IsRegular() || vobInfo.Size() == 0 {
-			return fmt.Errorf("mp4todvd: authored %s must be a non-empty regular file", vobName)
+			return fmt.Errorf("video2dvd: authored %s must be a non-empty regular file", vobName)
 		}
 		vtsCount++
 	}
 	if vtsCount != expectedVTSCount {
-		return fmt.Errorf("mp4todvd: authorer created %d title sets; want %d", vtsCount, expectedVTSCount)
+		return fmt.Errorf("video2dvd: authorer created %d title sets; want %d", vtsCount, expectedVTSCount)
 	}
 	if err := validateVOBs(videoTS); err != nil {
 		return err
@@ -571,17 +571,17 @@ func validateIFOBackup(videoTS, ifoName, bupName, signatureText string) error {
 	bupPath := filepath.Join(videoTS, bupName)
 	ifoInfo, err := os.Lstat(ifoPath)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: authorer did not create %s: %w", ifoName, err)
+		return fmt.Errorf("video2dvd: authorer did not create %s: %w", ifoName, err)
 	}
 	bupInfo, err := os.Lstat(bupPath)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: authorer did not create %s: %w", bupName, err)
+		return fmt.Errorf("video2dvd: authorer did not create %s: %w", bupName, err)
 	}
 	if !ifoInfo.Mode().IsRegular() || ifoInfo.Size() == 0 || ifoInfo.Size()%DVDVOBSectorSize != 0 {
-		return fmt.Errorf("mp4todvd: authored %s must be a non-empty sector-aligned regular file", ifoName)
+		return fmt.Errorf("video2dvd: authored %s must be a non-empty sector-aligned regular file", ifoName)
 	}
 	if !bupInfo.Mode().IsRegular() || bupInfo.Size() == 0 || bupInfo.Size()%DVDVOBSectorSize != 0 {
-		return fmt.Errorf("mp4todvd: authored %s must be a non-empty sector-aligned regular file", bupName)
+		return fmt.Errorf("video2dvd: authored %s must be a non-empty sector-aligned regular file", bupName)
 	}
 	ifo, err := os.Open(ifoPath)
 	if err != nil {
@@ -591,23 +591,23 @@ func validateIFOBackup(videoTS, ifoName, bupName, signatureText string) error {
 	_, readErr := io.ReadFull(ifo, signature[:])
 	closeErr := ifo.Close()
 	if readErr != nil {
-		return fmt.Errorf("mp4todvd: read %s header: %w", ifoName, readErr)
+		return fmt.Errorf("video2dvd: read %s header: %w", ifoName, readErr)
 	}
 	if closeErr != nil {
 		return closeErr
 	}
 	if string(signature[:]) != signatureText {
-		return fmt.Errorf("mp4todvd: %s has an invalid DVD-Video signature", ifoName)
+		return fmt.Errorf("video2dvd: %s has an invalid DVD-Video signature", ifoName)
 	}
 	if ifoInfo.Size() != bupInfo.Size() {
-		return fmt.Errorf("mp4todvd: %s must be the same size as %s", bupName, ifoName)
+		return fmt.Errorf("video2dvd: %s must be the same size as %s", bupName, ifoName)
 	}
 	equal, err := filesEqual(ifoPath, bupPath, ifoInfo.Size())
 	if err != nil {
 		return err
 	}
 	if !equal {
-		return fmt.Errorf("mp4todvd: %s must be an exact backup of %s", bupName, ifoName)
+		return fmt.Errorf("video2dvd: %s must be an exact backup of %s", bupName, ifoName)
 	}
 	return nil
 }
@@ -655,7 +655,7 @@ func validateVOBs(videoTS string) error {
 			return err
 		}
 		if !info.Mode().IsRegular() || info.Size() == 0 || info.Size()%2048 != 0 || info.Size() > 1<<30 {
-			return fmt.Errorf("mp4todvd: %s has an invalid DVD VOB size", entry.Name())
+			return fmt.Errorf("video2dvd: %s has an invalid DVD VOB size", entry.Name())
 		}
 		return validateVOBPacks(path, entry.Name(), info.Size())
 	})
@@ -674,11 +674,11 @@ func validateVOBPacks(path, name string, size int64) error {
 		chunkSize := min(int64(len(buffer)), size-offset)
 		chunk := buffer[:int(chunkSize)]
 		if _, err := io.ReadFull(io.NewSectionReader(file, offset, chunkSize), chunk); err != nil {
-			return fmt.Errorf("mp4todvd: read %s packs at sector offset %d: %w", name, offset, err)
+			return fmt.Errorf("video2dvd: read %s packs at sector offset %d: %w", name, offset, err)
 		}
 		for position := 0; position < len(chunk); position += sectorSize {
 			if chunk[position] != 0 || chunk[position+1] != 0 || chunk[position+2] != 1 || chunk[position+3] != 0xba {
-				return fmt.Errorf("mp4todvd: %s has no MPEG pack start at offset %d", name, offset+int64(position))
+				return fmt.Errorf("video2dvd: %s has no MPEG pack start at offset %d", name, offset+int64(position))
 			}
 		}
 		offset += chunkSize

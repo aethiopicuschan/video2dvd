@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"bytes"
@@ -35,11 +35,11 @@ type MPEGProgramStreamWriter struct {
 // program mux rate. PES packets must be submitted in nondecreasing PTS order.
 func NewMPEGProgramStreamWriter(dst io.Writer) (*MPEGProgramStreamWriter, error) {
 	if dst == nil {
-		return nil, errors.New("mp4todvd: program stream destination is required")
+		return nil, errors.New("video2dvd: program stream destination is required")
 	}
 	rateUnits := defaultProgramMuxRate / 50
 	if rateUnits == 0 || rateUnits > maxProgramStreamMuxRate/50 {
-		return nil, errors.New("mp4todvd: invalid program mux rate")
+		return nil, errors.New("video2dvd: invalid program mux rate")
 	}
 	return &MPEGProgramStreamWriter{dst: dst, muxRate: uint32(rateUnits)}, nil
 }
@@ -49,23 +49,23 @@ func NewMPEGProgramStreamWriter(dst io.Writer) (*MPEGProgramStreamWriter, error)
 // not. Each fragment is placed in its own fixed-size pack sector with padding.
 func (w *MPEGProgramStreamWriter) WritePES(streamID byte, pts time.Duration, payload []byte) error {
 	if w == nil || w.dst == nil {
-		return errors.New("mp4todvd: program stream writer is not configured")
+		return errors.New("video2dvd: program stream writer is not configured")
 	}
 	if w.closedErr != nil {
 		return w.closedErr
 	}
 	if w.closed {
-		return errors.New("mp4todvd: program stream writer is already closed")
+		return errors.New("video2dvd: program stream writer is already closed")
 	}
 	if !validProgramStreamID(streamID) {
-		return fmt.Errorf("mp4todvd: invalid PES stream id 0x%02x", streamID)
+		return fmt.Errorf("video2dvd: invalid PES stream id 0x%02x", streamID)
 	}
 	ptsTicks, err := durationToMPEGTimestamp(pts)
 	if err != nil {
 		return err
 	}
 	if w.havePTS && ptsTicks < w.lastPTS {
-		return errors.New("mp4todvd: PES timestamps must be nondecreasing")
+		return errors.New("video2dvd: PES timestamps must be nondecreasing")
 	}
 	if !w.started || ptsTicks > w.scr {
 		w.scr = ptsTicks
@@ -86,7 +86,7 @@ func (w *MPEGProgramStreamWriter) WritePES(streamID byte, pts time.Duration, pay
 		count := min(len(payload), maxPayload)
 		packet := buildPESPacket(streamID, ptsTicks, first, payload[:count])
 		if err := w.writePack(packet); err != nil {
-			w.closedErr = fmt.Errorf("mp4todvd: write program stream pack: %w", err)
+			w.closedErr = fmt.Errorf("video2dvd: write program stream pack: %w", err)
 			return w.closedErr
 		}
 		payload = payload[count:]
@@ -99,7 +99,7 @@ func (w *MPEGProgramStreamWriter) WritePES(streamID byte, pts time.Duration, pay
 // not close the destination writer.
 func (w *MPEGProgramStreamWriter) Close() error {
 	if w == nil || w.dst == nil {
-		return errors.New("mp4todvd: program stream writer is not configured")
+		return errors.New("video2dvd: program stream writer is not configured")
 	}
 	if w.closed {
 		return w.closedErr
@@ -109,7 +109,7 @@ func (w *MPEGProgramStreamWriter) Close() error {
 		return w.closedErr
 	}
 	if err := w.writeEndPack(); err != nil {
-		w.closedErr = fmt.Errorf("mp4todvd: finish program stream: %w", err)
+		w.closedErr = fmt.Errorf("video2dvd: finish program stream: %w", err)
 	}
 	return w.closedErr
 }
@@ -119,13 +119,13 @@ func (w *MPEGProgramStreamWriter) writeEndPack() error {
 	pack.Write(buildMPEG2PackHeader(w.scr, w.muxRate))
 	paddingLength := DVDVOBSectorSize - pack.Len() - 10 // padding header and end code.
 	if paddingLength < 0 || paddingLength > 0xffff {
-		return errors.New("mp4todvd: cannot fit program end code in a DVD sector")
+		return errors.New("video2dvd: cannot fit program end code in a DVD sector")
 	}
 	pack.Write([]byte{0, 0, 1, 0xbe, byte(paddingLength >> 8), byte(paddingLength)})
 	pack.Write(bytes.Repeat([]byte{0xff}, paddingLength))
 	pack.Write([]byte{0, 0, 1, 0xb9})
 	if pack.Len() != DVDVOBSectorSize {
-		return errors.New("mp4todvd: generated program end pack has an invalid sector size")
+		return errors.New("video2dvd: generated program end pack has an invalid sector size")
 	}
 	return writeAll(w.dst, pack.Bytes())
 }
@@ -137,13 +137,13 @@ func (w *MPEGProgramStreamWriter) writePack(packet []byte) error {
 	padding := DVDVOBSectorSize - pack.Len()
 	if padding != 0 {
 		if padding < 6 || padding > 0xffff+6 {
-			return fmt.Errorf("mp4todvd: cannot pad pack to a sector: %d bytes remain", padding)
+			return fmt.Errorf("video2dvd: cannot pad pack to a sector: %d bytes remain", padding)
 		}
 		pack.Write([]byte{0, 0, 1, 0xbe, byte((padding - 6) >> 8), byte(padding - 6)})
 		pack.Write(bytes.Repeat([]byte{0xff}, padding-6))
 	}
 	if pack.Len() != DVDVOBSectorSize {
-		return errors.New("mp4todvd: generated program stream pack has an invalid sector size")
+		return errors.New("video2dvd: generated program stream pack has an invalid sector size")
 	}
 	if err := writeAll(w.dst, pack.Bytes()); err != nil {
 		return err
@@ -202,13 +202,13 @@ func encodeMPEGTimestamp(dst []byte, timestamp uint64, prefix uint64) {
 
 func durationToMPEGTimestamp(value time.Duration) (uint64, error) {
 	if value < 0 {
-		return 0, errors.New("mp4todvd: negative PES presentation time")
+		return 0, errors.New("video2dvd: negative PES presentation time")
 	}
 	seconds := uint64(value / time.Second)
 	remainder := uint64(value % time.Second)
 	ticks := seconds*90_000 + remainder*90_000/uint64(time.Second)
 	if ticks > maxMPEGTimestamp {
-		return 0, errors.New("mp4todvd: PES timestamp exceeds the MPEG 33-bit range")
+		return 0, errors.New("video2dvd: PES timestamp exceeds the MPEG 33-bit range")
 	}
 	return ticks, nil
 }

@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"errors"
@@ -25,13 +25,13 @@ const (
 // the source is center-cropped. The input frame is not modified.
 func FitVideoFrame(frame DecodedVideoFrame, profile Profile, sourceAspectNumerator, sourceAspectDenominator int, mode FitMode) (DecodedVideoFrame, error) {
 	if frame.Width <= 0 || frame.Height <= 0 || frame.Width%2 != 0 || frame.Height%2 != 0 || frame.Width > int(^uint(0)>>1)/frame.Height {
-		return DecodedVideoFrame{}, errors.New("mp4todvd: source frame dimensions must be positive even values")
+		return DecodedVideoFrame{}, errors.New("video2dvd: source frame dimensions must be positive even values")
 	}
 	if len(frame.Y) < frame.Width*frame.Height || len(frame.U) < frame.Width*frame.Height/4 || len(frame.V) < frame.Width*frame.Height/4 {
-		return DecodedVideoFrame{}, errors.New("mp4todvd: source frame has incomplete YUV 4:2:0 planes")
+		return DecodedVideoFrame{}, errors.New("video2dvd: source frame has incomplete YUV 4:2:0 planes")
 	}
 	if sourceAspectNumerator <= 0 || sourceAspectDenominator <= 0 {
-		return DecodedVideoFrame{}, errors.New("mp4todvd: source display aspect ratio must be positive")
+		return DecodedVideoFrame{}, errors.New("video2dvd: source display aspect ratio must be positive")
 	}
 	wantWidth, wantHeight := 0, 0
 	switch profile.Standard {
@@ -49,7 +49,7 @@ func FitVideoFrame(frame DecodedVideoFrame, profile Profile, sourceAspectNumerat
 		return DecodedVideoFrame{}, ErrInvalidProfile
 	}
 	if mode != FitLetterbox && mode != FitCrop {
-		return DecodedVideoFrame{}, fmt.Errorf("mp4todvd: unknown fit mode %d", mode)
+		return DecodedVideoFrame{}, fmt.Errorf("video2dvd: unknown fit mode %d", mode)
 	}
 
 	// DVD pixels are not square. Derive the horizontal-to-vertical pixel ratio
@@ -85,7 +85,7 @@ func FitVideoFrame(frame DecodedVideoFrame, profile Profile, sourceAspectNumerat
 		}
 	}
 	if dstW < 2 || dstH < 2 || srcW < 2 || srcH < 2 {
-		return DecodedVideoFrame{}, errors.New("mp4todvd: aspect ratio leaves less than one chroma sample")
+		return DecodedVideoFrame{}, errors.New("video2dvd: aspect ratio leaves less than one chroma sample")
 	}
 
 	result := DecodedVideoFrame{

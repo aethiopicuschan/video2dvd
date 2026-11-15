@@ -1,4 +1,4 @@
-module github.com/aethiopicuschan/mp4todvd
+module github.com/aethiopicuschan/video2dvd
 
 go 1.27.4
 

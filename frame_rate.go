@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"errors"
@@ -27,7 +27,7 @@ type DVDFrameRateConverter struct {
 // NewDVDFrameRateConverter creates a streaming DVD frame-rate converter.
 func NewDVDFrameRateConverter(profile Profile, handler func(DecodedVideoFrame) error) (*DVDFrameRateConverter, error) {
 	if handler == nil {
-		return nil, errors.New("mp4todvd: frame handler is required")
+		return nil, errors.New("video2dvd: frame handler is required")
 	}
 	converter := &DVDFrameRateConverter{handler: handler}
 	switch profile.Standard {
@@ -52,26 +52,26 @@ func NewDVDFrameRateConverter(profile Profile, handler func(DecodedVideoFrame) e
 // output timestamp.
 func (c *DVDFrameRateConverter) Push(frame DecodedVideoFrame) error {
 	if c == nil || c.handler == nil {
-		return errors.New("mp4todvd: frame-rate converter is not configured")
+		return errors.New("video2dvd: frame-rate converter is not configured")
 	}
 	if c.finished {
-		return errors.New("mp4todvd: frame-rate converter is already finished")
+		return errors.New("video2dvd: frame-rate converter is already finished")
 	}
 	if err := validateDecodedFrame(frame); err != nil {
 		return err
 	}
 	if frame.Duration <= 0 {
-		return errors.New("mp4todvd: decoded frame duration must be positive")
+		return errors.New("video2dvd: decoded frame duration must be positive")
 	}
 	if frame.PTS > time.Duration(math.MaxInt64)-frame.Duration {
-		return errors.New("mp4todvd: decoded frame end timestamp overflows")
+		return errors.New("video2dvd: decoded frame end timestamp overflows")
 	}
 	if c.haveInput {
 		if frame.Width != c.width || frame.Height != c.height {
-			return errors.New("mp4todvd: frame dimensions changed during frame-rate conversion")
+			return errors.New("video2dvd: frame dimensions changed during frame-rate conversion")
 		}
 		if frame.PTS < c.lastInputPTS {
-			return errors.New("mp4todvd: decoded frames must be in presentation order")
+			return errors.New("video2dvd: decoded frames must be in presentation order")
 		}
 		limit, err := subtractDurations(frame.PTS, c.origin)
 		if err != nil {
@@ -95,10 +95,10 @@ func (c *DVDFrameRateConverter) Push(frame DecodedVideoFrame) error {
 // the converter. It may be called only once.
 func (c *DVDFrameRateConverter) Finish() error {
 	if c == nil || c.handler == nil {
-		return errors.New("mp4todvd: frame-rate converter is not configured")
+		return errors.New("video2dvd: frame-rate converter is not configured")
 	}
 	if c.finished {
-		return errors.New("mp4todvd: frame-rate converter is already finished")
+		return errors.New("video2dvd: frame-rate converter is already finished")
 	}
 	c.finished = true
 	if !c.haveInput || c.pending == nil {
@@ -114,10 +114,10 @@ func (c *DVDFrameRateConverter) Finish() error {
 
 func subtractDurations(left, right time.Duration) (time.Duration, error) {
 	if right < 0 && left > time.Duration(math.MaxInt64)+right {
-		return 0, errors.New("mp4todvd: timestamp difference overflows duration")
+		return 0, errors.New("video2dvd: timestamp difference overflows duration")
 	}
 	if right > 0 && left < time.Duration(math.MinInt64)+right {
-		return 0, errors.New("mp4todvd: timestamp difference overflows duration")
+		return 0, errors.New("video2dvd: timestamp difference overflows duration")
 	}
 	return left - right, nil
 }
@@ -148,18 +148,18 @@ func (c *DVDFrameRateConverter) emitBefore(limit time.Duration) error {
 
 func (c *DVDFrameRateConverter) outputTimestamp(index int64) (time.Duration, error) {
 	if index < 0 {
-		return 0, errors.New("mp4todvd: negative output frame index")
+		return 0, errors.New("video2dvd: negative output frame index")
 	}
 	unit := c.rateDenominator * int64(time.Second)
 	whole := index / c.rateNumerator
 	remainder := index % c.rateNumerator
 	if whole > math.MaxInt64/unit {
-		return 0, errors.New("mp4todvd: output timestamp overflows duration")
+		return 0, errors.New("video2dvd: output timestamp overflows duration")
 	}
 	wholeNanoseconds := whole * unit
 	fractionNanoseconds := remainder * unit / c.rateNumerator
 	if fractionNanoseconds > math.MaxInt64-wholeNanoseconds {
-		return 0, errors.New("mp4todvd: output timestamp overflows duration")
+		return 0, errors.New("video2dvd: output timestamp overflows duration")
 	}
 	nanoseconds := wholeNanoseconds + fractionNanoseconds
 	return time.Duration(nanoseconds), nil
@@ -167,11 +167,11 @@ func (c *DVDFrameRateConverter) outputTimestamp(index int64) (time.Duration, err
 
 func validateDecodedFrame(frame DecodedVideoFrame) error {
 	if frame.Width <= 0 || frame.Height <= 0 || frame.Width%2 != 0 || frame.Height%2 != 0 || frame.Width > int(^uint(0)>>1)/frame.Height {
-		return errors.New("mp4todvd: decoded frame dimensions must be positive even values")
+		return errors.New("video2dvd: decoded frame dimensions must be positive even values")
 	}
 	pixels := frame.Width * frame.Height
 	if len(frame.Y) < pixels || len(frame.U) < pixels/4 || len(frame.V) < pixels/4 {
-		return errors.New("mp4todvd: decoded frame has incomplete YUV 4:2:0 planes")
+		return errors.New("video2dvd: decoded frame has incomplete YUV 4:2:0 planes")
 	}
 	return nil
 }

@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"encoding/binary"
@@ -6,7 +6,7 @@ import (
 	"fmt"
 )
 
-var ErrInvalidAVC = errors.New("mp4todvd: invalid AVC sample or configuration")
+var ErrInvalidAVC = errors.New("video2dvd: invalid AVC sample or configuration")
 
 // AVCNALLengthSize returns the size of the NAL unit length field stored in an
 // avcC decoder configuration record.

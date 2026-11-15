@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"context"
@@ -12,7 +12,7 @@ import (
 // add the DVD LPCM private-stream headers.
 func PrepareMP4AudioForDVD(ctx context.Context, path string, trackIndex *int, dst io.Writer) error {
 	if dst == nil {
-		return errors.New("mp4todvd: DVD LPCM writer is required")
+		return errors.New("video2dvd: DVD LPCM writer is required")
 	}
 	return DecodeMP4Audio(ctx, path, trackIndex, func(chunk PCMChunk) error {
 		return WriteDVDLPCM(dst, chunk)

@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"errors"
@@ -20,27 +20,27 @@ type pcmWindowWriter struct {
 
 func newPCMWindowWriter(dst io.Writer, duration, offset time.Duration) (*pcmWindowWriter, error) {
 	if dst == nil {
-		return nil, errors.New("mp4todvd: LPCM destination writer is required")
+		return nil, errors.New("video2dvd: LPCM destination writer is required")
 	}
 	if duration <= 0 {
-		return nil, errors.New("mp4todvd: audio window duration must be positive")
+		return nil, errors.New("video2dvd: audio window duration must be positive")
 	}
 	return &pcmWindowWriter{dst: dst, offset: offset, endSample: durationToSampleCount(duration)}, nil
 }
 
 func (w *pcmWindowWriter) WriteChunk(chunk PCMChunk) error {
 	if w == nil || w.dst == nil {
-		return errors.New("mp4todvd: LPCM timeline writer is not configured")
+		return errors.New("video2dvd: LPCM timeline writer is not configured")
 	}
 	if chunk.SampleRate != int(dvdLPCMSampleRate) || chunk.Channels != 2 || len(chunk.Samples)%2 != 0 {
-		return errors.New("mp4todvd: LPCM timeline requires 48 kHz stereo PCM")
+		return errors.New("video2dvd: LPCM timeline requires 48 kHz stereo PCM")
 	}
 	if len(chunk.Samples) == 0 || w.next >= w.endSample {
 		return nil
 	}
 	start, ok := addMediaOffsets(w.offset, chunk.Start)
 	if !ok {
-		return errors.New("mp4todvd: audio timestamp overflows")
+		return errors.New("video2dvd: audio timestamp overflows")
 	}
 	startSample := durationToSampleCount(start)
 	frameCount := int64(len(chunk.Samples) / 2)
@@ -81,7 +81,7 @@ func (w *pcmWindowWriter) WriteChunk(chunk PCMChunk) error {
 
 func (w *pcmWindowWriter) Finish() error {
 	if w == nil || w.dst == nil {
-		return errors.New("mp4todvd: LPCM timeline writer is not configured")
+		return errors.New("video2dvd: LPCM timeline writer is not configured")
 	}
 	return w.writeSilence(w.endSample - w.next)
 }

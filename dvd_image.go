@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"bytes"
@@ -27,7 +27,7 @@ const (
 
 // DVDImageOptions configures a UDF 1.02 / ISO 9660 DVD-Video image.
 type DVDImageOptions struct {
-	// VolumeID is the ISO 9660 volume identifier. Empty selects MP4TODVD.
+	// VolumeID is the ISO 9660 volume identifier. Empty selects VIDEO2DVD.
 	VolumeID string
 	// DiscCapacityBytes is the maximum image size. Zero selects DVD5 capacity.
 	DiscCapacityBytes int64
@@ -44,7 +44,7 @@ func WriteDVDISO(ctx context.Context, videoTSDir, outputISO string) error {
 // limit. The image is assembled in-process and does not invoke external tools.
 func WriteDVDISOWithOptions(ctx context.Context, videoTSDir, outputISO string, options DVDImageOptions) error {
 	if ctx == nil {
-		return errors.New("mp4todvd: context must not be nil")
+		return errors.New("video2dvd: context must not be nil")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -55,27 +55,27 @@ func WriteDVDISOWithOptions(ctx context.Context, videoTSDir, outputISO string, o
 	}
 	videoTSDir, err = filepath.Abs(videoTSDir)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: resolve VIDEO_TS path: %w", err)
+		return fmt.Errorf("video2dvd: resolve VIDEO_TS path: %w", err)
 	}
 	outputISO, err = filepath.Abs(outputISO)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: resolve image path: %w", err)
+		return fmt.Errorf("video2dvd: resolve image path: %w", err)
 	}
 	if _, err := os.Lstat(outputISO); err == nil {
 		return fmt.Errorf("%w: %s", ErrOutputExists, outputISO)
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("mp4todvd: inspect image path: %w", err)
+		return fmt.Errorf("video2dvd: inspect image path: %w", err)
 	}
 	if rel, err := filepath.Rel(videoTSDir, outputISO); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel) {
-		return errors.New("mp4todvd: image output must not be inside VIDEO_TS")
+		return errors.New("video2dvd: image output must not be inside VIDEO_TS")
 	}
 	parent := filepath.Dir(outputISO)
 	parentInfo, err := os.Stat(parent)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: inspect image parent: %w", err)
+		return fmt.Errorf("video2dvd: inspect image parent: %w", err)
 	}
 	if !parentInfo.IsDir() {
-		return fmt.Errorf("mp4todvd: image parent %q is not a directory", parent)
+		return fmt.Errorf("video2dvd: image parent %q is not a directory", parent)
 	}
 
 	files, titleCount, err := inspectDVDImageSource(videoTSDir)
@@ -84,14 +84,14 @@ func WriteDVDISOWithOptions(ctx context.Context, videoTSDir, outputISO string, o
 	}
 	usedBytes, err := directorySize(videoTSDir)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: measure VIDEO_TS directory: %w", err)
+		return fmt.Errorf("video2dvd: measure VIDEO_TS directory: %w", err)
 	}
 	if usedBytes > capacity {
 		return ErrDiscCapacity
 	}
-	stageRoot, err := os.MkdirTemp(parent, ".mp4todvd-image-")
+	stageRoot, err := os.MkdirTemp(parent, ".video2dvd-image-")
 	if err != nil {
-		return fmt.Errorf("mp4todvd: create image staging directory: %w", err)
+		return fmt.Errorf("video2dvd: create image staging directory: %w", err)
 	}
 	defer os.RemoveAll(stageRoot)
 
@@ -102,7 +102,7 @@ func WriteDVDISOWithOptions(ctx context.Context, videoTSDir, outputISO string, o
 	imagePath := filepath.Join(stageRoot, "image.iso")
 	image, err := os.OpenFile(imagePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: create staged image: %w", err)
+		return fmt.Errorf("video2dvd: create staged image: %w", err)
 	}
 	removeImage := true
 	defer func() {
@@ -117,19 +117,19 @@ func WriteDVDISOWithOptions(ctx context.Context, videoTSDir, outputISO string, o
 		return err
 	}
 	if err := image.Truncate(int64(totalSectors) * dvdImageSectorSize); err != nil {
-		return fmt.Errorf("mp4todvd: size DVD image: %w", err)
+		return fmt.Errorf("video2dvd: size DVD image: %w", err)
 	}
 	if err := image.Sync(); err != nil {
-		return fmt.Errorf("mp4todvd: sync DVD image: %w", err)
+		return fmt.Errorf("video2dvd: sync DVD image: %w", err)
 	}
 	if err := image.Close(); err != nil {
-		return fmt.Errorf("mp4todvd: close DVD image: %w", err)
+		return fmt.Errorf("video2dvd: close DVD image: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if err := os.Rename(imagePath, outputISO); err != nil {
-		return fmt.Errorf("mp4todvd: publish DVD image: %w", err)
+		return fmt.Errorf("video2dvd: publish DVD image: %w", err)
 	}
 	removeImage = false
 	return nil
@@ -145,15 +145,15 @@ func normalizeDVDImageOptions(options DVDImageOptions) (int64, string, error) {
 	}
 	volumeID := strings.TrimSpace(options.VolumeID)
 	if volumeID == "" {
-		volumeID = "MP4TODVD"
+		volumeID = "VIDEO2DVD"
 	}
 	volumeID = strings.ToUpper(volumeID)
 	if len(volumeID) > 32 {
-		return 0, "", errors.New("mp4todvd: ISO volume identifier exceeds 32 bytes")
+		return 0, "", errors.New("video2dvd: ISO volume identifier exceeds 32 bytes")
 	}
 	for _, r := range volumeID {
 		if !((r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == ' ') {
-			return 0, "", errors.New("mp4todvd: ISO volume identifier may contain only ASCII letters, digits, underscore, and spaces")
+			return 0, "", errors.New("video2dvd: ISO volume identifier may contain only ASCII letters, digits, underscore, and spaces")
 		}
 	}
 	return capacity, volumeID, nil
@@ -167,16 +167,16 @@ type dvdImageFile struct {
 func inspectDVDImageSource(videoTS string) ([]dvdImageFile, int, error) {
 	entries, err := os.ReadDir(videoTS)
 	if err != nil {
-		return nil, 0, fmt.Errorf("mp4todvd: inspect VIDEO_TS directory: %w", err)
+		return nil, 0, fmt.Errorf("video2dvd: inspect VIDEO_TS directory: %w", err)
 	}
 	entryNames := make(map[string]bool, len(entries))
 	for _, entry := range entries {
 		info, err := entry.Info()
 		if err != nil {
-			return nil, 0, fmt.Errorf("mp4todvd: inspect %s: %w", entry.Name(), err)
+			return nil, 0, fmt.Errorf("video2dvd: inspect %s: %w", entry.Name(), err)
 		}
 		if !info.Mode().IsRegular() || info.Size() == 0 {
-			return nil, 0, fmt.Errorf("mp4todvd: VIDEO_TS entry %q must be a non-empty regular file", entry.Name())
+			return nil, 0, fmt.Errorf("video2dvd: VIDEO_TS entry %q must be a non-empty regular file", entry.Name())
 		}
 		entryNames[entry.Name()] = true
 	}
@@ -189,7 +189,7 @@ func inspectDVDImageSource(videoTS string) ([]dvdImageFile, int, error) {
 		titleCount++
 	}
 	if titleCount == 0 {
-		return nil, 0, errors.New("mp4todvd: VIDEO_TS contains no title sets")
+		return nil, 0, errors.New("video2dvd: VIDEO_TS contains no title sets")
 	}
 	if err := validateDVDDirectory(videoTS, titleCount); err != nil {
 		return nil, 0, err
@@ -207,11 +207,11 @@ func inspectDVDImageSource(videoTS string) ([]dvdImageFile, int, error) {
 		)
 	}
 	if len(entries) != len(expected) {
-		return nil, 0, errors.New("mp4todvd: image writer accepts the current menu-less VIDEO_TS file layout only")
+		return nil, 0, errors.New("video2dvd: image writer accepts the current menu-less VIDEO_TS file layout only")
 	}
 	for _, file := range expected {
 		if !entryNames[file.name] {
-			return nil, 0, fmt.Errorf("mp4todvd: VIDEO_TS is missing %s", file.name)
+			return nil, 0, fmt.Errorf("video2dvd: VIDEO_TS is missing %s", file.name)
 		}
 	}
 	return expected, titleCount, nil
@@ -219,10 +219,10 @@ func inspectDVDImageSource(videoTS string) ([]dvdImageFile, int, error) {
 
 func stageDVDImageTree(ctx context.Context, root, videoTS string, files []dvdImageFile) error {
 	if err := os.MkdirAll(filepath.Join(root, "VIDEO_TS"), 0o700); err != nil {
-		return fmt.Errorf("mp4todvd: create staged VIDEO_TS directory: %w", err)
+		return fmt.Errorf("video2dvd: create staged VIDEO_TS directory: %w", err)
 	}
 	if err := os.Mkdir(filepath.Join(root, "AUDIO_TS"), 0o700); err != nil {
-		return fmt.Errorf("mp4todvd: create staged AUDIO_TS directory: %w", err)
+		return fmt.Errorf("video2dvd: create staged AUDIO_TS directory: %w", err)
 	}
 	for _, file := range files {
 		if err := ctx.Err(); err != nil {
@@ -234,7 +234,7 @@ func stageDVDImageTree(ctx context.Context, root, videoTS string, files []dvdIma
 			continue
 		}
 		if err := copyFileContext(ctx, source, target); err != nil {
-			return fmt.Errorf("mp4todvd: stage %s: %w", file.name, err)
+			return fmt.Errorf("video2dvd: stage %s: %w", file.name, err)
 		}
 	}
 	return nil
@@ -305,13 +305,13 @@ func (w contextWriterAt) WriteAt(p []byte, off int64) (int, error) {
 func writeDVDImageContents(ctx context.Context, image *os.File, root string, files []dvdImageFile, titleCount int, volumeID string, capacity int64) (uint64, error) {
 	result, err := udf.WriteTree(contextWriterAt{ctx: ctx, w: image}, root, udf.Options{VolumeID: volumeID, VRSStart: udfVRSStart})
 	if err != nil {
-		return 0, fmt.Errorf("mp4todvd: write UDF 1.02 filesystem: %w", err)
+		return 0, fmt.Errorf("video2dvd: write UDF 1.02 filesystem: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
 	if result.TotalSectors == 0 || result.TotalSectors > math.MaxInt64/dvdImageSectorSize {
-		return 0, errors.New("mp4todvd: DVD image sector count overflows file size")
+		return 0, errors.New("video2dvd: DVD image sector count overflows file size")
 	}
 	imageBytes := int64(result.TotalSectors) * dvdImageSectorSize
 	if imageBytes > capacity {
@@ -323,7 +323,7 @@ func writeDVDImageContents(ctx context.Context, image *os.File, root string, fil
 		key := "VIDEO_TS/" + files[i].fakeName
 		loc, ok := result.Files[key]
 		if !ok {
-			return 0, fmt.Errorf("mp4todvd: UDF writer did not report extent for %s", files[i].name)
+			return 0, fmt.Errorf("video2dvd: UDF writer did not report extent for %s", files[i].name)
 		}
 		locations[files[i].name] = loc
 		if loc.Sector < minDataSector {
@@ -348,22 +348,22 @@ func writeDVDImageContents(ctx context.Context, image *os.File, root string, fil
 
 func patchUDFIdentifiers(image *os.File, firstFileSector uint64, files []dvdImageFile) error {
 	if firstFileSector <= dvdImagePartitionLBA {
-		return errors.New("mp4todvd: invalid UDF file-data location")
+		return errors.New("video2dvd: invalid UDF file-data location")
 	}
 	start := int64(dvdImagePartitionLBA) * dvdImageSectorSize
 	end := int64(firstFileSector) * dvdImageSectorSize
 	if end-start > 64*1024*1024 {
-		return errors.New("mp4todvd: UDF metadata area is unexpectedly large")
+		return errors.New("video2dvd: UDF metadata area is unexpectedly large")
 	}
 	metadata := make([]byte, end-start)
 	if _, err := image.ReadAt(metadata, start); err != nil {
-		return fmt.Errorf("mp4todvd: read UDF metadata: %w", err)
+		return fmt.Errorf("video2dvd: read UDF metadata: %w", err)
 	}
 	for _, file := range files {
 		oldID := append([]byte{8}, []byte(file.fakeName)...)
 		newID := []byte(file.name)
 		if len(oldID) != len(newID)+1 {
-			return fmt.Errorf("mp4todvd: internal UDF identifier length mismatch for %s", file.name)
+			return fmt.Errorf("video2dvd: internal UDF identifier length mismatch for %s", file.name)
 		}
 		searchAt, replacements := 0, 0
 		for searchAt < len(metadata) {
@@ -386,11 +386,11 @@ func patchUDFIdentifiers(image *os.File, firstFileSector uint64, files []dvdImag
 			searchAt = idAt + len(oldID)
 		}
 		if replacements != 1 {
-			return fmt.Errorf("mp4todvd: expected one UDF directory entry for %s, found %d", file.name, replacements)
+			return fmt.Errorf("video2dvd: expected one UDF directory entry for %s, found %d", file.name, replacements)
 		}
 	}
 	if err := writeAtFull(image, metadata, start); err != nil {
-		return fmt.Errorf("mp4todvd: update UDF directory entries: %w", err)
+		return fmt.Errorf("video2dvd: update UDF directory entries: %w", err)
 	}
 	return nil
 }
@@ -427,21 +427,21 @@ func crcCCITT(data []byte) uint16 {
 func validateUDFImage(image *os.File, files []dvdImageFile, titleCount int) error {
 	volume, err := udf.Read(image)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: validate UDF filesystem: %w", err)
+		return fmt.Errorf("video2dvd: validate UDF filesystem: %w", err)
 	}
 	root, err := volume.ReadDir(nil)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: read UDF root directory: %w", err)
+		return fmt.Errorf("video2dvd: read UDF root directory: %w", err)
 	}
 	if len(root) != 2 || root[0].Name != "AUDIO_TS" || root[1].Name != "VIDEO_TS" {
-		return errors.New("mp4todvd: generated UDF root directory is invalid")
+		return errors.New("video2dvd: generated UDF root directory is invalid")
 	}
 	videoEntries, err := volume.ReadDir([]string{"VIDEO_TS"})
 	if err != nil {
-		return fmt.Errorf("mp4todvd: read UDF VIDEO_TS directory: %w", err)
+		return fmt.Errorf("video2dvd: read UDF VIDEO_TS directory: %w", err)
 	}
 	if len(videoEntries) != len(files) {
-		return fmt.Errorf("mp4todvd: UDF VIDEO_TS has %d entries, want %d", len(videoEntries), len(files))
+		return fmt.Errorf("video2dvd: UDF VIDEO_TS has %d entries, want %d", len(videoEntries), len(files))
 	}
 	want := make(map[string]bool, len(files))
 	for _, file := range files {
@@ -449,12 +449,12 @@ func validateUDFImage(image *os.File, files []dvdImageFile, titleCount int) erro
 	}
 	for _, entry := range videoEntries {
 		if entry.IsDir || !want[entry.Name] {
-			return fmt.Errorf("mp4todvd: unexpected UDF VIDEO_TS entry %q", entry.Name)
+			return fmt.Errorf("video2dvd: unexpected UDF VIDEO_TS entry %q", entry.Name)
 		}
 		delete(want, entry.Name)
 	}
 	if len(want) != 0 || titleCount == 0 {
-		return errors.New("mp4todvd: generated UDF VIDEO_TS directory is incomplete")
+		return errors.New("video2dvd: generated UDF VIDEO_TS directory is incomplete")
 	}
 	return nil
 }
@@ -462,24 +462,24 @@ func validateUDFImage(image *os.File, files []dvdImageFile, titleCount int) erro
 func patchDVDImageIFO(image *os.File, locations map[string]udf.Location, titleCount int) error {
 	vmgIFO, ok := locations["VIDEO_TS.IFO"]
 	if !ok {
-		return errors.New("mp4todvd: VMGI extent is missing")
+		return errors.New("video2dvd: VMGI extent is missing")
 	}
 	vmgBUP := locations["VIDEO_TS.BUP"]
 	vmgBytes, err := patchIFOHeader(image, vmgIFO, vmgBUP)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: patch VMGI sector addresses: %w", err)
+		return fmt.Errorf("video2dvd: patch VMGI sector addresses: %w", err)
 	}
 	ttPointer := binary.BigEndian.Uint32(vmgBytes[0x00C4:0x00C8])
 	ttOffset := int64(ttPointer) * dvdImageSectorSize
 	if ttOffset+dvdImageSectorSize > vmgIFO.Length {
-		return errors.New("mp4todvd: VMGI title table exceeds IFO extent")
+		return errors.New("video2dvd: VMGI title table exceeds IFO extent")
 	}
 	table := make([]byte, dvdImageSectorSize)
 	if _, err := image.ReadAt(table, int64(vmgIFO.Sector)*dvdImageSectorSize+ttOffset); err != nil {
-		return fmt.Errorf("mp4todvd: read VMGI title table: %w", err)
+		return fmt.Errorf("video2dvd: read VMGI title table: %w", err)
 	}
 	if binary.BigEndian.Uint16(table[0:2]) != uint16(titleCount) {
-		return errors.New("mp4todvd: VMGI title count does not match VIDEO_TS")
+		return errors.New("video2dvd: VMGI title count does not match VIDEO_TS")
 	}
 	for i := range titleCount {
 		stem := fmt.Sprintf("VTS_%02d", i+1)
@@ -487,15 +487,15 @@ func patchDVDImageIFO(image *os.File, locations map[string]udf.Location, titleCo
 		vob := locations[stem+"_1.VOB"]
 		bup := locations[stem+"_0.BUP"]
 		if ifo.Length == 0 || vob.Length == 0 || bup.Length != ifo.Length {
-			return fmt.Errorf("mp4todvd: title set %d has inconsistent file extents", i+1)
+			return fmt.Errorf("video2dvd: title set %d has inconsistent file extents", i+1)
 		}
 		if !(ifo.Sector < vob.Sector && vob.Sector < bup.Sector) {
-			return fmt.Errorf("mp4todvd: title set %d files are not in DVD-Video sector order", i+1)
+			return fmt.Errorf("video2dvd: title set %d files are not in DVD-Video sector order", i+1)
 		}
 		start := ifo.Sector
 		end := bup.Sector + uint64(sectorsForSize(bup.Length)) - 1
 		if start > math.MaxUint32 || end-start > math.MaxUint32 || vob.Sector-start > math.MaxUint32 {
-			return fmt.Errorf("mp4todvd: title set %d sector address exceeds 32 bits", i+1)
+			return fmt.Errorf("video2dvd: title set %d sector address exceeds 32 bits", i+1)
 		}
 		titleHeader, err := readImageHeader(image, ifo)
 		if err != nil {
@@ -504,17 +504,17 @@ func patchDVDImageIFO(image *os.File, locations map[string]udf.Location, titleCo
 		binary.BigEndian.PutUint32(titleHeader[0x000C:0x0010], uint32(end-start))
 		binary.BigEndian.PutUint32(titleHeader[0x00C4:0x00C8], uint32(vob.Sector-start))
 		if err := writeImageHeader(image, ifo, bup, titleHeader); err != nil {
-			return fmt.Errorf("mp4todvd: patch title set %d sector addresses: %w", i+1, err)
+			return fmt.Errorf("video2dvd: patch title set %d sector addresses: %w", i+1, err)
 		}
 		entry := 8 + i*12
 		if entry+12 > len(table) {
-			return errors.New("mp4todvd: VMGI title table is too large")
+			return errors.New("video2dvd: VMGI title table is too large")
 		}
 		binary.BigEndian.PutUint32(table[entry+8:entry+12], uint32(start))
 	}
 	for _, loc := range []udf.Location{vmgIFO, vmgBUP} {
 		if err := writeAtFull(image, table, int64(loc.Sector)*dvdImageSectorSize+ttOffset); err != nil {
-			return fmt.Errorf("mp4todvd: update VMGI title table: %w", err)
+			return fmt.Errorf("video2dvd: update VMGI title table: %w", err)
 		}
 	}
 	return nil
@@ -576,17 +576,17 @@ type isoPathEntry struct {
 
 func writeISO9660Bridge(image *os.File, udfSectors uint64, locations map[string]udf.Location, files []dvdImageFile, volumeID string, capacity int64) (uint64, error) {
 	if udfSectors == 0 || udfSectors > math.MaxUint32 {
-		return 0, errors.New("mp4todvd: ISO 9660 volume exceeds 32-bit sector count")
+		return 0, errors.New("video2dvd: ISO 9660 volume exceeds 32-bit sector count")
 	}
 	// The ECMA-119 metadata is appended after the UDF partition. This keeps
 	// DVD-Video's reserved sectors (including 21-31 and 66-255) at zero.
 	if udfSectors > math.MaxUint32-4 {
-		return 0, errors.New("mp4todvd: ISO metadata extent exceeds 32-bit sector addresses")
+		return 0, errors.New("video2dvd: ISO metadata extent exceeds 32-bit sector addresses")
 	}
 	baseLBA := uint32(udfSectors - 1) // reuse the old backup-anchor sector.
 	anchor := make([]byte, dvdImageSectorSize)
 	if _, err := image.ReadAt(anchor, int64(baseLBA)*dvdImageSectorSize); err != nil {
-		return 0, fmt.Errorf("mp4todvd: read UDF backup anchor: %w", err)
+		return 0, fmt.Errorf("video2dvd: read UDF backup anchor: %w", err)
 	}
 	lPathLBA, mPathLBA := baseLBA, baseLBA+1
 	rootLBA, audioLBA, videoLBA := baseLBA+2, baseLBA+3, baseLBA+4
@@ -599,7 +599,7 @@ func writeISO9660Bridge(image *os.File, udfSectors uint64, locations map[string]
 	lPath := buildISOPathTable(entries, binary.LittleEndian)
 	mPath := buildISOPathTable(entries, binary.BigEndian)
 	if len(lPath) > dvdImageSectorSize || len(mPath) > dvdImageSectorSize {
-		return 0, errors.New("mp4todvd: ISO path table exceeds one sector")
+		return 0, errors.New("video2dvd: ISO path table exceeds one sector")
 	}
 
 	videoEntries := make([]dvdImageFile, len(files))
@@ -613,11 +613,11 @@ func writeISO9660Bridge(image *os.File, udfSectors uint64, locations map[string]
 	for _, file := range videoEntries {
 		loc := locations[file.name]
 		if loc.Length <= 0 || loc.Sector > math.MaxUint32 {
-			return 0, fmt.Errorf("mp4todvd: invalid ISO extent for %s", file.name)
+			return 0, fmt.Errorf("video2dvd: invalid ISO extent for %s", file.name)
 		}
 		records, err := isoFileRecords(file.name+";1", loc)
 		if err != nil {
-			return 0, fmt.Errorf("mp4todvd: create ISO records for %s: %w", file.name, err)
+			return 0, fmt.Errorf("video2dvd: create ISO records for %s: %w", file.name, err)
 		}
 		videoRecords = append(videoRecords, records...)
 	}
@@ -630,7 +630,7 @@ func writeISO9660Bridge(image *os.File, udfSectors uint64, locations map[string]
 	newAnchorLBA := uint64(videoLBA) + uint64(videoSectors)
 	imageSectors := newAnchorLBA + 1
 	if imageSectors > math.MaxUint32 || imageSectors > math.MaxInt64/dvdImageSectorSize {
-		return 0, errors.New("mp4todvd: ISO 9660 volume exceeds supported sector count")
+		return 0, errors.New("video2dvd: ISO 9660 volume exceeds supported sector count")
 	}
 	imageBytes := int64(imageSectors) * dvdImageSectorSize
 	if imageBytes > capacity {
@@ -658,7 +658,7 @@ func writeISO9660Bridge(image *os.File, udfSectors uint64, locations map[string]
 		name string
 	}{{lPathLBA, lPath, "little-endian"}, {mPathLBA, mPath, "big-endian"}} {
 		if err := writeAtFull(image, padSector(table.data), int64(table.lba)*dvdImageSectorSize); err != nil {
-			return 0, fmt.Errorf("mp4todvd: write ISO %s path table: %w", table.name, err)
+			return 0, fmt.Errorf("video2dvd: write ISO %s path table: %w", table.name, err)
 		}
 	}
 	for _, dir := range []struct {
@@ -666,25 +666,25 @@ func writeISO9660Bridge(image *os.File, udfSectors uint64, locations map[string]
 		data []byte
 	}{{rootLBA, rootData}, {audioLBA, audioData}, {videoLBA, videoData}} {
 		if err := writeAtFull(image, dir.data, int64(dir.lba)*dvdImageSectorSize); err != nil {
-			return 0, fmt.Errorf("mp4todvd: write ISO directory at sector %d: %w", dir.lba, err)
+			return 0, fmt.Errorf("video2dvd: write ISO directory at sector %d: %w", dir.lba, err)
 		}
 	}
 
 	pvd := buildISOPVD(imageSectors, uint32(len(lPath)), lPathLBA, mPathLBA, rootLBA, volumeID, uint32(len(rootData)))
 	if err := writeAtFull(image, pvd, int64(isoPVDLBA)*dvdImageSectorSize); err != nil {
-		return 0, fmt.Errorf("mp4todvd: write ISO primary volume descriptor: %w", err)
+		return 0, fmt.Errorf("video2dvd: write ISO primary volume descriptor: %w", err)
 	}
 	terminator := make([]byte, dvdImageSectorSize)
 	terminator[0] = 255
 	copy(terminator[1:6], "CD001")
 	terminator[6] = 1
 	if err := writeAtFull(image, terminator, int64(isoTerminatorLBA)*dvdImageSectorSize); err != nil {
-		return 0, fmt.Errorf("mp4todvd: write ISO volume descriptor terminator: %w", err)
+		return 0, fmt.Errorf("video2dvd: write ISO volume descriptor terminator: %w", err)
 	}
 	binary.LittleEndian.PutUint32(anchor[12:16], uint32(newAnchorLBA))
 	refreshUDFTag(anchor)
 	if err := writeAtFull(image, anchor, int64(newAnchorLBA)*dvdImageSectorSize); err != nil {
-		return 0, fmt.Errorf("mp4todvd: write final UDF backup anchor: %w", err)
+		return 0, fmt.Errorf("video2dvd: write final UDF backup anchor: %w", err)
 	}
 	return imageSectors, nil
 }
@@ -714,7 +714,7 @@ func buildISODirectory(records ...[]byte) ([]byte, error) {
 	var data []byte
 	for _, record := range records {
 		if len(record) == 0 || len(record) > 255 {
-			return nil, errors.New("mp4todvd: ISO directory record has invalid length")
+			return nil, errors.New("video2dvd: ISO directory record has invalid length")
 		}
 		withinSector := len(data) % dvdImageSectorSize
 		if withinSector+len(record) > dvdImageSectorSize {
@@ -726,7 +726,7 @@ func buildISODirectory(records ...[]byte) ([]byte, error) {
 		data = append(data, make([]byte, dvdImageSectorSize-padding)...)
 	}
 	if len(data) == 0 {
-		return nil, errors.New("mp4todvd: empty ISO directory")
+		return nil, errors.New("video2dvd: empty ISO directory")
 	}
 	return data, nil
 }

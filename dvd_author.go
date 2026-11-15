@@ -1,4 +1,4 @@
-package mp4todvd
+package video2dvd
 
 import (
 	"context"
@@ -34,10 +34,10 @@ type authoredTitle struct {
 // be empty. VTS numbers and title order match the input order.
 func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, outputDir string, profile Profile) error {
 	if a == nil {
-		return errors.New("mp4todvd: in-process authorer is nil")
+		return errors.New("video2dvd: in-process authorer is nil")
 	}
 	if ctx == nil {
-		return errors.New("mp4todvd: context must not be nil")
+		return errors.New("video2dvd: context must not be nil")
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -46,17 +46,17 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 		return ErrNoInputs
 	}
 	if len(titles) > dvdMaxTitles {
-		return fmt.Errorf("mp4todvd: DVD-Video supports at most %d titles", dvdMaxTitles)
+		return fmt.Errorf("video2dvd: DVD-Video supports at most %d titles", dvdMaxTitles)
 	}
 	if err := validateAuthoringProfile(profile); err != nil {
 		return err
 	}
 	entries, err := os.ReadDir(outputDir)
 	if err != nil {
-		return fmt.Errorf("mp4todvd: inspect authoring directory: %w", err)
+		return fmt.Errorf("video2dvd: inspect authoring directory: %w", err)
 	}
 	if len(entries) != 0 {
-		return errors.New("mp4todvd: authoring directory must be empty")
+		return errors.New("video2dvd: authoring directory must be empty")
 	}
 
 	vmgPlaceholder, vmgSectors, err := buildDVDVMGI(titles, profile, nil)
@@ -74,26 +74,26 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 			return err
 		}
 		if title.VideoCodec != VideoCodecMPEG2 || title.AudioCodec != AudioCodecLPCM {
-			return fmt.Errorf("mp4todvd: built-in authorer requires MPEG-2 video and LPCM audio for title %d", i+1)
+			return fmt.Errorf("video2dvd: built-in authorer requires MPEG-2 video and LPCM audio for title %d", i+1)
 		}
 		if title.Aspect != profile.Aspect || title.Width != profile.FrameWidth || title.Height != profile.FrameHeight {
-			return fmt.Errorf("mp4todvd: title %d metadata does not match the authoring profile", i+1)
+			return fmt.Errorf("video2dvd: title %d metadata does not match the authoring profile", i+1)
 		}
 		if title.Duration <= 0 || title.FrameRateNumerator <= 0 || title.FrameRateDenominator <= 0 {
-			return fmt.Errorf("mp4todvd: title %d has invalid timing metadata", i+1)
+			return fmt.Errorf("video2dvd: title %d has invalid timing metadata", i+1)
 		}
 		if !validFrameRate(profile.Standard, title.FrameRateNumerator, title.FrameRateDenominator) {
-			return fmt.Errorf("mp4todvd: title %d frame rate does not match the authoring standard", i+1)
+			return fmt.Errorf("video2dvd: title %d frame rate does not match the authoring standard", i+1)
 		}
 		if nextTitleSetSector > math.MaxUint32 {
-			return errors.New("mp4todvd: DVD title-set sector address exceeds 32 bits")
+			return errors.New("video2dvd: DVD title-set sector address exceeds 32 bits")
 		}
 		base := uint32(nextTitleSetSector)
 		vtsName := fmt.Sprintf("VTS_%02d", i+1)
 		vobPath := filepath.Join(outputDir, vtsName+"_1.VOB")
 		vob, err := os.OpenFile(vobPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err != nil {
-			return fmt.Errorf("mp4todvd: create %s: %w", filepath.Base(vobPath), err)
+			return fmt.Errorf("video2dvd: create %s: %w", filepath.Base(vobPath), err)
 		}
 		records := make([]dvdVOBURecord, 0, 64)
 		workDir := filepath.Dir(title.VideoPath)
@@ -103,22 +103,22 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 		})
 		closeErr := vob.Close()
 		if muxErr != nil {
-			return fmt.Errorf("mp4todvd: mux title %d: %w", i+1, muxErr)
+			return fmt.Errorf("video2dvd: mux title %d: %w", i+1, muxErr)
 		}
 		if closeErr != nil {
-			return fmt.Errorf("mp4todvd: close %s: %w", filepath.Base(vobPath), closeErr)
+			return fmt.Errorf("video2dvd: close %s: %w", filepath.Base(vobPath), closeErr)
 		}
 		vobInfo, err := os.Stat(vobPath)
 		if err != nil {
 			return err
 		}
 		if vobInfo.Size() == 0 || vobInfo.Size()%DVDVOBSectorSize != 0 || vobInfo.Size()/DVDVOBSectorSize > math.MaxUint32 {
-			return fmt.Errorf("mp4todvd: title %d VOB has an invalid sector count", i+1)
+			return fmt.Errorf("video2dvd: title %d VOB has an invalid sector count", i+1)
 		}
 		vobSectors := uint32(vobInfo.Size() / DVDVOBSectorSize)
 		ifo, ifoSectors, err := buildDVDVTSIFO(title, profile, records, vobSectors)
 		if err != nil {
-			return fmt.Errorf("mp4todvd: build title %d IFO: %w", i+1, err)
+			return fmt.Errorf("video2dvd: build title %d IFO: %w", i+1, err)
 		}
 		if err := writeIFOAndBUP(outputDir, vtsName+"_0", ifo); err != nil {
 			return err
@@ -136,7 +136,7 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 		return err
 	}
 	if finalVMGSectors != vmgSectors {
-		return errors.New("mp4todvd: VMGI size changed while writing title references")
+		return errors.New("video2dvd: VMGI size changed while writing title references")
 	}
 	if err := overwriteIFOAndBUP(outputDir, "VIDEO_TS", vmg); err != nil {
 		return err
@@ -295,7 +295,7 @@ func dvdIFOTime(duration time.Duration, standard VideoStandard) ([4]byte, error)
 
 func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint32) ([]byte, uint32, error) {
 	if len(titles) == 0 || len(titles) > dvdMaxTitles {
-		return nil, 0, errors.New("mp4todvd: VMGI requires between 1 and 99 titles")
+		return nil, 0, errors.New("video2dvd: VMGI requires between 1 and 99 titles")
 	}
 	attributes := make([]byte, len(titles)*776)
 	for i, title := range titles {
@@ -347,7 +347,7 @@ func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint3
 	binary.BigEndian.PutUint16(image[0x0028:0x002A], 1) // number of volumes.
 	binary.BigEndian.PutUint16(image[0x002A:0x002C], 1) // volume number.
 	binary.BigEndian.PutUint16(image[0x003E:0x0040], uint16(len(titles)))
-	copy(image[0x0040:0x0040+12], []byte("MP4TODVD-GO"))
+	copy(image[0x0040:0x0040+12], []byte("VIDEO2DVD-GO"))
 	binary.BigEndian.PutUint32(image[0x0080:0x0084], 0x01ff)
 	binary.BigEndian.PutUint32(image[0x00C4:0x00C8], 1) // TT_SRPT.
 	binary.BigEndian.PutUint32(image[0x00D0:0x00D4], 2) // VMG_VTS_ATRT.
@@ -360,7 +360,7 @@ func writeIFOAndBUP(dir, stem string, contents []byte) error {
 	for _, ext := range []string{".IFO", ".BUP"} {
 		path := filepath.Join(dir, stem+ext)
 		if err := os.WriteFile(path, contents, 0o600); err != nil {
-			return fmt.Errorf("mp4todvd: write %s: %w", filepath.Base(path), err)
+			return fmt.Errorf("video2dvd: write %s: %w", filepath.Base(path), err)
 		}
 	}
 	return nil
@@ -371,15 +371,15 @@ func overwriteIFOAndBUP(dir, stem string, contents []byte) error {
 		path := filepath.Join(dir, stem+ext)
 		file, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0)
 		if err != nil {
-			return fmt.Errorf("mp4todvd: open %s for finalization: %w", filepath.Base(path), err)
+			return fmt.Errorf("video2dvd: open %s for finalization: %w", filepath.Base(path), err)
 		}
 		_, writeErr := file.Write(contents)
 		closeErr := file.Close()
 		if writeErr != nil {
-			return fmt.Errorf("mp4todvd: finalize %s: %w", filepath.Base(path), writeErr)
+			return fmt.Errorf("video2dvd: finalize %s: %w", filepath.Base(path), writeErr)
 		}
 		if closeErr != nil {
-			return fmt.Errorf("mp4todvd: close %s: %w", filepath.Base(path), closeErr)
+			return fmt.Errorf("video2dvd: close %s: %w", filepath.Base(path), closeErr)
 		}
 	}
 	return nil
