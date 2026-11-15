@@ -38,8 +38,10 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	}
 	firstVTSStart := binary.BigEndian.Uint32(tt[8+8 : 8+12])
 	secondVTSStart := binary.BigEndian.Uint32(tt[8+12+8 : 8+12+12])
-	if firstVTSStart != vmgSectors*2 {
-		t.Fatalf("first VTS sector = %d, want after VMGI/BUP at %d", firstVTSStart, vmgSectors*2)
+	menuVOB := readAuthorerTestFile(t, videoTS, "VIDEO_TS.VOB")
+	menuSectors := uint32(len(menuVOB) / DVDVOBSectorSize)
+	if firstVTSStart != vmgSectors*2+menuSectors {
+		t.Fatalf("first VTS sector = %d, want after VMGI/menu/BUP at %d", firstVTSStart, vmgSectors*2+menuSectors)
 	}
 
 	firstIFO := readAuthorerTestFile(t, videoTS, "VTS_01_0.IFO")

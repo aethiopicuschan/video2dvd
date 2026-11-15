@@ -27,6 +27,17 @@ type DVDNAVPackInfo struct {
 	StartPTM                  uint32
 	EndPTM                    uint32
 	CellElapsedTime           [4]byte
+	Buttons                   []DVDNAVButton
+}
+
+// DVDNAVButton describes one rectangular menu button. Coordinates use the
+// DVD 720x480/576 display raster and commands are eight-byte DVD VM words.
+type DVDNAVButton struct {
+	XStart, YStart int
+	XEnd, YEnd     int
+	Up, Down       uint8
+	Left, Right    uint8
+	Command        [8]byte
 }
 
 // BuildDVDNAVPack builds one 2048-byte DVD navigation pack containing the
@@ -52,6 +63,9 @@ func BuildDVDNAVPack(info DVDNAVPackInfo) ([]byte, error) {
 	binary.BigEndian.PutUint32(pci[12:16], info.StartPTM)
 	binary.BigEndian.PutUint32(pci[16:20], info.EndPTM)
 	copy(pci[20:24], info.CellElapsedTime[:])
+	if err := writeDVDNAVButtons(pci, info.Buttons); err != nil {
+		return nil, err
+	}
 
 	const dsiOffset = 0x400
 	writePrivateStream2Packet(pack[dsiOffset:], 1, dvdNAVDSIDataSize)
@@ -66,6 +80,47 @@ func BuildDVDNAVPack(info DVDNAVPackInfo) ([]byte, error) {
 	dsi[27] = info.CellID
 	copy(dsi[28:32], info.CellElapsedTime[:])
 	return pack, nil
+}
+
+func writeDVDNAVButtons(pci []byte, buttons []DVDNAVButton) error {
+	if len(buttons) == 0 {
+		return nil
+	}
+	if len(buttons) > 36 {
+		return errors.New("video2dvd: DVD menu supports at most 36 buttons per VOBU")
+	}
+	base := 0x60
+	pci[base+1] = 1       // all-new highlight information.
+	pci[base+0x0e] = 0x40 // one normal button group.
+	pci[base+0x10] = 1
+	pci[base+0x11] = byte(len(buttons))
+	pci[base+0x12] = byte(len(buttons))
+	pci[base+0x14] = 1
+	pci[base+0x15] = 1
+	// White selection and yellow action emphasis with full contrast.
+	copy(pci[base+0x16:base+0x1e], []byte{0x03, 0x01, 0xff, 0xff, 0x30, 0x10, 0xff, 0xff})
+	for index, button := range buttons {
+		if button.XStart < 0 || button.XStart > 719 || button.XEnd < button.XStart || button.XEnd > 719 ||
+			button.YStart < 0 || button.YStart > 575 || button.YEnd < button.YStart || button.YEnd > 575 {
+			return errors.New("video2dvd: DVD menu button coordinates are outside the display raster")
+		}
+		if button.Up > 36 || button.Down > 36 || button.Left > 36 || button.Right > 36 {
+			return errors.New("video2dvd: DVD menu button navigation target is out of range")
+		}
+		offset := base + 0x2e + index*18
+		pci[offset] = 0x40 | byte(button.XStart>>4)
+		pci[offset+1] = byte(button.XStart<<4) | byte(button.XEnd>>8)
+		pci[offset+2] = byte(button.XEnd)
+		pci[offset+3] = byte(button.YStart >> 4)
+		pci[offset+4] = byte(button.YStart<<4) | byte(button.YEnd>>8)
+		pci[offset+5] = byte(button.YEnd)
+		pci[offset+6] = button.Up
+		pci[offset+7] = button.Down
+		pci[offset+8] = button.Left
+		pci[offset+9] = button.Right
+		copy(pci[offset+10:offset+18], button.Command[:])
+	}
+	return nil
 }
 
 // WriteDVDNAVPack writes one fixed-size navigation pack without closing dst.

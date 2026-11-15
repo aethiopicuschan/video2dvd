@@ -194,9 +194,10 @@ func inspectDVDImageSource(videoTS string) ([]dvdImageFile, int, error) {
 	if err := validateDVDDirectory(videoTS, titleCount); err != nil {
 		return nil, 0, err
 	}
-	expected := make([]dvdImageFile, 0, 2+3*titleCount)
+	expected := make([]dvdImageFile, 0, 3+3*titleCount)
 	expected = append(expected,
 		dvdImageFile{name: "VIDEO_TS.IFO", fakeName: "VIDEO_TS.AAA"},
+		dvdImageFile{name: "VIDEO_TS.VOB", fakeName: "VIDEO_TS.MMM"},
 		dvdImageFile{name: "VIDEO_TS.BUP", fakeName: "VIDEO_TS.ZZZ"},
 	)
 	for i := 1; i <= titleCount; i++ {
@@ -207,7 +208,7 @@ func inspectDVDImageSource(videoTS string) ([]dvdImageFile, int, error) {
 		)
 	}
 	if len(entries) != len(expected) {
-		return nil, 0, errors.New("video2dvd: image writer accepts the current menu-less VIDEO_TS file layout only")
+		return nil, 0, errors.New("video2dvd: image writer accepts the generated VIDEO_TS file layout only")
 	}
 	for _, file := range expected {
 		if !entryNames[file.name] {

@@ -17,9 +17,8 @@ const (
 	dvdVTSIFOBaseSectors = 5
 )
 
-// InProcessAuthorer writes a menu-less DVD-Video title set for each encoded
-// title. It uses only Go code and currently accepts MPEG-2 video with LPCM
-// audio, which are the streams supported by MuxDVDTitleVOB.
+// InProcessAuthorer writes a DVD-Video title set with an automatically
+// generated title menu. Each encoded title is one DVD title and one chapter.
 type InProcessAuthorer struct{}
 
 // NewInProcessAuthorer returns the built-in IFO/BUP and VOB authorer.
@@ -59,7 +58,33 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 		return errors.New("video2dvd: authoring directory must be empty")
 	}
 
-	vmgPlaceholder, vmgSectors, err := buildDVDVMGI(titles, profile, nil)
+	menuWorkDir, err := os.MkdirTemp(outputDir, ".video2dvd-menu-")
+	if err != nil {
+		return fmt.Errorf("video2dvd: create menu work directory: %w", err)
+	}
+	defer os.RemoveAll(menuWorkDir)
+	menuTitle, menuButtons, err := createDVDMenuTitle(ctx, titles, profile, menuWorkDir)
+	if err != nil {
+		return err
+	}
+	menuPath := filepath.Join(outputDir, "VIDEO_TS.VOB")
+	menuFile, err := os.OpenFile(menuPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("video2dvd: create VIDEO_TS.VOB: %w", err)
+	}
+	if err := muxDVDTitleVOB(ctx, menuTitle, menuWorkDir, menuFile, nil, menuButtons); err != nil {
+		_ = menuFile.Close()
+		return fmt.Errorf("video2dvd: mux title menu: %w", err)
+	}
+	if err := menuFile.Close(); err != nil {
+		return fmt.Errorf("video2dvd: close VIDEO_TS.VOB: %w", err)
+	}
+	menuInfo, err := os.Stat(menuPath)
+	if err != nil || menuInfo.Size() == 0 || menuInfo.Size()%DVDVOBSectorSize != 0 {
+		return errors.New("video2dvd: generated title menu has an invalid sector count")
+	}
+	menuSectors := uint32(menuInfo.Size() / DVDVOBSectorSize)
+	vmgPlaceholder, vmgSectors, err := buildDVDVMGI(titles, profile, nil, menuSectors)
 	if err != nil {
 		return err
 	}
@@ -68,7 +93,7 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 	}
 
 	authored := make([]authoredTitle, len(titles))
-	nextTitleSetSector := uint64(vmgSectors) * 2 // VMGI and its BUP; no VMGM VOB.
+	nextTitleSetSector := uint64(vmgSectors)*2 + uint64(menuSectors)
 	for i, title := range titles {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -100,7 +125,7 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 		muxErr := muxDVDTitleVOB(ctx, title, workDir, vob, func(record dvdVOBURecord) error {
 			records = append(records, record)
 			return nil
-		})
+		}, nil)
 		closeErr := vob.Close()
 		if muxErr != nil {
 			return fmt.Errorf("video2dvd: mux title %d: %w", i+1, muxErr)
@@ -131,7 +156,7 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 	for i := range authored {
 		starts[i] = authored[i].titleSetBase
 	}
-	vmg, finalVMGSectors, err := buildDVDVMGI(titles, profile, starts)
+	vmg, finalVMGSectors, err := buildDVDVMGI(titles, profile, starts, menuSectors)
 	if err != nil {
 		return err
 	}
@@ -293,7 +318,7 @@ func dvdIFOTime(duration time.Duration, standard VideoStandard) ([4]byte, error)
 	return [4]byte{toPackedBCD(hours), toPackedBCD(minutes), toPackedBCD(seconds), rateCode<<6 | toPackedBCD(framePart)}, nil
 }
 
-func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint32) ([]byte, uint32, error) {
+func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint32, menuSectors uint32) ([]byte, uint32, error) {
 	if len(titles) == 0 || len(titles) > dvdMaxTitles {
 		return nil, 0, errors.New("video2dvd: VMGI requires between 1 and 99 titles")
 	}
@@ -334,10 +359,13 @@ func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint3
 			binary.BigEndian.PutUint32(tt[base+8:base+12], titleSetStarts[i])
 		}
 	}
-	vmgSectors := uint32(2 + (len(attrTable)+DVDVOBSectorSize-1)/DVDVOBSectorSize)
+	menuTable := buildDVDVMGMenuPGCI(menuSectors)
+	attrSectors := uint32((len(attrTable) + DVDVOBSectorSize - 1) / DVDVOBSectorSize)
+	menuTableSector := uint32(2) + attrSectors
+	vmgSectors := menuTableSector + uint32((len(menuTable)+DVDVOBSectorSize-1)/DVDVOBSectorSize)
 	image := make([]byte, int(vmgSectors)*DVDVOBSectorSize)
 	copy(image[:12], []byte("DVDVIDEO-VMG"))
-	lastVMGSector := uint64(vmgSectors)*2 - 1 // IFO and BUP; no VIDEO_TS.VOB.
+	lastVMGSector := uint64(vmgSectors)*2 + uint64(menuSectors) - 1
 	if lastVMGSector > math.MaxUint32 {
 		return nil, 0, errors.New("VMG last-sector address exceeds 32 bits")
 	}
@@ -349,11 +377,54 @@ func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint3
 	binary.BigEndian.PutUint16(image[0x003E:0x0040], uint16(len(titles)))
 	copy(image[0x0040:0x0040+12], []byte("VIDEO2DVD-GO"))
 	binary.BigEndian.PutUint32(image[0x0080:0x0084], 0x01ff)
+	if menuSectors > 0 {
+		binary.BigEndian.PutUint32(image[0x00C0:0x00C4], vmgSectors)
+		binary.BigEndian.PutUint32(image[0x00C8:0x00CC], menuTableSector)
+		binary.BigEndian.PutUint32(image[0x0084:0x0088], menuTableSector*DVDVOBSectorSize+32)
+		image[0x0100] = byte(dvdVideoAttribute(titles[0], profile) >> 8)
+		image[0x0101] = byte(dvdVideoAttribute(titles[0], profile))
+		binary.BigEndian.PutUint16(image[0x0102:0x0104], 1)
+	}
 	binary.BigEndian.PutUint32(image[0x00C4:0x00C8], 1) // TT_SRPT.
 	binary.BigEndian.PutUint32(image[0x00D0:0x00D4], 2) // VMG_VTS_ATRT.
 	copy(image[DVDVOBSectorSize:], tt)
 	copy(image[2*DVDVOBSectorSize:], attrTable)
+	copy(image[int(menuTableSector)*DVDVOBSectorSize:], menuTable)
 	return image, vmgSectors, nil
+}
+
+func buildDVDVMGMenuPGCI(menuSectors uint32) []byte {
+	pgc := make([]byte, 0xec+2+24+4)
+	pgc[2], pgc[3] = 1, 1
+	pgc[0x0c] = 0x80
+	binary.BigEndian.PutUint16(pgc[0x00e6:0x00e8], 0xec)
+	binary.BigEndian.PutUint16(pgc[0x00e8:0x00ea], 0xec+2)
+	binary.BigEndian.PutUint16(pgc[0x00ea:0x00ec], 0xec+2+24)
+	pgc[0xec] = 1
+	cell := pgc[0xee:]
+	cell[3] = 1
+	copy(cell[4:8], []byte{0, 0, 0, 1})
+	binary.BigEndian.PutUint32(cell[8:12], 0)
+	if menuSectors > 0 {
+		binary.BigEndian.PutUint32(cell[20:24], menuSectors-1)
+	}
+	position := cell[24:]
+	binary.BigEndian.PutUint16(position[0:2], 1)
+	position[3] = 1
+	lu := make([]byte, 8+8+len(pgc))
+	binary.BigEndian.PutUint16(lu[0:2], 1)
+	binary.BigEndian.PutUint32(lu[4:8], uint32(len(lu)-1))
+	binary.BigEndian.PutUint32(lu[8:12], 0x80000002)
+	binary.BigEndian.PutUint32(lu[12:16], 16)
+	copy(lu[16:], pgc)
+	table := make([]byte, 8+8+len(lu))
+	binary.BigEndian.PutUint16(table[0:2], 1)
+	binary.BigEndian.PutUint32(table[4:8], uint32(len(table)-1))
+	copy(table[8:10], []byte("en"))
+	table[11] = 0x80
+	binary.BigEndian.PutUint32(table[12:16], 16)
+	copy(table[16:], lu)
+	return table
 }
 
 func writeIFOAndBUP(dir, stem string, contents []byte) error {
