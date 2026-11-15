@@ -126,13 +126,28 @@ func menuFrameRateDenominator(standard VideoStandard) int {
 func newDVDMenuFrame(profile Profile, titles []EncodedTitle, start int) DecodedVideoFrame {
 	frame := DecodedVideoFrame{Width: profile.FrameWidth, Height: profile.FrameHeight, Duration: time.Second,
 		Y: make([]byte, profile.FrameWidth*profile.FrameHeight), U: make([]byte, profile.FrameWidth*profile.FrameHeight/4), V: make([]byte, profile.FrameWidth*profile.FrameHeight/4)}
+	background := profile.MenuBackgroundLuma
+	if background == 0 {
+		background = 24
+	}
 	for i := range frame.Y {
-		frame.Y[i] = 24
+		frame.Y[i] = background
 	}
 	for i := range frame.U {
 		frame.U[i], frame.V[i] = 128, 128
 	}
-	drawDVDMenuText(&frame, 48, 48, "VIDEO2DVD", 220)
+	title := profile.MenuTitle
+	if title == "" {
+		title = "VIDEO2DVD"
+	}
+	textLuma := profile.MenuTextLuma
+	if textLuma == 0 {
+		textLuma = 220
+	}
+	drawDVDMenuText(&frame, 48, 24, strings.ToUpper(title), textLuma)
+	if start == 0 {
+		drawDVDMenuText(&frame, 56, 54, "PLAY ALL", textLuma)
+	}
 	for i, title := range titles {
 		name := strings.ToUpper(filepath.Base(title.VideoPath))
 		name = strings.TrimSuffix(name, strings.ToUpper(filepath.Ext(name)))
@@ -141,7 +156,7 @@ func newDVDMenuFrame(profile Profile, titles []EncodedTitle, start int) DecodedV
 		if column == 1 {
 			x = 376
 		}
-		drawDVDMenuText(&frame, x, 94+row*20, padMenuNumber(start+i+1)+" "+name, 210)
+		drawDVDMenuText(&frame, x, 94+row*20, padMenuNumber(start+i+1)+" "+name, textLuma)
 	}
 	return frame
 }
@@ -154,6 +169,7 @@ func padMenuNumber(number int) string {
 }
 
 var dvdMenuFont = map[byte][7]byte{
+	'?': {0x0e, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04}, ' ': {0, 0, 0, 0, 0, 0, 0},
 	'0': {0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e}, '1': {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e},
 	'2': {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f}, '3': {0x1e, 0x01, 0x01, 0x0e, 0x01, 0x01, 0x1e},
 	'4': {0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02}, '5': {0x1f, 0x10, 0x10, 0x1e, 0x01, 0x01, 0x1e},
@@ -170,14 +186,15 @@ var dvdMenuFont = map[byte][7]byte{
 func drawDVDMenuText(frame *DecodedVideoFrame, x, y int, text string, value byte) {
 	for _, char := range []byte(text) {
 		glyph, ok := dvdMenuFont[char]
-		if ok {
-			for row, bits := range glyph {
-				for column := range 5 {
-					if bits&(1<<(4-column)) != 0 && x+column*2+1 < frame.Width && y+row*2+1 < frame.Height {
-						for dy := range 2 {
-							for dx := range 2 {
-								frame.Y[(y+row*2+dy)*frame.Width+x+column*2+dx] = value
-							}
+		if !ok && char != ' ' {
+			glyph = dvdMenuFont['?']
+		}
+		for row, bits := range glyph {
+			for column := range 5 {
+				if bits&(1<<(4-column)) != 0 && x+column*2+1 < frame.Width && y+row*2+1 < frame.Height {
+					for dy := range 2 {
+						for dx := range 2 {
+							frame.Y[(y+row*2+dy)*frame.Width+x+column*2+dx] = value
 						}
 					}
 				}

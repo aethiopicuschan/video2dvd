@@ -403,14 +403,23 @@ func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint3
 }
 
 func buildDVDVMGMenuPGCI(menuSectors uint32, menuTime [4]byte) []byte {
-	pgc := make([]byte, 0xec+2+24+4)
+	const headerSize = 0xec
+	const commandTableSize = 16
+	pgc := make([]byte, headerSize+commandTableSize+2+24+4)
 	pgc[2], pgc[3] = 1, 1
 	pgc[0x0c] = 0x80
-	binary.BigEndian.PutUint16(pgc[0x00e6:0x00e8], 0xec)
-	binary.BigEndian.PutUint16(pgc[0x00e8:0x00ea], 0xec+2)
-	binary.BigEndian.PutUint16(pgc[0x00ea:0x00ec], 0xec+2+24)
-	pgc[0xec] = 1
-	cell := pgc[0xee:]
+	// Loop the title menu after its final page. This also makes menus usable
+	// on players that do not automatically repeat a VMG menu cell.
+	binary.BigEndian.PutUint16(pgc[0x00e4:0x00e6], headerSize)
+	binary.BigEndian.PutUint16(pgc[0x00e6:0x00e8], headerSize+commandTableSize)
+	binary.BigEndian.PutUint16(pgc[0x00e8:0x00ea], headerSize+commandTableSize+2)
+	binary.BigEndian.PutUint16(pgc[0x00ea:0x00ec], headerSize+commandTableSize+2+24)
+	commandTable := pgc[headerSize : headerSize+commandTableSize]
+	binary.BigEndian.PutUint16(commandTable[2:4], 1)
+	menuLoop := dvdJumpMenuCommand()
+	copy(commandTable[8:16], menuLoop[:])
+	pgc[headerSize+commandTableSize] = 1
+	cell := pgc[headerSize+commandTableSize+2:]
 	cell[3] = 1
 	copy(cell[4:8], menuTime[:])
 	binary.BigEndian.PutUint32(cell[8:12], 0)
