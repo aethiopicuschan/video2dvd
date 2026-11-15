@@ -22,19 +22,23 @@ const (
 
 // TrackInfo contains container-level metadata. Codec is the sample-entry four
 // character code; CodecConfig contains avcC data for AVC tracks or the
-// AudioSpecificConfig for AAC tracks.
+// AudioSpecificConfig for AAC tracks. PixelAspectHorizontal and
+// PixelAspectVertical are the MP4 pasp values; zero means square pixels or no
+// pasp box was present.
 type TrackInfo struct {
-	Index         int
-	Kind          TrackKind
-	Codec         string
-	CodecConfig   []byte
-	NALLengthSize int
-	Width         int
-	Height        int
-	SampleRate    int
-	Channels      int
-	Duration      time.Duration
-	TimeScale     uint32
+	Index                 int
+	Kind                  TrackKind
+	Codec                 string
+	CodecConfig           []byte
+	NALLengthSize         int
+	Width                 int
+	Height                int
+	PixelAspectHorizontal uint32
+	PixelAspectVertical   uint32
+	SampleRate            int
+	Channels              int
+	Duration              time.Duration
+	TimeScale             uint32
 }
 
 // MP4Info contains basic movie and track metadata read from the MP4 box tables.
@@ -344,20 +348,37 @@ func parseSampleDescription(r io.ReaderAt, box mp4Box, track *TrackInfo) error {
 			return fmt.Errorf("invalid video sample entry: %w", err)
 		}
 		for _, child := range children {
-			if child.kind != "avcC" {
-				continue
+			switch child.kind {
+			case "avcC":
+				if len(track.CodecConfig) != 0 {
+					return errors.New("AVC sample entry has multiple avcC boxes")
+				}
+				config, err := readBoxPayload(r, child, 1<<20)
+				if err != nil {
+					return err
+				}
+				lengthSize, err := AVCNALLengthSize(config)
+				if err != nil {
+					return err
+				}
+				track.CodecConfig = config
+				track.NALLengthSize = lengthSize
+			case "pasp":
+				if child.end-child.data != 8 {
+					return errors.New("invalid pixel aspect ratio box")
+				}
+				var data [8]byte
+				if _, err := r.ReadAt(data[:], child.data); err != nil {
+					return err
+				}
+				horizontal := binary.BigEndian.Uint32(data[:4])
+				vertical := binary.BigEndian.Uint32(data[4:])
+				if horizontal == 0 || vertical == 0 {
+					return errors.New("invalid zero pixel aspect ratio")
+				}
+				track.PixelAspectHorizontal = horizontal
+				track.PixelAspectVertical = vertical
 			}
-			config, err := readBoxPayload(r, child, 1<<20)
-			if err != nil {
-				return err
-			}
-			lengthSize, err := AVCNALLengthSize(config)
-			if err != nil {
-				return err
-			}
-			track.CodecConfig = config
-			track.NALLengthSize = lengthSize
-			break
 		}
 		if len(track.CodecConfig) == 0 {
 			return errors.New("AVC sample entry has no avcC configuration")

@@ -1,8 +1,8 @@
-// Package mp4todvd provides the orchestration API for creating a DVD-Video
-// directory from multiple MP4 files.
+// Package mp4todvd provides APIs for preparing DVD-compatible media and
+// orchestrating DVD-Video directory creation from multiple MP4 files.
 //
-// Codec and DVD authoring implementations are supplied through Encoder and
-// Authorer. The package itself does not start external processes.
+// The package itself does not start external processes. It includes a basic
+// in-process Encoder; DVD directory generation still requires an Authorer.
 package mp4todvd
 
 import (
@@ -134,9 +134,8 @@ type Converter struct {
 	authorer Authorer
 }
 
-// New constructs a Converter with in-process encoding and authoring backends.
-// The package intentionally has no default backend: it does not invoke external
-// commands or silently create a non-DVD data disc.
+// New constructs a Converter with the supplied encoding and authoring
+// backends. It does not select defaults or invoke external commands.
 func New(encoder Encoder, authorer Authorer) (*Converter, error) {
 	if encoder == nil {
 		return nil, errors.New("mp4todvd: encoder is required")

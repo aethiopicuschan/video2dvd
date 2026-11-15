@@ -18,7 +18,9 @@
 
 `PrepareMP4VideoForDVD` はH.264 MP4をデコードし、DVDラスタへのフィットとNTSC 29.97 fps／PAL 25 fpsへの間引き・反復を続けて行います。入力の表示アスペクト比は明示します。個別処理には `FitVideoFrame` と `DVDFrameRateConverter` を使えます。`PrepareMP4AudioForDVD` はAAC-LC/AC-3を48 kHz stereo LPCM音声データへ変換します。音声出力はDVD LPCM用のビッグエンディアンで、DVD用PESヘッダーやVOBへの多重化は別途必要です。
 
-DVD 用 MPEG-2 映像エンコード、IFO/VOBオーサリングは未実装です。`Encoder` と `Authorer` の実装もまだ含まれていないため、`Converter` 単体ではDVDを作成できません。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
+`NewInProcessEncoder` は外部コマンドを使わずMP4からMPEG-2映像とLPCM音声を生成します。現段階のMPEG-2エンコーダーはIフレームのみで各8x8ブロックのDC係数しか符号化しないため、細部が大きく失われます。標準ヘッダー検査を通る初期実装であり、一般的な品質の変換にはまだ使えません。
+
+IFO/BUP、DVD NAVパック、PES/VOB多重化を含むオーサリングは未実装です。`Converter` 単体では再生可能なDVDを作成できません。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
 
 ## バックエンドの接続
 
