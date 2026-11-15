@@ -20,7 +20,7 @@
 
 `NewInProcessEncoder` は外部コマンドを使わずMP4からMPEG-2映像とLPCM音声を生成します。現段階のMPEG-2エンコーダーはIフレームのみで各8x8ブロックのDC係数しか符号化しないため、細部が大きく失われます。標準ヘッダー検査を通る初期実装であり、一般的な品質の変換にはまだ使えません。
 
-IFO/BUP、DVD NAVパック、PES/VOB多重化を含むオーサリングは未実装です。`Converter` 単体では再生可能なDVDを作成できません。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
+`MPEGProgramStreamWriter` はPESを2048バイトのMPEG-2プログラムストリームセクターへ書き込む低レベル部品です。IFO/BUP、DVD NAVパック、LPCM用DVDサブストリームヘッダーを含むオーサリングは未実装で、`Converter` 単体では再生可能なDVDを作成できません。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
 
 ## バックエンドの接続
 
