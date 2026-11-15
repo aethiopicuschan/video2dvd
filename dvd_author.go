@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -123,6 +124,9 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 		}
 		base := uint32(nextTitleSetSector)
 		vtsName := fmt.Sprintf("VTS_%02d", i+1)
+		if err := copyFile(menuPath, filepath.Join(outputDir, vtsName+"_0.VOB")); err != nil {
+			return fmt.Errorf("video2dvd: create %s_0.VOB: %w", vtsName, err)
+		}
 		vobPath := filepath.Join(outputDir, vtsName+"_1.VOB")
 		vob, err := os.OpenFile(vobPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err != nil {
@@ -149,7 +153,7 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 			return fmt.Errorf("video2dvd: title %d VOB has an invalid sector count", i+1)
 		}
 		vobSectors := uint32(vobInfo.Size() / DVDVOBSectorSize)
-		ifo, ifoSectors, err := buildDVDVTSIFO(title, profile, records, vobSectors)
+		ifo, ifoSectors, err := buildDVDVTSIFO(title, profile, records, vobSectors, menuSectors, menuRecords)
 		if err != nil {
 			return fmt.Errorf("video2dvd: build title %d IFO: %w", i+1, err)
 		}
@@ -157,7 +161,7 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 			return err
 		}
 		authored[i] = authoredTitle{ifoSectors: ifoSectors, titleSetBase: base}
-		nextTitleSetSector += uint64(ifoSectors)*2 + uint64(vobSectors)
+		nextTitleSetSector += uint64(ifoSectors)*2 + uint64(menuSectors) + uint64(vobSectors)
 	}
 
 	starts := make([]uint32, len(authored))
@@ -194,7 +198,7 @@ func validateAuthoringProfile(profile Profile) error {
 	return nil
 }
 
-func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord, vobSectors uint32) ([]byte, uint32, error) {
+func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord, vobSectors, menuSectors uint32, menuRecords []dvdVOBURecord) ([]byte, uint32, error) {
 	if len(records) == 0 || records[0].StartSector != 0 || records[len(records)-1].EndSector+1 != vobSectors {
 		return nil, 0, errors.New("VOBU records do not cover the title VOB")
 	}
@@ -212,8 +216,12 @@ func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord
 	for i, record := range records {
 		binary.BigEndian.PutUint32(admap[4+i*4:8+i*4], record.StartSector)
 	}
-	ifoSectors := dvdVTSIFOBaseSectors + uint32((len(admap)+DVDVOBSectorSize-1)/DVDVOBSectorSize)
-	lastTitleSetSector := uint64(ifoSectors)*2 + uint64(vobSectors) - 1
+	menuPGCI := buildDVDVMGMenuPGCI(menuSectors, playbackTime, menuRecords)
+	admapSectors := uint32((len(admap) + DVDVOBSectorSize - 1) / DVDVOBSectorSize)
+	menuPGCISectors := uint32((len(menuPGCI) + DVDVOBSectorSize - 1) / DVDVOBSectorSize)
+	menuPGCISector := dvdVTSIFOBaseSectors + admapSectors
+	ifoSectors := menuPGCISector + menuPGCISectors
+	lastTitleSetSector := uint64(ifoSectors)*2 + uint64(menuSectors) + uint64(vobSectors) - 1
 	if lastTitleSetSector > math.MaxUint32 {
 		return nil, 0, errors.New("VTS last-sector address exceeds 32 bits")
 	}
@@ -223,12 +231,14 @@ func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord
 	binary.BigEndian.PutUint32(ifo[0x001C:0x0020], ifoSectors-1)
 	binary.BigEndian.PutUint16(ifo[0x0020:0x0022], 0x0011)
 	binary.BigEndian.PutUint32(ifo[0x0080:0x0084], 0x01ff)
-	binary.BigEndian.PutUint32(ifo[0x00C4:0x00C8], ifoSectors) // VTS_VOBS starts after VTSI.
-	binary.BigEndian.PutUint32(ifo[0x00C8:0x00CC], 1)          // VTS_PTT_SRPT
-	binary.BigEndian.PutUint32(ifo[0x00CC:0x00D0], 2)          // VTS_PGCI
-	binary.BigEndian.PutUint32(ifo[0x00D4:0x00D8], 4)          // VTS_TMAPTI
-	binary.BigEndian.PutUint32(ifo[0x00E0:0x00E4], 3)          // VTS_C_ADT
-	binary.BigEndian.PutUint32(ifo[0x00E4:0x00E8], 5)          // VTS_VOBU_ADMAP
+	binary.BigEndian.PutUint32(ifo[0x00C0:0x00C4], ifoSectors)             // VTSM_VOBS follows VTSI/BUP.
+	binary.BigEndian.PutUint32(ifo[0x00C4:0x00C8], ifoSectors+menuSectors) // VTSTT_VOBS follows VTSM_VOBS.
+	binary.BigEndian.PutUint32(ifo[0x00C8:0x00CC], 1)                      // VTS_PTT_SRPT
+	binary.BigEndian.PutUint32(ifo[0x00CC:0x00D0], 2)                      // VTS_PGCI
+	binary.BigEndian.PutUint32(ifo[0x00D0:0x00D4], menuPGCISector)         // VTSM_PGCI_UT
+	binary.BigEndian.PutUint32(ifo[0x00D4:0x00D8], 4)                      // VTS_TMAPTI
+	binary.BigEndian.PutUint32(ifo[0x00E0:0x00E4], 3)                      // VTS_C_ADT
+	binary.BigEndian.PutUint32(ifo[0x00E4:0x00E8], 5)                      // VTS_VOBU_ADMAP
 	videoAttr := dvdVideoAttribute(title, profile)
 	binary.BigEndian.PutUint16(ifo[dvdIFOAudioOffset:dvdIFOAudioOffset+2], videoAttr)
 	binary.BigEndian.PutUint16(ifo[dvdIFOAudioOffset+2:dvdIFOAudioOffset+4], 1)
@@ -267,7 +277,26 @@ func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord
 	tmap[12] = 1 // one-second time unit; this PGC's map has no indexed points.
 	copy(ifo[4*DVDVOBSectorSize:], tmap)
 	copy(ifo[5*DVDVOBSectorSize:], admap)
+	copy(ifo[int(menuPGCISector)*DVDVOBSectorSize:], menuPGCI)
 	return ifo, ifoSectors, nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
 
 func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobSectors uint32, postCommand [8]byte) []byte {

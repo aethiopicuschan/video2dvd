@@ -45,6 +45,9 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	}
 
 	firstIFO := readAuthorerTestFile(t, videoTS, "VTS_01_0.IFO")
+	if menuVTS := readAuthorerTestFile(t, videoTS, "VTS_01_0.VOB"); !bytes.Equal(menuVTS, menuVOB) {
+		t.Fatal("VTS menu VOB does not mirror the title menu")
+	}
 	firstVOB := readAuthorerTestFile(t, videoTS, "VTS_01_1.VOB")
 	secondIFO := readAuthorerTestFile(t, videoTS, "VTS_02_0.IFO")
 	if !bytes.Equal(firstIFO, readAuthorerTestFile(t, videoTS, "VTS_01_0.BUP")) ||
@@ -54,15 +57,15 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	}
 	firstIFOSectors := uint32(len(firstIFO) / DVDVOBSectorSize)
 	firstVOBSectors := uint32(len(firstVOB) / DVDVOBSectorSize)
-	if secondVTSStart != firstVTSStart+firstIFOSectors*2+firstVOBSectors {
-		t.Fatalf("second VTS sector = %d, want %d", secondVTSStart, firstVTSStart+firstIFOSectors*2+firstVOBSectors)
+	if secondVTSStart != firstVTSStart+firstIFOSectors*2+menuSectors+firstVOBSectors {
+		t.Fatalf("second VTS sector = %d, want %d", secondVTSStart, firstVTSStart+firstIFOSectors*2+menuSectors+firstVOBSectors)
 	}
 
 	if string(firstIFO[:12]) != "DVDVIDEO-VTS" {
 		t.Fatalf("VTSI signature = %q", firstIFO[:12])
 	}
-	if got := binary.BigEndian.Uint32(firstIFO[0x00C4:0x00C8]); got != firstIFOSectors {
-		t.Fatalf("title VOB starts at sector %d, want %d", got, firstIFOSectors)
+	if got := binary.BigEndian.Uint32(firstIFO[0x00C4:0x00C8]); got != firstIFOSectors+menuSectors {
+		t.Fatalf("title VOB starts at sector %d, want %d", got, firstIFOSectors+menuSectors)
 	}
 	for offset, want := range map[int]uint32{0x00C8: 1, 0x00CC: 2, 0x00D4: 4, 0x00E0: 3, 0x00E4: 5} {
 		if got := binary.BigEndian.Uint32(firstIFO[offset : offset+4]); got != want {

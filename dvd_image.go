@@ -194,7 +194,7 @@ func inspectDVDImageSource(videoTS string) ([]dvdImageFile, int, error) {
 	if err := validateDVDDirectory(videoTS, titleCount); err != nil {
 		return nil, 0, err
 	}
-	expected := make([]dvdImageFile, 0, 3+3*titleCount)
+	expected := make([]dvdImageFile, 0, 3+4*titleCount)
 	expected = append(expected,
 		dvdImageFile{name: "VIDEO_TS.IFO", fakeName: "VIDEO_TS.AAA"},
 		dvdImageFile{name: "VIDEO_TS.VOB", fakeName: "VIDEO_TS.MMM"},
@@ -203,7 +203,8 @@ func inspectDVDImageSource(videoTS string) ([]dvdImageFile, int, error) {
 	for i := 1; i <= titleCount; i++ {
 		expected = append(expected,
 			dvdImageFile{name: fmt.Sprintf("VTS_%02d_0.IFO", i), fakeName: fmt.Sprintf("VTS_%02d_0.AAA", i)},
-			dvdImageFile{name: fmt.Sprintf("VTS_%02d_1.VOB", i), fakeName: fmt.Sprintf("VTS_%02d_0.MMM", i)},
+			dvdImageFile{name: fmt.Sprintf("VTS_%02d_0.VOB", i), fakeName: fmt.Sprintf("VTS_%02d_0.MMM", i)},
+			dvdImageFile{name: fmt.Sprintf("VTS_%02d_1.VOB", i), fakeName: fmt.Sprintf("VTS_%02d_1.MMM", i)},
 			dvdImageFile{name: fmt.Sprintf("VTS_%02d_0.BUP", i), fakeName: fmt.Sprintf("VTS_%02d_0.ZZZ", i)},
 		)
 	}
