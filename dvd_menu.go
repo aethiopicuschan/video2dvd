@@ -2,18 +2,22 @@ package video2dvd
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
-const dvdMenuMaxButtons = 18
+const dvdMenuMaxButtons = 36
 
 func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Profile, workDir string) (EncodedTitle, []DVDNAVButton, error) {
-	if len(titles) == 0 || len(titles) > dvdMenuMaxButtons {
-		return EncodedTitle{}, nil, errors.New("video2dvd: automatically generated menu supports 1 to 18 titles")
+	maxButtons := dvdMenuMaxButtons
+	if profile.Aspect == AspectRatio16x9 {
+		maxButtons = 18
+	}
+	if len(titles) == 0 || len(titles) > maxButtons {
+		return EncodedTitle{}, nil, fmt.Errorf("video2dvd: automatically generated menu supports 1 to %d titles", maxButtons)
 	}
 	frame := newDVDMenuFrame(profile, titles)
 	videoPath := filepath.Join(workDir, "menu.m2v")
@@ -41,11 +45,30 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 	}
 	buttons := make([]DVDNAVButton, len(titles))
 	for i := range buttons {
-		top := 92 + i*20
+		column, row := i/18, i%18
+		up, down := i-1, i+1
+		if row == 0 {
+			up = i + 17
+		}
+		if row == 17 || down >= len(buttons) || down/18 != column {
+			down = i - row
+		}
+		leftIndex, rightIndex := i, i
+		if column == 0 && i+18 < len(buttons) {
+			rightIndex = i + 18
+		}
+		if column == 1 {
+			leftIndex = i - 18
+		}
+		left, right := 48, 672
+		if column == 1 {
+			left, right = 368, 704
+		}
+		top := 92 + row*20
 		buttons[i] = DVDNAVButton{
-			XStart: 48, YStart: top, XEnd: 672, YEnd: top + 16,
-			Up: uint8(max(1, i)), Down: uint8(min(len(buttons), i+2)),
-			Left: uint8(i + 1), Right: uint8(i + 1),
+			XStart: left, YStart: top, XEnd: right, YEnd: top + 16,
+			Up: uint8(up + 1), Down: uint8(down + 1),
+			Left: uint8(leftIndex + 1), Right: uint8(rightIndex + 1),
 			Command: dvdJumpTitleCommand(i + 1),
 		}
 	}
@@ -94,7 +117,12 @@ func newDVDMenuFrame(profile Profile, titles []EncodedTitle) DecodedVideoFrame {
 	for i, title := range titles {
 		name := strings.ToUpper(filepath.Base(title.VideoPath))
 		name = strings.TrimSuffix(name, strings.ToUpper(filepath.Ext(name)))
-		drawDVDMenuText(&frame, 56, 94+i*20, padMenuNumber(i+1)+" "+name, 210)
+		column, row := i/18, i%18
+		x := 56
+		if column == 1 {
+			x = 376
+		}
+		drawDVDMenuText(&frame, x, 94+row*20, padMenuNumber(i+1)+" "+name, 210)
 	}
 	return frame
 }
