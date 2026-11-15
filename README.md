@@ -20,7 +20,7 @@
 
 `PrepareMP4VideoForDVD` と `PrepareWebMVideoForDVD` は入力映像をDVDラスタへフィットし、NTSC 29.97 fps／PAL 25 fpsへ変換します。入力の表示アスペクト比は明示します。個別処理には `FitVideoFrame` と `DVDFrameRateConverter` を使えます。`PrepareMP4AudioForDVD` と `PrepareWebMAudioForDVD` は入力音声を48 kHz stereo LPCM音声データへ変換します。`DVDLPCMPacketWriter` はPCMチャンクをDVD LPCMヘッダー付きPESにまとめ、2048バイトのプログラムストリームセクターへ書きます。
 
-`NewInProcessEncoder` は外部コマンドを使わず MP4/WebM からMPEG-2映像とLPCM音声を生成します。映像の上限ビットレートを7 Mbit/sに引き上げ、プログラムストリームの宣言レートも更新しています。`MediaInput` を使うと映像と音声を別ファイルから選び、コンテナ内のトラック番号を指定できます。音声の開始オフセットに応じて無音を挿入し、映像の再生時間に合わせて音声を切り詰めます。現段階のMPEG-2エンコーダーは閉じたGOPにI/Pフレームを出力し、前フレームと完全一致するマクロブロックをPフレームで省略します。変更されたマクロブロックはイントラ符号化するため動き予測は行わず、単純な量子化とあわせて圧縮効率と画質は限定的です。一般的な品質の変換にはまだ使えません。
+`NewInProcessEncoder` は外部コマンドを使わず MP4/WebM からMPEG-2映像とLPCM音声を生成します。映像の上限ビットレートを7 Mbit/sに引き上げ、プログラムストリームの宣言レートも更新しています。`MediaInput` を使うと映像と音声を別ファイルから選び、コンテナ内のトラック番号を指定できます。音声の開始オフセットに応じて無音を挿入し、映像の再生時間に合わせて音声を切り詰めます。MPEG-2エンコーダーは閉じたGOPにI/Pフレームを出力し、Pフレームでは半画素精度の動き予測と量子化DCT残差を使います。各フレームの再構成画像を次の予測参照に使います。現段階では動き探索とレート制御が簡易的で、Bフレームも使わないため、画質と圧縮効率は専用エンコーダーに及びません。
 
 `MuxDVDTitleVOB` は1タイトル分のMPEG-2映像とLPCM音声をPTS順に多重化し、Iフレームから始まるVOBUごとにPCI/DSI入りのNAVパックを置きます。`MPEGProgramStreamWriter` と `DVDLPCMPacketWriter` はその下位部品で、`BuildDVDNAVPack` はNAVパック単体を構築します。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
 
