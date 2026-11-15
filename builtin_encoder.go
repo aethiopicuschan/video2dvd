@@ -11,9 +11,9 @@ import (
 )
 
 // InProcessEncoder is a built-in Encoder that uses only Go code. Its current
-// MPEG-2 video coder is deliberately basic and retains only block DC values;
-// use it for pipeline integration and low-detail material, not quality
-// transcoding. It converts available AAC-LC/AC-3 audio to LPCM and creates
+// MPEG-2 video coder uses I pictures and a simple intra quantizer, with no
+// motion prediction; use it as an experimental backend rather than a quality
+// transcoder. It converts available AAC-LC/AC-3 audio to LPCM and creates
 // silent LPCM when the input has no audio track.
 type InProcessEncoder struct{}
 

@@ -4,23 +4,64 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 )
 
+const mpeg2VideoBitrate = 5_000_000
+
+var mpeg2DCTBasis = buildMPEG2DCTBasis()
+
+var mpeg2DefaultIntraMatrix = [64]int{
+	8, 16, 19, 22, 26, 27, 29, 34,
+	16, 16, 22, 24, 27, 29, 34, 37,
+	19, 22, 26, 27, 29, 34, 34, 38,
+	22, 22, 26, 27, 29, 32, 36, 40,
+	22, 26, 27, 29, 32, 35, 40, 48,
+	26, 27, 29, 32, 35, 40, 48, 58,
+	26, 27, 29, 34, 38, 46, 56, 69,
+	27, 29, 35, 38, 46, 56, 69, 83,
+}
+
+var mpeg2ZigZag = [64]int{
+	0, 1, 8, 16, 9, 2, 3, 10,
+	17, 24, 32, 25, 18, 11, 4, 5,
+	12, 19, 26, 33, 40, 48, 41, 34,
+	27, 20, 13, 6, 7, 14, 21, 28,
+	35, 42, 49, 56, 57, 50, 43, 36,
+	29, 22, 15, 23, 30, 37, 44, 51,
+	58, 59, 52, 45, 38, 31, 39, 46,
+	53, 60, 61, 54, 47, 55, 62, 63,
+}
+
+func buildMPEG2DCTBasis() [8][8]float64 {
+	var basis [8][8]float64
+	for frequency := 0; frequency < 8; frequency++ {
+		normalization := 1.0
+		if frequency == 0 {
+			normalization = 1 / math.Sqrt2
+		}
+		for position := 0; position < 8; position++ {
+			basis[frequency][position] = normalization * math.Cos(float64((2*position+1)*frequency)*math.Pi/16)
+		}
+	}
+	return basis
+}
+
 // MPEG2VideoEncoder writes a DVD-raster MPEG-2 elementary stream from planar
-// YUV 4:2:0 frames. This first in-process encoder emits closed GOPs containing
-// I pictures and codes only each 8x8 block's DC coefficient. The stream is
-// standards-shaped and small, but the omitted AC coefficients make image
-// detail very coarse; this is not yet a quality encoder for general use.
+// YUV 4:2:0 frames. It emits closed GOPs containing I pictures and codes full
+// intra DCT blocks with an escape-based run/level writer. Its simple quantizer
+// and lack of inter-frame prediction limit quality and compression efficiency.
 //
 // The writer does not close dst. Call Close after the final frame to write the
 // MPEG sequence-end code.
 type MPEG2VideoEncoder struct {
-	dst       io.Writer
-	profile   Profile
-	frameRate int
-	frameNo   int64
-	closed    bool
-	writeErr  error
+	dst        io.Writer
+	profile    Profile
+	frameRate  int
+	frameBytes int
+	frameNo    int64
+	closed     bool
+	writeErr   error
 }
 
 // NewMPEG2VideoEncoder prepares an encoder for NTSC or PAL full-raster DVD
@@ -36,8 +77,10 @@ func NewMPEG2VideoEncoder(dst io.Writer, profile Profile) (*MPEG2VideoEncoder, e
 	switch profile.Standard {
 	case VideoStandardNTSC:
 		encoder.frameRate = 30
+		encoder.frameBytes = mpeg2VideoBitrate * 1001 / (8 * 30000)
 	case VideoStandardPAL:
 		encoder.frameRate = 25
+		encoder.frameBytes = mpeg2VideoBitrate / (8 * 25)
 	default:
 		return nil, ErrInvalidProfile
 	}
@@ -62,23 +105,39 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 	if frame.Width != e.profile.FrameWidth || frame.Height != e.profile.FrameHeight {
 		return fmt.Errorf("mp4todvd: MPEG-2 encoder requires %dx%d frames", e.profile.FrameWidth, e.profile.FrameHeight)
 	}
+	mbWidth := frame.Width / 16
+	mbHeight := frame.Height / 16
+	blocks := collectMPEG2IntraBlocks(frame, mbWidth, mbHeight)
+	var encoded []byte
+	for quantizer := 1; quantizer <= 31; quantizer++ {
+		encoded = e.encodeIntraPicture(frame, blocks, mbWidth, mbHeight, quantizer, true)
+		if len(encoded) <= e.frameBytes {
+			break
+		}
+	}
+	if len(encoded) > e.frameBytes {
+		// At the upper quantizer limit, retain the DC image as a bounded fallback.
+		encoded = e.encodeIntraPicture(frame, blocks, mbWidth, mbHeight, 31, false)
+	}
+	if err := writeAll(e.dst, encoded); err != nil {
+		e.writeErr = fmt.Errorf("mp4todvd: write MPEG-2 picture %d: %w", e.frameNo, err)
+		return e.writeErr
+	}
+	e.frameNo++
+	return nil
+}
+
+func (e *MPEG2VideoEncoder) encodeIntraPicture(frame DecodedVideoFrame, blocks []mpeg2IntraBlock, mbWidth, mbHeight, quantizer int, includeAC bool) []byte {
 	var bits mpeg2BitWriter
 	if e.frameNo%15 == 0 {
 		writeMPEG2SequenceHeader(&bits, e.profile)
 		writeMPEG2GOPHeader(&bits, e.frameNo, e.frameRate)
 	}
 	writeMPEG2PictureHeader(&bits, uint16(e.frameNo%15))
-	mbWidth := frame.Width / 16
-	mbHeight := frame.Height / 16
 	for row := 0; row < mbHeight; row++ {
-		writeMPEG2DCOnlySlice(&bits, frame, row, mbWidth)
+		writeMPEG2IntraSlice(&bits, blocks, row, mbWidth, quantizer, includeAC)
 	}
-	if err := writeAll(e.dst, bits.bytes()); err != nil {
-		e.writeErr = fmt.Errorf("mp4todvd: write MPEG-2 picture %d: %w", e.frameNo, err)
-		return e.writeErr
-	}
-	e.frameNo++
-	return nil
+	return bits.bytes()
 }
 
 // Close finishes the elementary stream. It does not close the destination.
@@ -183,37 +242,87 @@ func writeMPEG2PictureHeader(bits *mpeg2BitWriter, temporalReference uint16) {
 	bits.write(0, 1) // composite_display_flag
 }
 
-func writeMPEG2DCOnlySlice(bits *mpeg2BitWriter, frame DecodedVideoFrame, row, mbWidth int) {
+type mpeg2IntraBlock struct {
+	dc     int
+	coeff  [64]float64
+	chroma bool
+}
+
+func collectMPEG2IntraBlocks(frame DecodedVideoFrame, mbWidth, mbHeight int) []mpeg2IntraBlock {
+	blocks := make([]mpeg2IntraBlock, 0, mbWidth*mbHeight*6)
+	for mbRow := 0; mbRow < mbHeight; mbRow++ {
+		for mbColumn := 0; mbColumn < mbWidth; mbColumn++ {
+			baseX, baseY := mbColumn*16, mbRow*16
+			for block := 0; block < 4; block++ {
+				x := baseX + (block%2)*8
+				y := baseY + (block/2)*8
+				blocks = append(blocks, analyzeMPEG2Block(frame.Y, frame.Width, x, y, false))
+			}
+			blocks = append(blocks,
+				analyzeMPEG2Block(frame.U, frame.Width/2, mbColumn*8, mbRow*8, true),
+				analyzeMPEG2Block(frame.V, frame.Width/2, mbColumn*8, mbRow*8, true),
+			)
+		}
+	}
+	return blocks
+}
+
+func analyzeMPEG2Block(plane []byte, stride, x, y int, chroma bool) mpeg2IntraBlock {
+	var block mpeg2IntraBlock
+	block.chroma = chroma
+	var source, temporary [8][8]float64
+	sum := 0
+	for row := 0; row < 8; row++ {
+		for column := 0; column < 8; column++ {
+			value := int(plane[(y+row)*stride+x+column])
+			sum += value
+			source[row][column] = float64(value - 128)
+		}
+	}
+	block.dc = (sum+32)/64 - 128
+	for row := 0; row < 8; row++ {
+		for horizontal := 0; horizontal < 8; horizontal++ {
+			var value float64
+			for column := 0; column < 8; column++ {
+				value += source[row][column] * mpeg2DCTBasis[horizontal][column]
+			}
+			temporary[row][horizontal] = value
+		}
+	}
+	for vertical := 0; vertical < 8; vertical++ {
+		for horizontal := 0; horizontal < 8; horizontal++ {
+			var value float64
+			for row := 0; row < 8; row++ {
+				value += temporary[row][horizontal] * mpeg2DCTBasis[vertical][row]
+			}
+			block.coeff[vertical*8+horizontal] = value * 0.25
+		}
+	}
+	return block
+}
+
+func writeMPEG2IntraSlice(bits *mpeg2BitWriter, blocks []mpeg2IntraBlock, row, mbWidth, quantizer int, includeAC bool) {
 	bits.startCode(byte(row + 1))
-	bits.write(8, 5) // quantizer_scale_code; AC coefficients are omitted.
-	bits.write(0, 1) // extra_bit_slice
+	bits.write(uint64(quantizer), 5) // linear quantizer_scale_code.
+	bits.write(0, 1)                 // extra_bit_slice
 	lastY, lastCb, lastCr := 128, 128, 128
 	for column := 0; column < mbWidth; column++ {
 		bits.write(1, 1) // macroblock_address_increment = 1
 		bits.write(1, 1) // I-picture macroblock_type = intra
-		baseX, baseY := column*16, row*16
+		blockIndex := (row*mbWidth + column) * 6
 		for block := 0; block < 4; block++ {
-			x := baseX + (block%2)*8
-			y := baseY + (block/2)*8
-			lastY = writeMPEG2DCAverage(bits, frame.Y, frame.Width, x, y, lastY, false)
+			lastY = writeMPEG2Block(bits, blocks[blockIndex+block], lastY, quantizer, includeAC)
 		}
-		lastCb = writeMPEG2DCAverage(bits, frame.U, frame.Width/2, column*8, row*8, lastCb, true)
-		lastCr = writeMPEG2DCAverage(bits, frame.V, frame.Width/2, column*8, row*8, lastCr, true)
+		lastCb = writeMPEG2Block(bits, blocks[blockIndex+4], lastCb, quantizer, includeAC)
+		lastCr = writeMPEG2Block(bits, blocks[blockIndex+5], lastCr, quantizer, includeAC)
 	}
 	bits.align()
 }
 
-func writeMPEG2DCAverage(bits *mpeg2BitWriter, plane []byte, stride, x, y, predictor int, chroma bool) int {
-	sum := 0
-	for row := 0; row < 8; row++ {
-		for column := 0; column < 8; column++ {
-			sum += int(plane[(y+row)*stride+x+column])
-		}
-	}
-	level := (sum+32)/64 - 128
-	difference := level - predictor
+func writeMPEG2Block(bits *mpeg2BitWriter, block mpeg2IntraBlock, predictor, quantizer int, includeAC bool) int {
+	difference := block.dc - predictor
 	size := mpeg2MagnitudeBits(difference)
-	writeMPEG2DCSize(bits, size, chroma)
+	writeMPEG2DCSize(bits, size, block.chroma)
 	if size != 0 {
 		value := difference
 		if difference < 0 {
@@ -221,8 +330,38 @@ func writeMPEG2DCAverage(bits *mpeg2BitWriter, plane []byte, stride, x, y, predi
 		}
 		bits.write(uint64(value), size)
 	}
-	bits.write(0b10, 2) // end_of_block; all AC coefficients are zero.
-	return level
+	if includeAC {
+		writeMPEG2ACCoefficients(bits, block.coeff, quantizer)
+	} else {
+		bits.write(0b10, 2) // end_of_block
+	}
+	return block.dc
+}
+
+func writeMPEG2ACCoefficients(bits *mpeg2BitWriter, coefficients [64]float64, quantizer int) {
+	lastPosition := 0
+	qScale := float64(quantizer * 2)
+	for scanPosition := 1; scanPosition < 64; scanPosition++ {
+		coefficientIndex := mpeg2ZigZag[scanPosition]
+		value := coefficients[coefficientIndex]
+		weight := float64(mpeg2DefaultIntraMatrix[coefficientIndex])
+		level := int(math.Floor(math.Abs(value)*16/(qScale*weight) + 0.5))
+		if level == 0 {
+			continue
+		}
+		if level > 127 {
+			level = 127
+		}
+		bits.write(1, 6) // DCT escape code 000001.
+		bits.write(uint64(scanPosition-lastPosition-1), 6)
+		if value < 0 {
+			bits.write(uint64(byte(-level)), 8)
+		} else {
+			bits.write(uint64(level), 8)
+		}
+		lastPosition = scanPosition
+	}
+	bits.write(0b10, 2) // end_of_block
 }
 
 func mpeg2MagnitudeBits(value int) int {

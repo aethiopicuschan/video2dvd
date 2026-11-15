@@ -78,3 +78,49 @@ func TestMPEG2VideoEncoderRejectsEmptyStream(t *testing.T) {
 		t.Fatal("expected an error for an empty MPEG-2 stream")
 	}
 }
+
+func TestMPEG2VideoEncoderCodesACAndStaysWithinFrameBudget(t *testing.T) {
+	profile, err := (Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9}).profile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := DecodedVideoFrame{Width: 720, Height: 480, Duration: time.Second * 1001 / 30000}
+	frame.Y = make([]byte, frame.Width*frame.Height)
+	frame.U = make([]byte, frame.Width*frame.Height/4)
+	frame.V = make([]byte, frame.Width*frame.Height/4)
+	for y := 0; y < frame.Height; y++ {
+		for x := 0; x < frame.Width; x++ {
+			frame.Y[y*frame.Width+x] = byte(16 + (x*13+y*7)%220)
+		}
+	}
+	for i := range frame.U {
+		frame.U[i] = byte(16 + (i*3)%224)
+		frame.V[i] = byte(16 + (i*5)%224)
+	}
+
+	blocks := collectMPEG2IntraBlocks(frame, frame.Width/16, frame.Height/16)
+	encoder, err := NewMPEG2VideoEncoder(&bytes.Buffer{}, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withAC := encoder.encodeIntraPicture(frame, blocks, frame.Width/16, frame.Height/16, 31, true)
+	withoutAC := encoder.encodeIntraPicture(frame, blocks, frame.Width/16, frame.Height/16, 31, false)
+	if len(withAC) <= len(withoutAC) {
+		t.Fatalf("AC-coded picture size %d did not exceed DC-only size %d", len(withAC), len(withoutAC))
+	}
+
+	var output bytes.Buffer
+	encoder, err = NewMPEG2VideoEncoder(&output, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.WriteFrame(frame); err != nil {
+		t.Fatal(err)
+	}
+	if err := encoder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if output.Len() > encoder.frameBytes+4 {
+		t.Fatalf("output size %d exceeds one-frame budget %d plus sequence end", output.Len(), encoder.frameBytes)
+	}
+}
