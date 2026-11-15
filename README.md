@@ -20,7 +20,7 @@
 
 `PrepareMP4VideoForDVD` と `PrepareWebMVideoForDVD` は入力映像をDVDラスタへフィットし、NTSC 29.97 fps／PAL 25 fpsへ変換します。入力の表示アスペクト比は明示します。個別処理には `FitVideoFrame` と `DVDFrameRateConverter` を使えます。`PrepareMP4AudioForDVD` と `PrepareWebMAudioForDVD` は入力音声を48 kHz stereo LPCM音声データへ変換します。`DVDLPCMPacketWriter` はPCMチャンクをDVD LPCMヘッダー付きPESにまとめ、2048バイトのプログラムストリームセクターへ書きます。
 
-`NewInProcessEncoder` は外部コマンドを使わず MP4/WebM からMPEG-2映像とLPCM音声を生成します。現段階のMPEG-2エンコーダーは閉じたGOPにI/Pフレームを出力し、前フレームと完全一致するマクロブロックをPフレームで省略します。変更されたマクロブロックはイントラ符号化するため動き予測は行わず、単純な量子化とあわせて圧縮効率と画質は限定的です。一般的な品質の変換にはまだ使えません。
+`NewInProcessEncoder` は外部コマンドを使わず MP4/WebM からMPEG-2映像とLPCM音声を生成します。映像の上限ビットレートを7 Mbit/sに引き上げ、プログラムストリームの宣言レートも更新しています。`MediaInput` を使うと映像と音声を別ファイルから選び、コンテナ内のトラック番号を指定できます。音声の開始オフセットに応じて無音を挿入し、映像の再生時間に合わせて音声を切り詰めます。現段階のMPEG-2エンコーダーは閉じたGOPにI/Pフレームを出力し、前フレームと完全一致するマクロブロックをPフレームで省略します。変更されたマクロブロックはイントラ符号化するため動き予測は行わず、単純な量子化とあわせて圧縮効率と画質は限定的です。一般的な品質の変換にはまだ使えません。
 
 `MuxDVDTitleVOB` は1タイトル分のMPEG-2映像とLPCM音声をPTS順に多重化し、Iフレームから始まるVOBUごとにPCI/DSI入りのNAVパックを置きます。`MPEGProgramStreamWriter` と `DVDLPCMPacketWriter` はその下位部品で、`BuildDVDNAVPack` はNAVパック単体を構築します。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
 
@@ -56,5 +56,21 @@ err = converter.ConvertISO(ctx,
 	mp4todvd.Options{Standard: mp4todvd.VideoStandardNTSC},
 )
 ```
+
+YouTube ダウンローダーが映像と音声を別ファイルに保存した場合は `ConvertSources` を使います。トラック番号は `ProbeMedia` が返す `TrackInfo.Index` と同じゼロ始まりです。`AudioOffset` が正なら音声の前に無音を挿入し、負なら音声の先頭を切り詰めます。
+
+```go
+err = converter.ConvertSources(ctx,
+	[]mp4todvd.MediaInput{{
+		VideoPath:   "video-only.webm",
+		AudioPath:   "audio-only.webm",
+		AudioOffset: 250 * time.Millisecond,
+	}},
+	"./disc",
+	mp4todvd.Options{Standard: mp4todvd.VideoStandardNTSC},
+)
+```
+
+同じファイル内の映像・音声トラックを選ぶ場合も `MediaInput` の `VideoTrackIndex` と `AudioTrackIndex` を設定できます。未指定時は、デコーダーが対応する最初のトラックを選びます。
 
 出力先は既存でないパスを指定します。`Convert` の成功時は `disc/VIDEO_TS` 以下に DVD-Video ファイルが作成されます。`ConvertISO` はISOイメージファイルを作ります。すでに作成したディレクトリは `WriteDVDISO(ctx, "./disc/VIDEO_TS", "./disc.iso")` でイメージ化できます。`DiscCapacityBytes` を省略するとDVD-5の4.7 GBを上限にし、ISO/UDFの管理領域も含めて判定します。エンコーダーの出力は MPEG-2 映像と AC-3、LPCM、または MPEG-1 Layer II 音声で、解像度とフレームレートは選択した DVD 規格に適合する必要があります。

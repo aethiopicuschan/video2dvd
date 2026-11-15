@@ -23,10 +23,10 @@ func TestTrackDisplayAspectIncludesPixelAspect(t *testing.T) {
 }
 
 func TestCheckEstimatedTitleSize(t *testing.T) {
-	if err := checkEstimatedTitleSize(time.Second, 817_000); err != nil {
+	if err := checkEstimatedTitleSize(time.Second, 1_067_000); err != nil {
 		t.Fatalf("one-second estimate should fit exactly: %v", err)
 	}
-	if err := checkEstimatedTitleSize(time.Second, 816_999); !errors.Is(err, ErrDiscCapacity) {
+	if err := checkEstimatedTitleSize(time.Second, 1_066_999); !errors.Is(err, ErrDiscCapacity) {
 		t.Fatalf("one-byte undersized capacity should fail with ErrDiscCapacity, got %v", err)
 	}
 }

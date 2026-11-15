@@ -11,7 +11,7 @@ import (
 
 const (
 	DVDVOBSectorSize        = 2048
-	defaultProgramMuxRate   = 1_000_000 // bytes per second
+	defaultProgramMuxRate   = 1_150_000 // bytes per second (9.2 Mbit/s)
 	maxProgramStreamMuxRate = (1<<22 - 1) * 50
 	maxMPEGTimestamp        = (1 << 33) - 1
 )
@@ -31,7 +31,7 @@ type MPEGProgramStreamWriter struct {
 	closedErr error
 }
 
-// NewMPEGProgramStreamWriter creates a sector writer with a 1 MB/s declared
+// NewMPEGProgramStreamWriter creates a sector writer with a 1.15 MB/s declared
 // program mux rate. PES packets must be submitted in nondecreasing PTS order.
 func NewMPEGProgramStreamWriter(dst io.Writer) (*MPEGProgramStreamWriter, error) {
 	if dst == nil {

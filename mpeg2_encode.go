@@ -8,7 +8,7 @@ import (
 	"math"
 )
 
-const mpeg2VideoBitrate = 5_000_000
+const mpeg2VideoBitrate = 7_000_000
 
 var mpeg2DCTBasis = buildMPEG2DCTBasis()
 
@@ -201,12 +201,12 @@ func writeMPEG2SequenceHeader(bits *mpeg2BitWriter, profile Profile) {
 		frameRateCode = 3 // 25/1
 	}
 	bits.write(frameRateCode, 4)
-	bits.write(12500, 18) // 5 Mbit/s in units of 400 bit/s.
-	bits.write(1, 1)      // marker_bit
-	bits.write(112, 10)   // 224 KiB video buffering verifier.
-	bits.write(0, 1)      // constrained_parameters_flag
-	bits.write(0, 1)      // load_intra_quantiser_matrix
-	bits.write(0, 1)      // load_non_intra_quantiser_matrix
+	bits.write(mpeg2VideoBitrate/400, 18) // Maximum video rate in units of 400 bit/s.
+	bits.write(1, 1)                      // marker_bit
+	bits.write(112, 10)                   // 224 KiB video buffering verifier.
+	bits.write(0, 1)                      // constrained_parameters_flag
+	bits.write(0, 1)                      // load_intra_quantiser_matrix
+	bits.write(0, 1)                      // load_non_intra_quantiser_matrix
 
 	bits.startCode(0xb5)
 	bits.write(1, 4)    // sequence_extension_identifier
