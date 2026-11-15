@@ -261,6 +261,57 @@ func (c *Converter) Convert(ctx context.Context, inputs []string, outputDir stri
 	return nil
 }
 
+// ConvertISO converts inputs into a DVD-Video UDF bridge ISO image. The image
+// contains both ISO 9660 and UDF 1.02 directory views over the same VIDEO_TS
+// file extents and is published only after authoring and image creation succeed.
+func (c *Converter) ConvertISO(ctx context.Context, inputs []string, outputISO string, options Options) error {
+	if ctx == nil {
+		return errors.New("mp4todvd: context must not be nil")
+	}
+	profile, err := options.profile()
+	if err != nil {
+		return err
+	}
+	outputISO, err = filepath.Abs(outputISO)
+	if err != nil {
+		return fmt.Errorf("mp4todvd: resolve image path: %w", err)
+	}
+	if _, err := os.Lstat(outputISO); err == nil {
+		return fmt.Errorf("%w: %s", ErrOutputExists, outputISO)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("mp4todvd: inspect image path: %w", err)
+	}
+	parent := filepath.Dir(outputISO)
+	parentInfo, err := os.Stat(parent)
+	if err != nil {
+		return fmt.Errorf("mp4todvd: inspect image parent: %w", err)
+	}
+	if !parentInfo.IsDir() {
+		return fmt.Errorf("mp4todvd: image parent %q is not a directory", parent)
+	}
+	stageRoot, err := os.MkdirTemp(parent, ".mp4todvd-iso-")
+	if err != nil {
+		return fmt.Errorf("mp4todvd: create conversion staging directory: %w", err)
+	}
+	defer os.RemoveAll(stageRoot)
+
+	discDir := filepath.Join(stageRoot, "disc")
+	if err := c.Convert(ctx, inputs, discDir, options); err != nil {
+		return err
+	}
+	stagedISO := filepath.Join(stageRoot, "disc.iso")
+	if err := WriteDVDISOWithOptions(ctx, filepath.Join(discDir, "VIDEO_TS"), stagedISO, DVDImageOptions{DiscCapacityBytes: profile.DiscCapacityBytes}); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Rename(stagedISO, outputISO); err != nil {
+		return fmt.Errorf("mp4todvd: publish DVD image: %w", err)
+	}
+	return nil
+}
+
 func validateInputs(inputs []string) ([]string, error) {
 	paths := make([]string, 0, len(inputs))
 	seen := make(map[string]struct{}, len(inputs))

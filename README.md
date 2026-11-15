@@ -22,7 +22,7 @@
 
 `MuxDVDTitleVOB` は1タイトル分のMPEG-2映像とLPCM音声をPTS順に多重化し、Iフレームから始まるVOBUごとにPCI/DSI入りのNAVパックを置きます。`MPEGProgramStreamWriter` と `DVDLPCMPacketWriter` はその下位部品で、`BuildDVDNAVPack` はNAVパック単体を構築します。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
 
-`NewInProcessAuthorer` は最大99個の入力を入力順に別々のVTS/タイトルとしてオーサリングし、VMG/VTSのIFO・BUP、PTT/PGC/セル/VOBUテーブルと各タイトルのVOBを作成します。現在はMPEG-2映像とLPCM音声に対応し、タイトルメニューや字幕は作成しません。出力は `VIDEO_TS` ディレクトリで、ISO/UDFイメージ作成や書き込みは対象外です。ディスク起動時の自動再生、複数タイトルの自動連続再生、メニュー操作は未実装です。
+`NewInProcessAuthorer` は最大99個の入力を入力順に別々のVTS/タイトルとしてオーサリングし、VMG/VTSのIFO・BUP、PTT/PGC/セル/VOBUテーブルと各タイトルのVOBを作成します。現在はMPEG-2映像とLPCM音声に対応し、タイトルメニューや字幕は作成しません。`WriteDVDISO` は現在のメニューなし `VIDEO_TS` をISO 9660とUDF 1.02の両方から読めるDVD-Videoイメージにまとめます。UDFの実ファイル配置に基づいてIFO内のセクタ参照を確定し、ISOメタデータを含めた容量も確認します。UDFの記述には純Goの [go-sdk-winmediafoundry UDF package](https://pkg.go.dev/github.com/deploymenttheory/go-sdk-winmediafoundry/pkg/udf) を使い、外部プロセスは起動しません。ディスクへの書き込み、ディスク起動時の自動再生、複数タイトルの自動連続再生、メニュー操作は未実装です。
 
 ## バックエンドの接続
 
@@ -45,4 +45,14 @@ err = converter.Convert(ctx,
 )
 ```
 
-出力先は既存でないパスを指定します。成功時は `disc/VIDEO_TS` 以下に DVD-Video ファイルが作成されます。`DiscCapacityBytes` を省略すると DVD-5 の4.7 GBを上限にします。エンコーダーの出力は MPEG-2 映像と AC-3、LPCM、または MPEG-1 Layer II 音声で、解像度とフレームレートは選択した DVD 規格に適合する必要があります。
+ISOイメージまで作成する場合は `ConvertISO` を使います。
+
+```go
+err = converter.ConvertISO(ctx,
+	[]string{"part-1.mp4", "part-2.mp4"},
+	"./disc.iso",
+	mp4todvd.Options{Standard: mp4todvd.VideoStandardNTSC},
+)
+```
+
+出力先は既存でないパスを指定します。`Convert` の成功時は `disc/VIDEO_TS` 以下に DVD-Video ファイルが作成されます。`ConvertISO` はISOイメージファイルを作ります。すでに作成したディレクトリは `WriteDVDISO(ctx, "./disc/VIDEO_TS", "./disc.iso")` でイメージ化できます。`DiscCapacityBytes` を省略するとDVD-5の4.7 GBを上限にし、ISO/UDFの管理領域も含めて判定します。エンコーダーの出力は MPEG-2 映像と AC-3、LPCM、または MPEG-1 Layer II 音声で、解像度とフレームレートは選択した DVD 規格に適合する必要があります。
