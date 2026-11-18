@@ -51,6 +51,17 @@ func NewDVDFrameRateConverter(profile Profile, handler func(DecodedVideoFrame) e
 // frame establishes that no earlier source frame can be selected for that
 // output timestamp.
 func (c *DVDFrameRateConverter) Push(frame DecodedVideoFrame) error {
+	return c.push(frame, true)
+}
+
+// pushOwned accepts a frame whose planes are newly allocated for this call.
+// The streaming preparation paths use it to avoid copying the fitted frame
+// before the next output timestamp is ready.
+func (c *DVDFrameRateConverter) pushOwned(frame DecodedVideoFrame) error {
+	return c.push(frame, false)
+}
+
+func (c *DVDFrameRateConverter) push(frame DecodedVideoFrame, cloneFrame bool) error {
 	if c == nil || c.handler == nil {
 		return errors.New("video2dvd: frame-rate converter is not configured")
 	}
@@ -85,8 +96,12 @@ func (c *DVDFrameRateConverter) Push(frame DecodedVideoFrame) error {
 		c.width, c.height = frame.Width, frame.Height
 		c.haveInput = true
 	}
-	owned := cloneDecodedVideoFrame(frame)
-	c.pending = &owned
+	if cloneFrame {
+		owned := cloneDecodedVideoFrame(frame)
+		c.pending = &owned
+	} else {
+		c.pending = &frame
+	}
 	c.lastInputPTS = frame.PTS
 	return nil
 }

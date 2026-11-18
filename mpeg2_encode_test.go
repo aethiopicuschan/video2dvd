@@ -158,6 +158,12 @@ func TestMPEG2VideoEncoderCodesACAndStaysWithinFrameBudget(t *testing.T) {
 	}
 	withAC := ExportMPEG2IntraPicture(encoder, frame, blocks, frame.Width/16, frame.Height/16, 31, true)
 	withoutAC := ExportMPEG2IntraPicture(encoder, frame, blocks, frame.Width/16, frame.Height/16, 31, false)
+	if got := ExportMPEG2IntraPictureSize(encoder, frame, blocks, frame.Width/16, frame.Height/16, 31, true); got != len(withAC) {
+		t.Fatalf("counted AC picture size = %d, encoded size = %d", got, len(withAC))
+	}
+	if got := ExportMPEG2IntraPictureSize(encoder, frame, blocks, frame.Width/16, frame.Height/16, 31, false); got != len(withoutAC) {
+		t.Fatalf("counted DC-only picture size = %d, encoded size = %d", got, len(withoutAC))
+	}
 	if len(withAC) <= len(withoutAC) {
 		t.Fatalf("AC-coded picture size %d did not exceed DC-only size %d", len(withAC), len(withoutAC))
 	}
@@ -258,6 +264,56 @@ func TestMPEG2PredictiveProcessingIsDeterministicAcrossWorkerCounts(t *testing.T
 	}
 	if !reflect.DeepEqual(parallelReconstruction, serialReconstruction) {
 		t.Fatal("parallel reconstruction differs from serial reconstruction")
+	}
+}
+
+func TestMPEG2ParallelPictureRowsMatchCountedSizesAndSerialOutput(t *testing.T) {
+	profile, err := ExportProfile(Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoder, err := NewMPEG2VideoEncoder(&bytes.Buffer{}, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := DecodedVideoFrame{Width: 32, Height: 32}
+	frame.Y = make([]byte, frame.Width*frame.Height)
+	frame.U = make([]byte, frame.Width*frame.Height/4)
+	frame.V = make([]byte, frame.Width*frame.Height/4)
+	reference := ExportCloneDecodedVideoFrame(frame)
+	for y := range frame.Height {
+		for x := range frame.Width {
+			frame.Y[y*frame.Width+x] = byte((x*13 + y*7) % 220)
+			reference.Y[y*frame.Width+x] = byte((x*9 + y*5) % 220)
+		}
+	}
+	for i := range frame.U {
+		frame.U[i], frame.V[i] = byte((i*3)%224), byte((i*5)%224)
+		reference.U[i], reference.V[i] = byte((i*7)%224), byte((i*11)%224)
+	}
+	const mbWidth, mbHeight = 2, 2
+	intraBlocks := ExportCollectMPEG2IntraBlocks(frame, mbWidth, mbHeight)
+	predictive := ExportAnalyzeMPEG2PredictiveMacroblocks(frame, reference, mbWidth, mbHeight)
+
+	previous := runtime.GOMAXPROCS(1)
+	serialIntra := ExportMPEG2IntraPicture(encoder, frame, intraBlocks, mbWidth, mbHeight, 8, true)
+	serialPredictive := ExportMPEG2PredictivePicture(encoder, predictive, mbWidth, mbHeight, 8, true)
+	runtime.GOMAXPROCS(max(2, previous))
+	defer runtime.GOMAXPROCS(previous)
+	parallelIntra := ExportMPEG2IntraPicture(encoder, frame, intraBlocks, mbWidth, mbHeight, 8, true)
+	parallelPredictive := ExportMPEG2PredictivePicture(encoder, predictive, mbWidth, mbHeight, 8, true)
+
+	if !bytes.Equal(parallelIntra, serialIntra) {
+		t.Fatal("parallel intra slice output differs from serial output")
+	}
+	if !bytes.Equal(parallelPredictive, serialPredictive) {
+		t.Fatal("parallel predictive slice output differs from serial output")
+	}
+	if got := ExportMPEG2IntraPictureSize(encoder, frame, intraBlocks, mbWidth, mbHeight, 8, true); got != len(serialIntra) {
+		t.Fatalf("counted intra picture size = %d, encoded size = %d", got, len(serialIntra))
+	}
+	if got := ExportMPEG2PredictivePictureSize(encoder, predictive, mbWidth, mbHeight, 8, true); got != len(serialPredictive) {
+		t.Fatalf("counted predictive picture size = %d, encoded size = %d", got, len(serialPredictive))
 	}
 }
 

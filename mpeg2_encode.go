@@ -134,28 +134,29 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 		predictiveMacroblocks = analyzeMPEG2PredictiveMacroblocks(frame, *e.reference, mbWidth, mbHeight)
 	}
 	var encoded []byte
-	selectedQuantizer := 1
+	selectedQuantizer := 0
 	includeAC := true
 	for quantizer := 1; quantizer <= 31; quantizer++ {
+		var size int
 		if isIntra {
-			encoded = e.encodeIntraPicture(frame, intraBlocks, mbWidth, mbHeight, quantizer, true)
+			size = e.measureIntraPicture(frame, intraBlocks, mbWidth, mbHeight, quantizer, true)
 		} else {
-			encoded = e.encodePredictivePicture(predictiveMacroblocks, mbWidth, mbHeight, quantizer, true)
+			size = e.measurePredictivePicture(predictiveMacroblocks, mbWidth, mbHeight, quantizer, true)
 		}
-		if len(encoded) <= e.frameBytes {
+		if size <= e.frameBytes {
 			selectedQuantizer = quantizer
 			break
 		}
 	}
-	if len(encoded) > e.frameBytes {
+	if selectedQuantizer == 0 {
 		// At the upper quantizer limit, drop AC coefficients as a lower-rate fallback.
 		selectedQuantizer = 31
 		includeAC = false
-		if isIntra {
-			encoded = e.encodeIntraPicture(frame, intraBlocks, mbWidth, mbHeight, selectedQuantizer, false)
-		} else {
-			encoded = e.encodePredictivePicture(predictiveMacroblocks, mbWidth, mbHeight, selectedQuantizer, false)
-		}
+	}
+	if isIntra {
+		encoded = e.encodeIntraPicture(frame, intraBlocks, mbWidth, mbHeight, selectedQuantizer, includeAC)
+	} else {
+		encoded = e.encodePredictivePicture(predictiveMacroblocks, mbWidth, mbHeight, selectedQuantizer, includeAC)
 	}
 	if err := writeAll(e.dst, encoded); err != nil {
 		e.writeErr = fmt.Errorf("video2dvd: write MPEG-2 picture %d: %w", e.frameNo, err)
@@ -174,24 +175,91 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 
 func (e *MPEG2VideoEncoder) encodeIntraPicture(frame DecodedVideoFrame, blocks []mpeg2IntraBlock, mbWidth, mbHeight, quantizer int, includeAC bool) []byte {
 	var bits mpeg2BitWriter
+	e.writeIntraPictureHeader(&bits)
+	encoded, _ := encodeMPEG2PictureRows(&bits, mbHeight, func(rowBits *mpeg2BitWriter, row int) {
+		writeMPEG2IntraSlice(rowBits, blocks, row, mbWidth, quantizer, includeAC)
+	})
+	return encoded
+}
+
+func (e *MPEG2VideoEncoder) measureIntraPicture(frame DecodedVideoFrame, blocks []mpeg2IntraBlock, mbWidth, mbHeight, quantizer int, includeAC bool) int {
+	bits := mpeg2BitWriter{countOnly: true}
+	e.writeIntraPictureHeader(&bits)
+	_, size := encodeMPEG2PictureRows(&bits, mbHeight, func(rowBits *mpeg2BitWriter, row int) {
+		writeMPEG2IntraSlice(rowBits, blocks, row, mbWidth, quantizer, includeAC)
+	})
+	return size
+}
+
+func (e *MPEG2VideoEncoder) writeIntraPictureHeader(bits *mpeg2BitWriter) {
 	if e.frameNo%15 == 0 {
-		writeMPEG2SequenceHeader(&bits, e.profile)
-		writeMPEG2GOPHeader(&bits, e.frameNo, e.frameRate)
+		writeMPEG2SequenceHeader(bits, e.profile)
+		writeMPEG2GOPHeader(bits, e.frameNo, e.frameRate)
 	}
-	writeMPEG2PictureHeader(&bits, uint16(e.frameNo%15), 1)
-	for row := range mbHeight {
-		writeMPEG2IntraSlice(&bits, blocks, row, mbWidth, quantizer, includeAC)
-	}
-	return bits.bytes()
+	writeMPEG2PictureHeader(bits, uint16(e.frameNo%15), 1)
 }
 
 func (e *MPEG2VideoEncoder) encodePredictivePicture(macroblocks []mpeg2PredictiveMacroblock, mbWidth, mbHeight, quantizer int, includeAC bool) []byte {
 	var bits mpeg2BitWriter
-	writeMPEG2PictureHeader(&bits, uint16(e.frameNo%15), 2)
-	for row := range mbHeight {
-		writeMPEG2PredictiveSlice(&bits, macroblocks, row, mbWidth, quantizer, includeAC)
+	e.writePredictivePictureHeader(&bits)
+	encoded, _ := encodeMPEG2PictureRows(&bits, mbHeight, func(rowBits *mpeg2BitWriter, row int) {
+		writeMPEG2PredictiveSlice(rowBits, macroblocks, row, mbWidth, quantizer, includeAC)
+	})
+	return encoded
+}
+
+func (e *MPEG2VideoEncoder) measurePredictivePicture(macroblocks []mpeg2PredictiveMacroblock, mbWidth, mbHeight, quantizer int, includeAC bool) int {
+	bits := mpeg2BitWriter{countOnly: true}
+	e.writePredictivePictureHeader(&bits)
+	_, size := encodeMPEG2PictureRows(&bits, mbHeight, func(rowBits *mpeg2BitWriter, row int) {
+		writeMPEG2PredictiveSlice(rowBits, macroblocks, row, mbWidth, quantizer, includeAC)
+	})
+	return size
+}
+
+func (e *MPEG2VideoEncoder) writePredictivePictureHeader(bits *mpeg2BitWriter) {
+	writeMPEG2PictureHeader(bits, uint16(e.frameNo%15), 2)
+}
+
+func encodeMPEG2PictureRows(header *mpeg2BitWriter, rowCount int, writeRow func(*mpeg2BitWriter, int)) ([]byte, int) {
+	var prefix []byte
+	var prefixSize int
+	if header.countOnly {
+		header.align()
+		prefixSize = header.sizeBytes()
+	} else {
+		prefix = header.bytes()
+		prefixSize = len(prefix)
 	}
-	return bits.bytes()
+
+	rowData := make([][]byte, rowCount)
+	rowSizes := make([]int, rowCount)
+	parallelMPEG2Rows(rowCount, func(row int) {
+		rowBits := mpeg2BitWriter{countOnly: header.countOnly}
+		writeRow(&rowBits, row)
+		if header.countOnly {
+			rowBits.align()
+			rowSizes[row] = rowBits.sizeBytes()
+			return
+		}
+		rowData[row] = rowBits.bytes()
+		rowSizes[row] = len(rowData[row])
+	})
+
+	totalSize := prefixSize
+	for _, rowSize := range rowSizes {
+		totalSize += rowSize
+	}
+	if header.countOnly {
+		return nil, totalSize
+	}
+
+	encoded := make([]byte, 0, totalSize)
+	encoded = append(encoded, prefix...)
+	for _, row := range rowData {
+		encoded = append(encoded, row...)
+	}
+	return encoded, totalSize
 }
 
 // Close finishes the elementary stream. It does not close the destination.
@@ -682,13 +750,13 @@ func reconstructMPEG2PredictiveFrame(frame, reference DecodedVideoFrame, macrobl
 	return reconstructed
 }
 
-func reconstructMPEG2NonIntraBlock(levels [64]int, quantizer int) [64]int {
+func reconstructMPEG2NonIntraBlock(levels [64]int16, quantizer int) [64]int {
 	var coefficients [64]int
 	for index, level := range levels {
 		if level == 0 {
 			continue
 		}
-		coefficients[index] = clampMPEG2Coefficient(inverseMPEG2NonIntraCoefficient(level, quantizer))
+		coefficients[index] = clampMPEG2Coefficient(inverseMPEG2NonIntraCoefficient(int(level), quantizer))
 	}
 	applyMPEG2MismatchControl(&coefficients)
 	return inverseMPEG2DCT(coefficients)
@@ -875,8 +943,8 @@ func writeMPEG2PredictiveSlice(bits *mpeg2BitWriter, macroblocks []mpeg2Predicti
 	bits.align()
 }
 
-func quantizeMPEG2ResidualMacroblock(macroblock mpeg2PredictiveMacroblock, quantizer int, includeAC bool) ([6][64]int, uint8) {
-	var levels [6][64]int
+func quantizeMPEG2ResidualMacroblock(macroblock mpeg2PredictiveMacroblock, quantizer int, includeAC bool) ([6][64]int16, uint8) {
+	var levels [6][64]int16
 	var pattern uint8
 	coefficientLimit := 64
 	if !includeAC {
@@ -887,7 +955,7 @@ func quantizeMPEG2ResidualMacroblock(macroblock mpeg2PredictiveMacroblock, quant
 			coefficientIndex := mpeg2ZigZag[scanPosition]
 			value := block.coeff[coefficientIndex]
 			magnitude := quantizeMPEG2NonIntraCoefficient(value, quantizer)
-			levels[blockIndex][coefficientIndex] = magnitude
+			levels[blockIndex][coefficientIndex] = int16(magnitude)
 			if magnitude != 0 {
 				pattern |= 1 << (5 - blockIndex)
 			}
@@ -909,10 +977,10 @@ func writeMPEG2CodedBlockPattern(bits *mpeg2BitWriter, pattern uint8) {
 	bits.write(uint64(code.bits), int(code.length))
 }
 
-func writeMPEG2NonIntraBlock(bits *mpeg2BitWriter, levels [64]int) {
+func writeMPEG2NonIntraBlock(bits *mpeg2BitWriter, levels [64]int16) {
 	lastPosition := -1
 	for scanPosition := range 64 {
-		level := levels[mpeg2ZigZag[scanPosition]]
+		level := int(levels[mpeg2ZigZag[scanPosition]])
 		if level == 0 {
 			continue
 		}
@@ -1089,12 +1157,23 @@ func writeMPEG2DCSize(bits *mpeg2BitWriter, size int, chroma bool) {
 }
 
 type mpeg2BitWriter struct {
-	data    []byte
-	current byte
-	used    uint8
+	data      []byte
+	current   byte
+	used      uint8
+	countOnly bool
+	counted   int
 }
 
 func (w *mpeg2BitWriter) write(value uint64, width int) {
+	if w.countOnly {
+		if width <= 0 {
+			return
+		}
+		buffered := int(w.used) + width
+		w.counted += buffered / 8
+		w.used = uint8(buffered % 8)
+		return
+	}
 	for width > 0 {
 		available := 8 - int(w.used)
 		take := min(width, available)
@@ -1112,18 +1191,41 @@ func (w *mpeg2BitWriter) write(value uint64, width int) {
 
 func (w *mpeg2BitWriter) align() {
 	if w.used != 0 {
-		w.current <<= 8 - w.used
-		w.data = append(w.data, w.current)
+		if w.countOnly {
+			w.counted++
+		} else {
+			w.current <<= 8 - w.used
+			w.data = append(w.data, w.current)
+		}
 		w.current, w.used = 0, 0
 	}
 }
 
 func (w *mpeg2BitWriter) startCode(code byte) {
 	w.align()
-	w.data = append(w.data, 0, 0, 1, code)
+	if w.countOnly {
+		w.counted += 4
+	} else {
+		w.data = append(w.data, 0, 0, 1, code)
+	}
 }
 
 func (w *mpeg2BitWriter) bytes() []byte {
 	w.align()
 	return w.data
+}
+
+func (w *mpeg2BitWriter) sizeBytes() int {
+	if w.countOnly {
+		size := w.counted
+		if w.used != 0 {
+			size++
+		}
+		return size
+	}
+	size := len(w.data)
+	if w.used != 0 {
+		size++
+	}
+	return size
 }

@@ -171,7 +171,7 @@ func PrepareWebMVideoForDVD(
 		if err != nil {
 			return err
 		}
-		return rateConverter.Push(fitted)
+		return rateConverter.pushOwned(fitted)
 	})
 	if err != nil {
 		return err
@@ -231,7 +231,7 @@ func DecodeWebMVideo(ctx context.Context, path string, trackIndex *int, handler 
 			if err != nil {
 				return err
 			}
-			return resolver.Push(decoded)
+			return resolver.pushOwned(decoded)
 		})
 		if err != nil {
 			return err
@@ -253,12 +253,21 @@ func newWebMFrameDurationResolver(defaultDuration time.Duration, handler func(De
 }
 
 func (r *webMFrameDurationResolver) Push(frame DecodedVideoFrame) error {
+	return r.push(frame, true)
+}
+
+// pushOwned takes ownership of the frame planes. The decoder paths pass fresh
+// frame buffers here, avoiding a redundant full-frame clone per input frame.
+func (r *webMFrameDurationResolver) pushOwned(frame DecodedVideoFrame) error {
+	return r.push(frame, false)
+}
+
+func (r *webMFrameDurationResolver) push(frame DecodedVideoFrame, cloneFrame bool) error {
 	if frame.Duration > 0 {
 		r.previous = frame.Duration
 	}
 	if r.pending == nil {
-		owned := cloneDecodedVideoFrame(frame)
-		r.pending = &owned
+		r.pending = r.ownFrame(frame, cloneFrame)
 		return nil
 	}
 	if r.pending.Duration <= 0 {
@@ -281,9 +290,16 @@ func (r *webMFrameDurationResolver) Push(frame DecodedVideoFrame) error {
 	if err := r.handler(*r.pending); err != nil {
 		return err
 	}
-	owned := cloneDecodedVideoFrame(frame)
-	r.pending = &owned
+	r.pending = r.ownFrame(frame, cloneFrame)
 	return nil
+}
+
+func (r *webMFrameDurationResolver) ownFrame(frame DecodedVideoFrame, cloneFrame bool) *DecodedVideoFrame {
+	if cloneFrame {
+		owned := cloneDecodedVideoFrame(frame)
+		return &owned
+	}
+	return &frame
 }
 
 func (r *webMFrameDurationResolver) Finish() error {
@@ -417,7 +433,7 @@ func decodeWebMVP9(ctx context.Context, path string, track TrackInfo, handler fu
 		if !decodedVisible {
 			return errors.New("video2dvd: VP9 decoder produced no visible frame")
 		}
-		if err := resolver.Push(decoded); err != nil {
+		if err := resolver.pushOwned(decoded); err != nil {
 			return err
 		}
 		decodedFrames++

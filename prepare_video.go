@@ -31,7 +31,7 @@ func PrepareMP4VideoForDVD(
 		if err != nil {
 			return err
 		}
-		return rateConverter.Push(fitted)
+		return rateConverter.pushOwned(fitted)
 	})
 	if err != nil {
 		return err

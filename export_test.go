@@ -61,4 +61,13 @@ func ExportMPEG2QuantizeNonIntra(value float64, quantizer int) int {
 func ExportMPEG2IntraPicture(e *MPEG2VideoEncoder, f DecodedVideoFrame, blocks []mpeg2IntraBlock, w, h, q int, ac bool) []byte {
 	return e.encodeIntraPicture(f, blocks, w, h, q, ac)
 }
+func ExportMPEG2IntraPictureSize(e *MPEG2VideoEncoder, f DecodedVideoFrame, blocks []mpeg2IntraBlock, w, h, q int, ac bool) int {
+	return e.measureIntraPicture(f, blocks, w, h, q, ac)
+}
+func ExportMPEG2PredictivePicture(e *MPEG2VideoEncoder, macroblocks []mpeg2PredictiveMacroblock, w, h, q int, ac bool) []byte {
+	return e.encodePredictivePicture(macroblocks, w, h, q, ac)
+}
+func ExportMPEG2PredictivePictureSize(e *MPEG2VideoEncoder, macroblocks []mpeg2PredictiveMacroblock, w, h, q int, ac bool) int {
+	return e.measurePredictivePicture(macroblocks, w, h, q, ac)
+}
 func ExportProgramStreamClosedError(w *MPEGProgramStreamWriter) error { return w.closedErr }
