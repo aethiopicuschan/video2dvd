@@ -26,7 +26,29 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	if len(vmg)%DVDVOBSectorSize != 0 || string(vmg[:12]) != "DVDVIDEO-VMG" {
 		t.Fatalf("VMGI header/size invalid: %q, %d bytes", vmg[:12], len(vmg))
 	}
+	firstPlayOffset := int(binary.BigEndian.Uint32(vmg[0x0084:0x0088]))
+	firstPlay := vmg[firstPlayOffset:]
+	if firstPlay[2] != 0 || firstPlay[3] != 0 || binary.BigEndian.Uint16(firstPlay[0x00e4:0x00e6]) != 0x00ec {
+		t.Fatal("first-play PGC does not contain an isolated command-only chain")
+	}
+	if binary.BigEndian.Uint16(firstPlay[0x00ec:0x00ee]) != 1 || !bytes.Equal(firstPlay[0x00f4:0x00fc], []byte{0x30, 0x06, 0, 0, 0, 0x42, 0, 0}) {
+		t.Fatal("first-play PGC does not jump to the VMG menu")
+	}
 	vmgSectors := uint32(len(vmg) / DVDVOBSectorSize)
+	vmgMenuCadtSector := binary.BigEndian.Uint32(vmg[0x00d8:0x00dc])
+	vmgMenuAdmapSector := binary.BigEndian.Uint32(vmg[0x00dc:0x00e0])
+	vmgMenuCadt := vmg[int(vmgMenuCadtSector)*DVDVOBSectorSize:]
+	vmgMenuAdmap := vmg[int(vmgMenuAdmapSector)*DVDVOBSectorSize:]
+	menuVOB := readAuthorerTestFile(t, videoTS, "VIDEO_TS.VOB")
+	menuSectors := uint32(len(menuVOB) / DVDVOBSectorSize)
+	if vmgiCount := binary.BigEndian.Uint16(vmgMenuCadt[0:2]); vmgiCount != 1 ||
+		binary.BigEndian.Uint16(vmgMenuCadt[8:10]) != 1 || vmgMenuCadt[10] != 1 ||
+		binary.BigEndian.Uint32(vmgMenuCadt[12:16]) != 0 ||
+		binary.BigEndian.Uint32(vmgMenuCadt[16:20]) != menuSectors-1 ||
+		binary.BigEndian.Uint32(vmgMenuAdmap[0:4]) != 7 ||
+		binary.BigEndian.Uint32(vmgMenuAdmap[4:8]) != 0 {
+		t.Fatal("VMG menu cell/VOBU address tables do not cover the menu VOB")
+	}
 	if got := binary.BigEndian.Uint32(vmg[0x00C4:0x00C8]); got != 1 {
 		t.Fatalf("TT_SRPT sector = %d, want 1", got)
 	}
@@ -39,8 +61,7 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	}
 	firstVTSStart := binary.BigEndian.Uint32(tt[8+8 : 8+12])
 	secondVTSStart := binary.BigEndian.Uint32(tt[8+12+8 : 8+12+12])
-	menuVOB := readAuthorerTestFile(t, videoTS, "VIDEO_TS.VOB")
-	menuSectors := uint32(len(menuVOB) / DVDVOBSectorSize)
+	menuSectors = uint32(len(menuVOB) / DVDVOBSectorSize)
 	if firstVTSStart != vmgSectors*2+menuSectors {
 		t.Fatalf("first VTS sector = %d, want after VMGI/menu/BUP at %d", firstVTSStart, vmgSectors*2+menuSectors)
 	}
@@ -83,6 +104,15 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	}
 	if firstIFO[0x0204]>>5 != 4 || firstIFO[0x0205]&7 != 1 {
 		t.Fatalf("LPCM stream attributes = % x, want 16-bit 48 kHz stereo", firstIFO[0x0204:0x020c])
+	}
+	vtsMenuCadtSector := binary.BigEndian.Uint32(firstIFO[0x00d8:0x00dc])
+	vtsMenuAdmapSector := binary.BigEndian.Uint32(firstIFO[0x00dc:0x00e0])
+	vtsMenuCadt := firstIFO[int(vtsMenuCadtSector)*DVDVOBSectorSize:]
+	vtsMenuAdmap := firstIFO[int(vtsMenuAdmapSector)*DVDVOBSectorSize:]
+	if binary.BigEndian.Uint16(vtsMenuCadt[0:2]) != 1 || binary.BigEndian.Uint16(vtsMenuCadt[8:10]) != 1 ||
+		vtsMenuCadt[10] != 1 || binary.BigEndian.Uint32(vtsMenuCadt[16:20]) != menuSectors-1 ||
+		binary.BigEndian.Uint32(vtsMenuAdmap[4:8]) != 0 {
+		t.Fatal("VTS menu cell/VOBU address tables do not cover the menu VOB")
 	}
 
 	ptt := firstIFO[DVDVOBSectorSize:]
@@ -146,6 +176,16 @@ func TestDVDMenuPGCIContainsPagePGCs(t *testing.T) {
 	})
 	if len(menu) < 32 || binary.BigEndian.Uint16(menu[16:18]) != 3 {
 		t.Fatalf("menu language unit page count is invalid")
+	}
+	unit := menu[16:]
+	for page := range 2 {
+		searchEntry := 8 + page*8
+		pgcOffset := int(binary.BigEndian.Uint32(unit[searchEntry+4 : searchEntry+8]))
+		pgc := unit[pgcOffset:]
+		positionOffset := int(binary.BigEndian.Uint16(pgc[0x00ea:0x00ec]))
+		if got, want := pgc[positionOffset+3], byte(page+1); got != want {
+			t.Fatalf("menu page %d cell ID = %d, want %d", page+1, got, want)
+		}
 	}
 }
 

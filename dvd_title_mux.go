@@ -138,8 +138,13 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 			return errors.New("video2dvd: VOB title exceeds the 1 GiB single-file limit")
 		}
 		var buttons []DVDNAVButton
+		cellID := uint8(1)
 		if menuVOBUIndex < len(buttonPages) {
 			buttons = buttonPages[menuVOBUIndex]
+			if menuVOBUIndex >= math.MaxUint8 {
+				return errors.New("video2dvd: menu contains more cells than a DVD VOB can address")
+			}
+			cellID = uint8(menuVOBUIndex + 1)
 		}
 		nav, err := BuildDVDNAVPack(DVDNAVPackInfo{
 			SCRBase:                   groupSCR,
@@ -149,7 +154,7 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 			SecondReferenceEndAddress: referenceEnds[1],
 			ThirdReferenceEndAddress:  referenceEnds[2],
 			VOBID:                     1,
-			CellID:                    1,
+			CellID:                    cellID,
 			StartPTM:                  groupStartPTS,
 			EndPTM:                    groupEndPTS,
 			CellElapsedTime:           groupCellElapsed,
