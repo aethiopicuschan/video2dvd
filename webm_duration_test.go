@@ -1,6 +1,7 @@
-package video2dvd
+package video2dvd_test
 
 import (
+	. "github.com/aethiopicuschan/video2dvd"
 	"strings"
 	"testing"
 	"time"
@@ -8,7 +9,7 @@ import (
 
 func TestWebMFrameDurationResolverUsesNextPTSWithoutBlockOrDefaultDuration(t *testing.T) {
 	var got []DecodedVideoFrame
-	resolver := newWebMFrameDurationResolver(0, func(frame DecodedVideoFrame) error {
+	resolver := TestNewWebMFrameDurationResolver(0, func(frame DecodedVideoFrame) error {
 		got = append(got, frame)
 		return nil
 	})
@@ -35,7 +36,7 @@ func TestWebMFrameDurationResolverUsesNextPTSWithoutBlockOrDefaultDuration(t *te
 }
 
 func TestWebMFrameDurationResolverRejectsUnrecoverableFinalDuration(t *testing.T) {
-	resolver := newWebMFrameDurationResolver(0, func(DecodedVideoFrame) error { return nil })
+	resolver := TestNewWebMFrameDurationResolver(0, func(DecodedVideoFrame) error { return nil })
 	frame := testWebMDurationFrame(0, 0)
 	if err := resolver.Push(frame); err != nil {
 		t.Fatal(err)
@@ -48,7 +49,7 @@ func TestWebMFrameDurationResolverRejectsUnrecoverableFinalDuration(t *testing.T
 
 func TestWebMFrameDurationResolverPreservesPacketDuration(t *testing.T) {
 	var got []DecodedVideoFrame
-	resolver := newWebMFrameDurationResolver(40*time.Millisecond, func(frame DecodedVideoFrame) error {
+	resolver := TestNewWebMFrameDurationResolver(40*time.Millisecond, func(frame DecodedVideoFrame) error {
 		got = append(got, frame)
 		return nil
 	})
@@ -69,7 +70,7 @@ func TestWebMFrameDurationResolverPreservesPacketDuration(t *testing.T) {
 
 func TestWebMFrameDurationResolverUsesTrackDefaultDuration(t *testing.T) {
 	var got []DecodedVideoFrame
-	resolver := newWebMFrameDurationResolver(40*time.Millisecond, func(frame DecodedVideoFrame) error {
+	resolver := TestNewWebMFrameDurationResolver(40*time.Millisecond, func(frame DecodedVideoFrame) error {
 		got = append(got, frame)
 		return nil
 	})

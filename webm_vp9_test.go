@@ -1,6 +1,7 @@
-package video2dvd
+package video2dvd_test
 
 import (
+	. "github.com/aethiopicuschan/video2dvd"
 	"image"
 	"testing"
 	"time"
@@ -47,7 +48,7 @@ func TestCopyGovpxFrameFromProfile0Decoder(t *testing.T) {
 		t.Fatal("Profile 0 decoder produced no frame")
 	}
 
-	got, err := copyVP9Frame(frame, 7*time.Millisecond, 33*time.Millisecond)
+	got, err := ExportCopyVP9Frame(frame, 7*time.Millisecond, 33*time.Millisecond)
 	if err != nil {
 		t.Fatalf("copy govpx frame: %v", err)
 	}

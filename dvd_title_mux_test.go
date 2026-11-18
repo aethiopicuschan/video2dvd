@@ -1,9 +1,10 @@
-package video2dvd
+package video2dvd_test
 
 import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	. "github.com/aethiopicuschan/video2dvd"
 	"io"
 	"os"
 	"path/filepath"
@@ -19,7 +20,7 @@ func TestMPEG2PictureReaderPreservesPrefixAcrossShortReads(t *testing.T) {
 		0, 0, 1, 0x00, 0x66, 0x77,
 		0, 0, 1, 0xb7,
 	}
-	reader := mpeg2PictureReader{src: &limitedReadSizeReader{data: stream, limit: 2}}
+	reader := *ExportNewMPEG2PictureReader(&limitedReadSizeReader{data: stream, limit: 2})
 	first, err := reader.Next()
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +42,7 @@ func TestMPEG2PictureReaderPreservesPrefixAcrossShortReads(t *testing.T) {
 }
 
 func TestMuxDVDTitleVOBInterleavesVideoAndLPCM(t *testing.T) {
-	profile, err := (Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9}).profile()
+	profile, err := ExportProfile(Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +66,7 @@ func TestMuxDVDTitleVOBInterleavesVideoAndLPCM(t *testing.T) {
 	}
 	for i := range 16 {
 		if i == 1 {
-			frame = cloneDecodedVideoFrame(frame)
+			frame = ExportCloneDecodedVideoFrame(frame)
 			frame.Y[100*frame.Width+100] = 140
 		}
 		if err := encoder.WriteFrame(frame); err != nil {

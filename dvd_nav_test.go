@@ -1,8 +1,9 @@
-package video2dvd
+package video2dvd_test
 
 import (
 	"bytes"
 	"encoding/binary"
+	. "github.com/aethiopicuschan/video2dvd"
 	"testing"
 	"time"
 )
@@ -67,14 +68,14 @@ func TestBuildDVDNAVPackRejectsMissingIDs(t *testing.T) {
 }
 
 func TestDVDCellElapsedTimeUsesDVDBCDAndFrameRateCode(t *testing.T) {
-	ntsc, err := dvdCellElapsedTime(time.Hour+2*time.Minute+3*time.Second+500*time.Millisecond, 30000, 1001)
+	ntsc, err := ExportDVDCellElapsedTime(time.Hour+2*time.Minute+3*time.Second+500*time.Millisecond, 30000, 1001)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if ntsc != [4]byte{0x01, 0x02, 0x03, 0xcf} {
 		t.Fatalf("NTSC cell time = % x, want 01 02 03 cf", ntsc)
 	}
-	pal, err := dvdCellElapsedTime(time.Second+960*time.Millisecond, 25, 1)
+	pal, err := ExportDVDCellElapsedTime(time.Second+960*time.Millisecond, 25, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

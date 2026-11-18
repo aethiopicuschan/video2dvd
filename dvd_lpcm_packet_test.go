@@ -1,8 +1,9 @@
-package video2dvd
+package video2dvd_test
 
 import (
 	"bytes"
 	"encoding/binary"
+	. "github.com/aethiopicuschan/video2dvd"
 	"testing"
 	"time"
 )

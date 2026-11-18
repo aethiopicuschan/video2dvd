@@ -1,9 +1,10 @@
-package video2dvd
+package video2dvd_test
 
 import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	. "github.com/aethiopicuschan/video2dvd"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,7 +12,7 @@ import (
 )
 
 func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
-	profile, err := (Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9}).profile()
+	profile, err := ExportProfile(Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +133,7 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 }
 
 func TestDVDMenuPGCIContainsPagePGCs(t *testing.T) {
-	menu := buildDVDVMGMenuPGCI(20, [4]byte{0, 0, 1, 0xc0}, []dvdVOBURecord{
+	menu := ExportBuildDVDVMGMenuPGCI(20, [4]byte{0, 0, 1, 0xc0}, []TestDVDVOBURecord{
 		{StartSector: 0, EndSector: 9}, {StartSector: 10, EndSector: 19},
 	})
 	if len(menu) < 32 || binary.BigEndian.Uint16(menu[16:18]) != 3 {
@@ -162,7 +163,7 @@ func makeAuthorerTestTitle(t *testing.T, profile Profile) EncodedTitle {
 	}
 	for i := range 16 {
 		if i == 1 {
-			frame = cloneDecodedVideoFrame(frame)
+			frame = ExportCloneDecodedVideoFrame(frame)
 			frame.Y[100*frame.Width+100] = 140
 		}
 		if err := encoder.WriteFrame(frame); err != nil {

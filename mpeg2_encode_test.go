@@ -1,7 +1,8 @@
-package video2dvd
+package video2dvd_test
 
 import (
 	"bytes"
+	. "github.com/aethiopicuschan/video2dvd"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -24,7 +25,7 @@ func TestMPEG2VideoEncoderWritesDVDSequence(t *testing.T) {
 		{name: "pal", standard: VideoStandardPAL, aspect: AspectRatio4x3, width: 720, height: 576, fpsN: 25, fpsD: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			profile, err := (Options{Standard: tc.standard, Aspect: tc.aspect}).profile()
+			profile, err := ExportProfile(Options{Standard: tc.standard, Aspect: tc.aspect})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -67,7 +68,7 @@ func TestMPEG2VideoEncoderWritesDVDSequence(t *testing.T) {
 }
 
 func TestMPEG2VideoEncoderRejectsEmptyStream(t *testing.T) {
-	profile, err := (Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9}).profile()
+	profile, err := ExportProfile(Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +83,7 @@ func TestMPEG2VideoEncoderRejectsEmptyStream(t *testing.T) {
 }
 
 func TestMPEG2VideoEncoderHonorsConfiguredBitrate(t *testing.T) {
-	profile, err := (Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9, VideoBitrate: 4_000_000}).profile()
+	profile, err := ExportProfile(Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9, VideoBitrate: 4_000_000})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,8 +91,8 @@ func TestMPEG2VideoEncoderHonorsConfiguredBitrate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := 4_000_000 * 1001 / (8 * 30000); encoder.frameBytes != want {
-		t.Fatalf("frame budget = %d, want %d", encoder.frameBytes, want)
+	if want := 4_000_000 * 1001 / (8 * 30000); ExportMPEG2FrameBytes(encoder) != want {
+		t.Fatalf("frame budget = %d, want %d", ExportMPEG2FrameBytes(encoder), want)
 	}
 	profile.VideoBitrate = 9_000_000
 	if _, err := NewMPEG2VideoEncoder(&bytes.Buffer{}, profile); err == nil {
@@ -100,7 +101,7 @@ func TestMPEG2VideoEncoderHonorsConfiguredBitrate(t *testing.T) {
 }
 
 func TestMPEG2VideoEncoderCodesACAndStaysWithinFrameBudget(t *testing.T) {
-	profile, err := (Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9}).profile()
+	profile, err := ExportProfile(Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,13 +119,13 @@ func TestMPEG2VideoEncoderCodesACAndStaysWithinFrameBudget(t *testing.T) {
 		frame.V[i] = byte(16 + (i*5)%224)
 	}
 
-	blocks := collectMPEG2IntraBlocks(frame, frame.Width/16, frame.Height/16)
+	blocks := ExportCollectMPEG2IntraBlocks(frame, frame.Width/16, frame.Height/16)
 	encoder, err := NewMPEG2VideoEncoder(&bytes.Buffer{}, profile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	withAC := encoder.encodeIntraPicture(frame, blocks, frame.Width/16, frame.Height/16, 31, true)
-	withoutAC := encoder.encodeIntraPicture(frame, blocks, frame.Width/16, frame.Height/16, 31, false)
+	withAC := ExportMPEG2IntraPicture(encoder, frame, blocks, frame.Width/16, frame.Height/16, 31, true)
+	withoutAC := ExportMPEG2IntraPicture(encoder, frame, blocks, frame.Width/16, frame.Height/16, 31, false)
 	if len(withAC) <= len(withoutAC) {
 		t.Fatalf("AC-coded picture size %d did not exceed DC-only size %d", len(withAC), len(withoutAC))
 	}
@@ -140,13 +141,13 @@ func TestMPEG2VideoEncoderCodesACAndStaysWithinFrameBudget(t *testing.T) {
 	if err := encoder.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if output.Len() > encoder.frameBytes+4 {
-		t.Fatalf("output size %d exceeds one-frame budget %d plus sequence end", output.Len(), encoder.frameBytes)
+	if output.Len() > ExportMPEG2FrameBytes(encoder)+4 {
+		t.Fatalf("output size %d exceeds one-frame budget %d plus sequence end", output.Len(), ExportMPEG2FrameBytes(encoder))
 	}
 }
 
 func TestMPEG2VideoEncoderUsesPredictivePicturesForUnchangedMacroblocks(t *testing.T) {
-	profile, err := (Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9}).profile()
+	profile, err := ExportProfile(Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +166,7 @@ func TestMPEG2VideoEncoderUsesPredictivePicturesForUnchangedMacroblocks(t *testi
 	}
 	for i := range 3 {
 		if i == 2 {
-			frame = cloneDecodedVideoFrame(frame)
+			frame = ExportCloneDecodedVideoFrame(frame)
 			for y := 160; y < 176; y++ {
 				for x := 320; x < 336; x++ {
 					frame.Y[y*frame.Width+x]++
@@ -180,7 +181,7 @@ func TestMPEG2VideoEncoderUsesPredictivePicturesForUnchangedMacroblocks(t *testi
 		t.Fatal(err)
 	}
 
-	types, sizes := mpeg2TestPictureTypesAndSizes(output.Bytes())
+	types, sizes := mpeg2PictureTypesAndSizes(output.Bytes())
 	if len(types) != 3 {
 		t.Fatalf("found %d pictures, want 3", len(types))
 	}
@@ -200,7 +201,7 @@ func TestMPEG2PredictiveProcessingIsDeterministicAcrossWorkerCounts(t *testing.T
 	frame.Y = make([]byte, frame.Width*frame.Height)
 	frame.U = make([]byte, frame.Width*frame.Height/4)
 	frame.V = make([]byte, frame.Width*frame.Height/4)
-	reference := cloneDecodedVideoFrame(frame)
+	reference := ExportCloneDecodedVideoFrame(frame)
 	for y := range frame.Height {
 		for x := range frame.Width {
 			frame.Y[y*frame.Width+x] = byte((x*11 + y*7) % 220)
@@ -213,12 +214,12 @@ func TestMPEG2PredictiveProcessingIsDeterministicAcrossWorkerCounts(t *testing.T
 	}
 
 	previous := runtime.GOMAXPROCS(1)
-	serial := analyzeMPEG2PredictiveMacroblocks(frame, reference, 4, 4)
-	serialReconstruction := reconstructMPEG2PredictiveFrame(frame, reference, serial, 4, 4, 8, true)
+	serial := ExportAnalyzeMPEG2PredictiveMacroblocks(frame, reference, 4, 4)
+	serialReconstruction := ExportReconstructMPEG2PredictiveFrame(frame, reference, serial, 4, 4, 8, true)
 	runtime.GOMAXPROCS(max(2, previous))
 	defer runtime.GOMAXPROCS(previous)
-	parallel := analyzeMPEG2PredictiveMacroblocks(frame, reference, 4, 4)
-	parallelReconstruction := reconstructMPEG2PredictiveFrame(frame, reference, parallel, 4, 4, 8, true)
+	parallel := ExportAnalyzeMPEG2PredictiveMacroblocks(frame, reference, 4, 4)
+	parallelReconstruction := ExportReconstructMPEG2PredictiveFrame(frame, reference, parallel, 4, 4, 8, true)
 
 	if !reflect.DeepEqual(parallel, serial) {
 		t.Fatal("parallel macroblock analysis differs from serial analysis")
@@ -228,7 +229,7 @@ func TestMPEG2PredictiveProcessingIsDeterministicAcrossWorkerCounts(t *testing.T
 	}
 }
 
-func mpeg2TestPictureTypesAndSizes(stream []byte) ([]uint32, []int) {
+func mpeg2PictureTypesAndSizes(stream []byte) ([]uint32, []int) {
 	var types []uint32
 	var sizes []int
 	for position := 0; position+4 <= len(stream); position++ {
@@ -238,9 +239,9 @@ func mpeg2TestPictureTypesAndSizes(stream []byte) ([]uint32, []int) {
 		if position+6 > len(stream) {
 			break
 		}
-		reader := bitReader{data: stream[position+4:]}
-		_, _ = reader.read(10)
-		pictureType, err := reader.read(3)
+		reader := ExportNewBitReader(stream[position+4:])
+		_, _ = ExportReadBits(reader, 10)
+		pictureType, err := ExportReadBits(reader, 3)
 		if err != nil {
 			break
 		}

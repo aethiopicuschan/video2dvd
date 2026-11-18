@@ -1,7 +1,8 @@
-package video2dvd
+package video2dvd_test
 
 import (
 	"context"
+	. "github.com/aethiopicuschan/video2dvd"
 	"os"
 	"testing"
 	"time"
@@ -21,7 +22,7 @@ func TestMP4AACAlignmentPaddingRegression(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	track, err := selectAudioTrack(info, nil)
+	track, err := ExportSelectAudioTrack(info, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +58,7 @@ func TestMP4AACAlignmentPaddingRegression(t *testing.T) {
 		t.Fatal(err)
 	}
 	audioTrack := demux.Track()
-	timing, err := audioTrack.TimingPlan(int64(audioTrack.SampleCount) * aacFallbackDecodedFramesPerSample)
+	timing, err := audioTrack.TimingPlan(int64(audioTrack.SampleCount * ExportAACFallbackDecodedFramesPerSample))
 	file.Close()
 	if err != nil {
 		t.Fatal(err)
@@ -77,7 +78,7 @@ func TestWebMVP9FullFileRegression(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	track, err := selectWebMVideoTrack(info, nil)
+	track, err := ExportSelectWebMVideoTrack(info, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

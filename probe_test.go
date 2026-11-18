@@ -1,8 +1,9 @@
-package video2dvd
+package video2dvd_test
 
 import (
 	"bytes"
 	"encoding/binary"
+	. "github.com/aethiopicuschan/video2dvd"
 	"io"
 	"testing"
 	"time"
@@ -38,7 +39,7 @@ func TestParseMediaDurationRejectsShortMDHDVersions(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			data := make([]byte, tc.payload)
 			data[0] = tc.version
-			_, _, err := parseMediaDuration(bytes.NewReader(data), mp4Box{data: 0, end: int64(len(data))})
+			_, _, err := ExportParseMediaDuration(bytes.NewReader(data), ExportMP4Box(0, int64(len(data))))
 			if err == nil || err != io.ErrUnexpectedEOF {
 				t.Fatalf("error = %v, want unexpected EOF", err)
 			}

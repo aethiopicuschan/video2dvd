@@ -1,9 +1,10 @@
-package video2dvd
+package video2dvd_test
 
 import (
 	"context"
 	"encoding/binary"
 	"errors"
+	. "github.com/aethiopicuschan/video2dvd"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -14,7 +15,7 @@ import (
 )
 
 func TestMakeAACADTSHeaderFromMP4AudioSpecificConfig(t *testing.T) {
-	header, err := makeAACADTSHeader([]byte{0x12, 0x10}, 123)
+	header, err := TestMakeAACADTSHeader([]byte{0x12, 0x10}, 123)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +41,7 @@ func TestAACPCMFileSourceAppliesEditTimeline(t *testing.T) {
 		binary.LittleEndian.PutUint16(bytes[2:4], uint16(-(frame + 1)))
 		raw = append(raw, bytes[:]...)
 	}
-	if err := writeAll(file, raw); err != nil {
+	if err := ExportWriteAll(file, raw); err != nil {
 		t.Fatal(err)
 	}
 	if err := file.Close(); err != nil {
@@ -51,10 +52,7 @@ func TestAACPCMFileSourceAppliesEditTimeline(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer file.Close()
-	source := &aacPCMFileSource{
-		file: file, info: pcm.Info{SampleRate: 44100, Channels: 2, Frames: 5},
-		priming: 1, leading: 2,
-	}
+	source := ExportAACSource(file, pcm.Info{SampleRate: 44100, Channels: 2, Frames: 5}, 1, 2)
 	got := make([]float64, 10)
 	n, err := source.ReadFrames(context.Background(), got)
 	if err != nil {
@@ -76,11 +74,11 @@ func TestAACPCMFileSourceAppliesEditTimeline(t *testing.T) {
 
 func TestMakeAACADTSHeaderRejectsUnsupportedConfig(t *testing.T) {
 	for _, config := range [][]byte{{}, {0x0a, 0x10}, {0x12, 0x18}, {0x16, 0x90}} {
-		if _, err := makeAACADTSHeader(config, 32); err == nil {
+		if _, err := TestMakeAACADTSHeader(config, 32); err == nil {
 			t.Errorf("accepted unsupported AudioSpecificConfig %x", config)
 		}
 	}
-	if _, err := makeAACADTSHeader([]byte{0x12, 0x10}, 8193); err == nil {
+	if _, err := TestMakeAACADTSHeader([]byte{0x12, 0x10}, 8193); err == nil {
 		t.Fatal("accepted an access unit larger than the ADTS frame limit")
 	}
 }

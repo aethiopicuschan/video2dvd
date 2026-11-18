@@ -1,8 +1,9 @@
-package video2dvd
+package video2dvd_test
 
 import (
 	"bytes"
 	"encoding/binary"
+	. "github.com/aethiopicuschan/video2dvd"
 	"testing"
 	"time"
 )
@@ -53,8 +54,8 @@ func TestMPEGProgramStreamWriterRejectsInvalidIDsAndRegressingPTS(t *testing.T) 
 	if err := writer.WritePES(0xc0, 0, []byte{2}); err == nil {
 		t.Fatal("expected regressing PTS to be rejected")
 	}
-	if writer.closedErr != nil {
-		t.Fatalf("timestamp validation poisoned the writer: %v", writer.closedErr)
+	if ExportProgramStreamClosedError(writer) != nil {
+		t.Fatalf("timestamp validation poisoned the writer: %v", ExportProgramStreamClosedError(writer))
 	}
 }
 

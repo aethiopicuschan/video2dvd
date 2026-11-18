@@ -1,14 +1,15 @@
-package video2dvd
+package video2dvd_test
 
 import (
 	"bytes"
 	"errors"
+	. "github.com/aethiopicuschan/video2dvd"
 	"testing"
 	"time"
 )
 
 func TestTrackDisplayAspectIncludesPixelAspect(t *testing.T) {
-	gotNumerator, gotDenominator, err := trackDisplayAspect(TrackInfo{
+	gotNumerator, gotDenominator, err := ExportTrackDisplayAspect(TrackInfo{
 		Width:                 1920,
 		Height:                1080,
 		PixelAspectHorizontal: 4,
@@ -18,22 +19,22 @@ func TestTrackDisplayAspectIncludesPixelAspect(t *testing.T) {
 		t.Fatal(err)
 	}
 	if gotNumerator != 64 || gotDenominator != 27 {
-		t.Fatalf("trackDisplayAspect() = %d/%d, want 64/27", gotNumerator, gotDenominator)
+		t.Fatalf("ExportTrackDisplayAspect() = %d/%d, want 64/27", gotNumerator, gotDenominator)
 	}
 }
 
 func TestCheckEstimatedTitleSize(t *testing.T) {
-	if err := checkEstimatedTitleSize(time.Second, 1_192_000, mpeg2VideoBitrate); err != nil {
+	if err := ExportCheckEstimatedTitleSize(time.Second, 1_192_000, ExportMPEG2VideoBitrate); err != nil {
 		t.Fatalf("one-second estimate should fit exactly: %v", err)
 	}
-	if err := checkEstimatedTitleSize(time.Second, 1_191_999, mpeg2VideoBitrate); !errors.Is(err, ErrDiscCapacity) {
+	if err := ExportCheckEstimatedTitleSize(time.Second, 1_191_999, ExportMPEG2VideoBitrate); !errors.Is(err, ErrDiscCapacity) {
 		t.Fatalf("one-byte undersized capacity should fail with ErrDiscCapacity, got %v", err)
 	}
 }
 
 func TestSizeLimitedWriterStopsAtLimit(t *testing.T) {
 	var output bytes.Buffer
-	writer := &sizeLimitedWriter{dst: &output, limit: 4}
+	writer := ExportNewSizeLimitedWriter(&output, 4)
 	if n, err := writer.Write([]byte("ab")); n != 2 || err != nil {
 		t.Fatalf("first write = %d, %v; want 2, nil", n, err)
 	}
