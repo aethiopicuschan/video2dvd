@@ -509,27 +509,26 @@ func absInt(value int) int {
 }
 
 func collectMPEG2IntraBlocks(frame DecodedVideoFrame, mbWidth, mbHeight int) []mpeg2IntraBlock {
-	blocks := make([]mpeg2IntraBlock, 0, mbWidth*mbHeight*6)
-	for mbRow := range mbHeight {
+	blocks := make([]mpeg2IntraBlock, mbWidth*mbHeight*6)
+	parallelMPEG2Rows(mbHeight, func(mbRow int) {
 		for mbColumn := range mbWidth {
 			baseX, baseY := mbColumn*16, mbRow*16
+			blockIndex := (mbRow*mbWidth + mbColumn) * 6
 			for block := range 4 {
 				x := baseX + (block%2)*8
 				y := baseY + (block/2)*8
-				blocks = append(blocks, analyzeMPEG2Block(frame.Y, frame.Width, x, y, false))
+				blocks[blockIndex+block] = analyzeMPEG2Block(frame.Y, frame.Width, x, y, false)
 			}
-			blocks = append(blocks,
-				analyzeMPEG2Block(frame.U, frame.Width/2, mbColumn*8, mbRow*8, true),
-				analyzeMPEG2Block(frame.V, frame.Width/2, mbColumn*8, mbRow*8, true),
-			)
+			blocks[blockIndex+4] = analyzeMPEG2Block(frame.U, frame.Width/2, mbColumn*8, mbRow*8, true)
+			blocks[blockIndex+5] = analyzeMPEG2Block(frame.V, frame.Width/2, mbColumn*8, mbRow*8, true)
 		}
-	}
+	})
 	return blocks
 }
 
 func reconstructMPEG2IntraFrame(frame DecodedVideoFrame, blocks []mpeg2IntraBlock, mbWidth, mbHeight, quantizer int, includeAC bool) DecodedVideoFrame {
 	reconstructed := newMPEG2FrameLike(frame)
-	for row := range mbHeight {
+	parallelMPEG2Rows(mbHeight, func(row int) {
 		for column := range mbWidth {
 			blockIndex := (row*mbWidth + column) * 6
 			baseX, baseY := column*16, row*16
@@ -544,7 +543,7 @@ func reconstructMPEG2IntraFrame(frame DecodedVideoFrame, blocks []mpeg2IntraBloc
 			copyMPEG2Block(reconstructed.U, frame.Width/2, column*8, row*8, pixelsU)
 			copyMPEG2Block(reconstructed.V, frame.Width/2, column*8, row*8, pixelsV)
 		}
-	}
+	})
 	return reconstructed
 }
 
@@ -663,13 +662,21 @@ func copyMPEG2Block(plane []byte, stride, x, y int, block [64]byte) {
 
 func inverseMPEG2DCT(coefficients [64]int) [64]int {
 	var pixels [64]int
+	var temporary [8][8]float64
+	for vertical := range 8 {
+		for x := range 8 {
+			var value float64
+			for horizontal := range 8 {
+				value += float64(coefficients[vertical*8+horizontal]) * mpeg2DCTBasis[horizontal][x]
+			}
+			temporary[vertical][x] = value
+		}
+	}
 	for y := range 8 {
 		for x := range 8 {
 			var value float64
 			for vertical := range 8 {
-				for horizontal := range 8 {
-					value += float64(coefficients[vertical*8+horizontal]) * mpeg2DCTBasis[horizontal][x] * mpeg2DCTBasis[vertical][y]
-				}
+				value += temporary[vertical][x] * mpeg2DCTBasis[vertical][y]
 			}
 			pixels[y*8+x] = int(math.Round(value * 0.25))
 		}
