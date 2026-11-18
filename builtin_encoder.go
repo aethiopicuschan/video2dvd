@@ -65,7 +65,7 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 	if err := validateEncoderProfile(profile); err != nil {
 		return EncodedTitle{}, err
 	}
-	if err := checkEstimatedTitleSize(duration, encoderOutputLimit(profile)); err != nil {
+	if err := checkEstimatedTitleSize(duration, encoderOutputLimit(profile), profileVideoBitrate(profile)); err != nil {
 		return EncodedTitle{}, err
 	}
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
@@ -320,8 +320,8 @@ func encoderOutputLimit(profile Profile) int64 {
 	return DVD5CapacityBytes
 }
 
-func checkEstimatedTitleSize(duration time.Duration, capacity int64) error {
-	videoBytes, err := estimateRateBytes(duration, mpeg2VideoBitrate/8)
+func checkEstimatedTitleSize(duration time.Duration, capacity int64, videoBitrate int) error {
+	videoBytes, err := estimateRateBytes(duration, int64(videoBitrate)/8)
 	if err != nil {
 		return err
 	}

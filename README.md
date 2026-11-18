@@ -14,7 +14,7 @@
 
 `ProbeMedia` はファイルから MP4/WebM を判別してトラック・コーデック・解像度・音声情報・再生時間を読み取ります。個別の `ProbeMP4` と `ProbeWebM` も使えます。`DemuxMP4` は非 fragmented MP4 の音声・映像サンプルを DTS/PTS とともに順に取り出します。H.264 の AVC 設定を取得でき、`AVCToAnnexB` と `AVCConfigToAnnexB` でNAL列とSPS/PPSを Annex B 形式に変換できます。AAC の AudioSpecificConfig も取得します。
 
-`DecodeMP4Video` は progressive 8-bit 4:2:0 H.264 をYUVフレームに、`DecodeMP4Audio` は対応する AAC-LC/AC-3 を48 kHz stereo PCMにデコードします。`DecodeWebMVideo` は VP9 Profile 0/2、VP8、AV1 の映像を、`DecodeWebMAudio` は Opus 音声をDVD向けフレーム/PCMへデコードします。VP9 Profile 2 の10/12-bit映像は8-bitへ変換します。各デコーダーは純Go実装を使い、FFmpegなどの外部コマンドは起動しません。
+`DecodeMP4Video` は progressive 8-bit 4:2:0 H.264 をYUVフレームに、`DecodeMP4Audio` は対応する AAC-LC/AC-3 を48 kHz stereo PCMにデコードします。`DecodeWebMVideo` は VP9 Profile 0/2、VP8、AV1 の映像を、`DecodeWebMAudio` は Opus 音声をDVD向けフレーム/PCMへデコードします。VP9 Profile 2 の10/12-bit映像は8-bitへ変換します。VP9 Profile 0 は `github.com/thesyncim/govpx`、Profile 2 は `github.com/aethiopicuschan/go-vp9` を使用します。各デコーダーは純Go実装を使い、FFmpegなどの外部コマンドは起動しません。
 
 組み込み変換器で扱える主な入力は MP4 H.264 + AAC-LC/AC-3 と WebM VP8/VP9 Profile 0/2/AV1 + Opus です。VP9 Profile 1/3、WebM Vorbis、AV1の高ビット深度、HDRのトーンマッピング、AVC以外のMP4映像コーデックは未対応です。VP9 Profile 2のビット深度変換は行いますが、BT.2020/PQ/HLGからDVD向けSDRへの色変換は行いません。
 
@@ -24,7 +24,7 @@
 
 `MuxDVDTitleVOB` は1タイトル分のMPEG-2映像とLPCM音声をPTS順に多重化し、Iフレームから始まるVOBUごとにPCI/DSI入りのNAVパックを置きます。`MPEGProgramStreamWriter` と `DVDLPCMPacketWriter` はその下位部品で、`BuildDVDNAVPack` はNAVパック単体を構築します。fragmented MP4、暗号化トラック、映像demux側でのedit list適用も現在の対象外です。
 
-`NewInProcessAuthorer` は最大99個の入力を入力順に別々のVTS/タイトルとしてオーサリングし、VMG/VTSのIFO・BUP、PTT/PGC/セル/VOBUテーブルと各タイトルのVOBを作成します。現在はMPEG-2映像とLPCM音声に対応し、タイトルメニューや字幕は作成しません。`WriteDVDISO` は現在のメニューなし `VIDEO_TS` をISO 9660とUDF 1.02の両方から読めるDVD-Videoイメージにまとめます。UDFの実ファイル配置に基づいてIFO内のセクタ参照を確定し、ISOメタデータを含めた容量も確認します。UDFの記述には純Goの [go-sdk-winmediafoundry UDF package](https://pkg.go.dev/github.com/deploymenttheory/go-sdk-winmediafoundry/pkg/udf) を使い、外部プロセスは起動しません。ディスクへの書き込み、ディスク起動時の自動再生、複数タイトルの自動連続再生、メニュー操作は未実装です。
+`NewInProcessAuthorer` はDVD規格上の最大99個の入力を入力順に別々のVTS/タイトルとしてオーサリングし、各入力動画を1タイトル・1チャプターとして登録します。自動生成タイトルメニューは動画ファイル名を `VIDEO_TS.VOB` に表示し、DVDリモコンの方向キーと決定ボタンで各タイトルへ移動できます。タイトル再生終了後はタイトルメニューへ戻り、メニューは再生終了後に先頭へループします。4:3メニューは2列、16:9メニューは1列で、最大36ボタン単位にページを自動生成します。`Options.MenuTitle`、`MenuBackgroundLuma`、`MenuTextLuma` でメニュー見出しと明るさを変更できます。英数字以外は `?` として表示されます。字幕は未対応です。VMG/VTSのIFO・BUP、PTT/PGC/セル/VOBUテーブルと各タイトルのVOBも作成します。`WriteDVDISO` は `VIDEO_TS` をISO 9660とUDF 1.02の両方から読めるDVD-Videoイメージにまとめます。UDFの実ファイル配置に基づいてIFO内のセクタ参照を確定し、ISOメタデータを含めた容量も確認します。UDFの記述には純Goの [go-sdk-winmediafoundry UDF package](https://pkg.go.dev/github.com/deploymenttheory/go-sdk-winmediafoundry/pkg/udf) を使い、外部プロセスは起動しません。ディスクへの書き込みは未実装です。
 
 ## バックエンドの接続
 
@@ -73,4 +73,4 @@ err = converter.ConvertSources(ctx,
 
 同じファイル内の映像・音声トラックを選ぶ場合も `MediaInput` の `VideoTrackIndex` と `AudioTrackIndex` を設定できます。未指定時は、デコーダーが対応する最初のトラックを選びます。
 
-出力先は既存でないパスを指定します。`Convert` の成功時は `disc/VIDEO_TS` 以下に DVD-Video ファイルが作成されます。`ConvertISO` はISOイメージファイルを作ります。すでに作成したディレクトリは `WriteDVDISO(ctx, "./disc/VIDEO_TS", "./disc.iso")` でイメージ化できます。`DiscCapacityBytes` を省略するとDVD-5の4.7 GBを上限にし、ISO/UDFの管理領域も含めて判定します。エンコーダーの出力は MPEG-2 映像と AC-3、LPCM、または MPEG-1 Layer II 音声で、解像度とフレームレートは選択した DVD 規格に適合する必要があります。
+出力先は既存でないパスを指定します。`Convert` の成功時は `disc/VIDEO_TS` 以下に DVD-Video ファイルが作成されます。`ConvertISO` はISOイメージファイルを作ります。すでに作成したディレクトリは `WriteDVDISO(ctx, "./disc/VIDEO_TS", "./disc.iso")` でイメージ化できます。`DiscCapacityBytes` を省略するとDVD-5の4.7 GBを上限にし、ISO/UDFの管理領域も含めて判定します。`Options.VideoBitrate` は映像ビットレート（2〜8.5 Mbps）を指定でき、省略時は8 Mbpsです。エンコーダーの出力は MPEG-2 映像と AC-3、LPCM、または MPEG-1 Layer II 音声で、解像度とフレームレートは選択した DVD 規格に適合する必要があります。

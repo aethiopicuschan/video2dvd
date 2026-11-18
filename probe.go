@@ -37,6 +37,7 @@ type TrackInfo struct {
 	SampleRate            int
 	Channels              int
 	Duration              time.Duration
+	DefaultDuration       time.Duration
 	TimeScale             uint32
 }
 
@@ -276,7 +277,20 @@ func parseHandler(r io.ReaderAt, box mp4Box) (string, error) {
 }
 
 func parseMediaDuration(r io.ReaderAt, box mp4Box) (time.Duration, uint32, error) {
-	data, err := readBoxPrefix(r, box, 32)
+	versionData, err := readBoxPrefix(r, box, 4)
+	if err != nil {
+		return 0, 0, err
+	}
+	minimumSize := 0
+	switch versionData[0] {
+	case 0:
+		minimumSize = 24
+	case 1:
+		minimumSize = 32
+	default:
+		return 0, 0, fmt.Errorf("unsupported mdhd version %d", versionData[0])
+	}
+	data, err := readBoxPrefix(r, box, minimumSize)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -287,13 +301,8 @@ func parseMediaDuration(r io.ReaderAt, box mp4Box) (time.Duration, uint32, error
 		timeScale = binary.BigEndian.Uint32(data[12:16])
 		duration = uint64(binary.BigEndian.Uint32(data[16:20]))
 	case 1:
-		if len(data) < 32 {
-			return 0, 0, io.ErrUnexpectedEOF
-		}
 		timeScale = binary.BigEndian.Uint32(data[20:24])
 		duration = binary.BigEndian.Uint64(data[24:32])
-	default:
-		return 0, 0, fmt.Errorf("unsupported mdhd version %d", data[0])
 	}
 	value, err := toDuration(duration, timeScale)
 	return value, timeScale, err
