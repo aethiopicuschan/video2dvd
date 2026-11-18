@@ -49,6 +49,12 @@ func ExportNewBitReader(data []byte) *bitReader              { return &bitReader
 func ExportReadBits(r *bitReader, count int) (uint32, error) { return r.read(count) }
 func ExportMP4Box(data, end int64) mp4Box                    { return mp4Box{data: data, end: end} }
 func ExportMPEG2FrameBytes(e *MPEG2VideoEncoder) int         { return e.frameBytes }
+func ExportMPEG2InverseIntraAC(level, weight, quantizer int) int {
+	return inverseMPEG2IntraACCoefficient(level, weight, quantizer)
+}
+func ExportMPEG2InverseNonIntra(level, quantizer int) int {
+	return inverseMPEG2NonIntraCoefficient(level, quantizer)
+}
 func ExportMPEG2IntraPicture(e *MPEG2VideoEncoder, f DecodedVideoFrame, blocks []mpeg2IntraBlock, w, h, q int, ac bool) []byte {
 	return e.encodeIntraPicture(f, blocks, w, h, q, ac)
 }

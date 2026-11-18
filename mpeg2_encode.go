@@ -556,7 +556,7 @@ func reconstructMPEG2IntraBlock(block mpeg2IntraBlock, quantizer int, includeAC 
 			index := mpeg2ZigZag[scanPosition]
 			weight := mpeg2DefaultIntraMatrix[index]
 			level := quantizeMPEG2IntraCoefficient(block.coeff[index], quantizer, weight)
-			coefficients[index] = level * weight * quantizer / 8
+			coefficients[index] = inverseMPEG2IntraACCoefficient(level, weight, quantizer)
 		}
 	}
 	applyMPEG2MismatchControl(&coefficients)
@@ -622,15 +622,25 @@ func reconstructMPEG2NonIntraBlock(levels [64]int, quantizer int) [64]int {
 		if level == 0 {
 			continue
 		}
-		sign := 1
-		if level < 0 {
-			sign = -1
-		}
-		value := (2*absInt(level) + 1) * sign * quantizer
-		coefficients[index] = clampMPEG2Coefficient(value)
+		coefficients[index] = clampMPEG2Coefficient(inverseMPEG2NonIntraCoefficient(level, quantizer))
 	}
 	applyMPEG2MismatchControl(&coefficients)
 	return inverseMPEG2DCT(coefficients)
+}
+
+func inverseMPEG2IntraACCoefficient(level, weight, quantizer int) int {
+	// H.262 7.4.2.2: intra AC coefficients use 2*QF*W*qscale/32.
+	return level * weight * quantizer / 16
+}
+
+func inverseMPEG2NonIntraCoefficient(level, quantizer int) int {
+	// With the default non-intra matrix (16), H.262 7.4.2.2 reduces to
+	// sign(level)*(2*abs(level)+1)*qscale/2.
+	sign := 1
+	if level < 0 {
+		sign = -1
+	}
+	return sign * ((2*absInt(level) + 1) * quantizer / 2)
 }
 
 func newMPEG2FrameLike(frame DecodedVideoFrame) DecodedVideoFrame {
@@ -958,7 +968,7 @@ func writeMPEG2ACCoefficients(bits *mpeg2BitWriter, coefficients [64]float64, qu
 }
 
 func quantizeMPEG2IntraCoefficient(value float64, quantizer, weight int) int {
-	level := min(int(math.Floor(math.Abs(value)*8/(float64(quantizer*weight))+0.5)), 2047)
+	level := min(int(math.Floor(math.Abs(value)*16/(float64(quantizer*weight))+0.5)), 2047)
 	if value < 0 {
 		return -level
 	}

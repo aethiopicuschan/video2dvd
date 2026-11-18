@@ -100,6 +100,18 @@ func TestMPEG2VideoEncoderHonorsConfiguredBitrate(t *testing.T) {
 	}
 }
 
+func TestMPEG2InverseQuantizationMatchesH262Scale(t *testing.T) {
+	if got, want := ExportMPEG2InverseIntraAC(4, 16, 16), 64; got != want {
+		t.Errorf("intra AC inverse quantization = %d, want %d", got, want)
+	}
+	if got, want := ExportMPEG2InverseNonIntra(4, 16), 72; got != want {
+		t.Errorf("positive non-intra inverse quantization = %d, want %d", got, want)
+	}
+	if got, want := ExportMPEG2InverseNonIntra(-4, 16), -72; got != want {
+		t.Errorf("negative non-intra inverse quantization = %d, want %d", got, want)
+	}
+}
+
 func TestMPEG2VideoEncoderCodesACAndStaysWithinFrameBudget(t *testing.T) {
 	profile, err := ExportProfile(Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9})
 	if err != nil {
