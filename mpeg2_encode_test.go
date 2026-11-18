@@ -112,6 +112,26 @@ func TestMPEG2InverseQuantizationMatchesH262Scale(t *testing.T) {
 	}
 }
 
+func TestMPEG2NonIntraQuantizationMatchesInverseScale(t *testing.T) {
+	for _, tc := range []struct {
+		coefficient float64
+		quantizer   int
+		wantLevel   int
+		wantDecoded int
+	}{
+		{coefficient: 20, quantizer: 5, wantLevel: 4, wantDecoded: 22},
+		{coefficient: -17, quantizer: 5, wantLevel: -3, wantDecoded: -17},
+	} {
+		level := ExportMPEG2QuantizeNonIntra(tc.coefficient, tc.quantizer)
+		if level != tc.wantLevel {
+			t.Errorf("quantized coefficient %.1f = %d, want %d", tc.coefficient, level, tc.wantLevel)
+		}
+		if got := ExportMPEG2InverseNonIntra(level, tc.quantizer); got != tc.wantDecoded {
+			t.Errorf("reconstructed coefficient %.1f = %d, want %d", tc.coefficient, got, tc.wantDecoded)
+		}
+	}
+}
+
 func TestMPEG2VideoEncoderCodesACAndStaysWithinFrameBudget(t *testing.T) {
 	profile, err := ExportProfile(Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9})
 	if err != nil {

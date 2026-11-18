@@ -812,10 +812,7 @@ func quantizeMPEG2ResidualMacroblock(macroblock mpeg2PredictiveMacroblock, quant
 		for scanPosition := range coefficientLimit {
 			coefficientIndex := mpeg2ZigZag[scanPosition]
 			value := block.coeff[coefficientIndex]
-			magnitude := min(int(math.Floor((math.Abs(value)/float64(quantizer)+1)/2)), 2047)
-			if value < 0 {
-				magnitude = -magnitude
-			}
+			magnitude := quantizeMPEG2NonIntraCoefficient(value, quantizer)
 			levels[blockIndex][coefficientIndex] = magnitude
 			if magnitude != 0 {
 				pattern |= 1 << (5 - blockIndex)
@@ -823,6 +820,14 @@ func quantizeMPEG2ResidualMacroblock(macroblock mpeg2PredictiveMacroblock, quant
 		}
 	}
 	return levels, pattern
+}
+
+func quantizeMPEG2NonIntraCoefficient(value float64, quantizer int) int {
+	level := min(int(math.Floor(math.Abs(value)/float64(quantizer)+0.5)), 2047)
+	if value < 0 {
+		return -level
+	}
+	return level
 }
 
 func writeMPEG2CodedBlockPattern(bits *mpeg2BitWriter, pattern uint8) {

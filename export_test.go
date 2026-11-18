@@ -55,6 +55,9 @@ func ExportMPEG2InverseIntraAC(level, weight, quantizer int) int {
 func ExportMPEG2InverseNonIntra(level, quantizer int) int {
 	return inverseMPEG2NonIntraCoefficient(level, quantizer)
 }
+func ExportMPEG2QuantizeNonIntra(value float64, quantizer int) int {
+	return quantizeMPEG2NonIntraCoefficient(value, quantizer)
+}
 func ExportMPEG2IntraPicture(e *MPEG2VideoEncoder, f DecodedVideoFrame, blocks []mpeg2IntraBlock, w, h, q int, ac bool) []byte {
 	return e.encodeIntraPicture(f, blocks, w, h, q, ac)
 }
