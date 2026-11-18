@@ -3,12 +3,10 @@ pre-commit:
   commands:
     go-lint:
       run: |
-        pkgs=$(go list ./... | grep -vE '(^|/)(gen)($|/)')
-        staticcheck $pkgs
+        staticcheck ./...
     go-modernize:
       run: |
-        pkgs=$(go list ./... | grep -vE '(^|/)(gen)($|/)')
-        modernize -errorsastype=false $pkgs
+        modernize -errorsastype=false ./...
     go-mod:
       run: go mod tidy -diff
     go-mod-verify:
