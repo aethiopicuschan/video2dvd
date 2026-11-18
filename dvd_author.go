@@ -328,7 +328,7 @@ func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobS
 	binary.BigEndian.PutUint32(cell[8:12], records[0].StartSector)
 	binary.BigEndian.PutUint32(cell[16:20], records[len(records)-1].StartSector)
 	binary.BigEndian.PutUint32(cell[20:24], vobSectors-1)
-	position := pgc[headerSize+programMapSize+cellPlaybackSize:]
+	position := pgc[headerSize+commandTableSize+programMapSize+cellPlaybackSize:]
 	binary.BigEndian.PutUint16(position[0:2], 1)
 	position[3] = 1
 	return pgc

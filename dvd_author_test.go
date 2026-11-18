@@ -97,6 +97,14 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	if pgc[2] != 1 || pgc[3] != 1 || pgc[0x0c] != 0x80 {
 		t.Fatalf("PGC program/cell/audio controls are invalid: % x", pgc[:0x1c])
 	}
+	cellPlaybackOffset := int(binary.BigEndian.Uint16(pgc[0x00e8:0x00ea]))
+	cellPositionOffset := int(binary.BigEndian.Uint16(pgc[0x00ea:0x00ec]))
+	if got := binary.BigEndian.Uint32(pgc[cellPlaybackOffset+8 : cellPlaybackOffset+12]); got != 0 {
+		t.Fatalf("title cell starts at VOB sector %d, want sector 0", got)
+	}
+	if got := binary.BigEndian.Uint16(pgc[cellPositionOffset : cellPositionOffset+2]); got != 1 || pgc[cellPositionOffset+3] != 1 {
+		t.Fatalf("title cell position is VOB %d/cell %d, want VOB 1/cell 1", got, pgc[cellPositionOffset+3])
+	}
 	cadt := firstIFO[3*DVDVOBSectorSize:]
 	if binary.BigEndian.Uint16(cadt[0:2]) != 1 || binary.BigEndian.Uint32(cadt[16:20]) != firstVOBSectors-1 {
 		t.Fatal("cell address table does not cover the title VOB")
