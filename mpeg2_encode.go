@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"runtime"
+	"sync"
 )
 
 const (
@@ -320,7 +322,7 @@ type mpeg2PredictiveMacroblock struct {
 
 func analyzeMPEG2PredictiveMacroblocks(frame, reference DecodedVideoFrame, mbWidth, mbHeight int) []mpeg2PredictiveMacroblock {
 	macroblocks := make([]mpeg2PredictiveMacroblock, mbWidth*mbHeight)
-	for row := range mbHeight {
+	parallelMPEG2Rows(mbHeight, func(row int) {
 		for column := range mbWidth {
 			motionX, motionY := estimateMPEG2Motion(frame, reference, column*16, row*16)
 			macroblock := &macroblocks[row*mbWidth+column]
@@ -341,8 +343,31 @@ func analyzeMPEG2PredictiveMacroblocks(frame, reference DecodedVideoFrame, mbWid
 				frame.V, reference.V, frame.Width/2, column*8, row*8, 8, 8, chromaMotionX, chromaMotionY,
 			)
 		}
-	}
+	})
 	return macroblocks
+}
+
+func parallelMPEG2Rows(rows int, process func(int)) {
+	workers := min(runtime.GOMAXPROCS(0), rows)
+	if workers <= 1 {
+		for row := range rows {
+			process(row)
+		}
+		return
+	}
+	var wait sync.WaitGroup
+	wait.Add(workers)
+	for worker := range workers {
+		start := rows * worker / workers
+		end := rows * (worker + 1) / workers
+		go func() {
+			defer wait.Done()
+			for row := start; row < end; row++ {
+				process(row)
+			}
+		}()
+	}
+	wait.Wait()
 }
 
 func estimateMPEG2Motion(frame, reference DecodedVideoFrame, x, y int) (int, int) {
@@ -545,7 +570,7 @@ func reconstructMPEG2IntraBlock(block mpeg2IntraBlock, quantizer int, includeAC 
 
 func reconstructMPEG2PredictiveFrame(frame, reference DecodedVideoFrame, macroblocks []mpeg2PredictiveMacroblock, mbWidth, mbHeight, quantizer int, includeAC bool) DecodedVideoFrame {
 	reconstructed := newMPEG2FrameLike(frame)
-	for row := range mbHeight {
+	parallelMPEG2Rows(mbHeight, func(row int) {
 		for column := range mbWidth {
 			macroblock := macroblocks[row*mbWidth+column]
 			levels, codedPattern := quantizeMPEG2ResidualMacroblock(macroblock, quantizer, includeAC)
@@ -587,7 +612,7 @@ func reconstructMPEG2PredictiveFrame(frame, reference DecodedVideoFrame, macrobl
 				copyMPEG2Block(plane.target, frame.Width/2, column*8, row*8, pixels)
 			}
 		}
-	}
+	})
 	return reconstructed
 }
 

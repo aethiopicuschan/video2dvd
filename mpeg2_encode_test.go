@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"reflect"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -190,6 +192,39 @@ func TestMPEG2VideoEncoderUsesPredictivePicturesForUnchangedMacroblocks(t *testi
 	}
 	if sizes[2] <= sizes[1] {
 		t.Fatalf("P picture with a changed macroblock size %d should exceed unchanged P picture size %d", sizes[2], sizes[1])
+	}
+}
+
+func TestMPEG2PredictiveProcessingIsDeterministicAcrossWorkerCounts(t *testing.T) {
+	frame := DecodedVideoFrame{Width: 64, Height: 64}
+	frame.Y = make([]byte, frame.Width*frame.Height)
+	frame.U = make([]byte, frame.Width*frame.Height/4)
+	frame.V = make([]byte, frame.Width*frame.Height/4)
+	reference := cloneDecodedVideoFrame(frame)
+	for y := range frame.Height {
+		for x := range frame.Width {
+			frame.Y[y*frame.Width+x] = byte((x*11 + y*7) % 220)
+			reference.Y[y*frame.Width+x] = byte((x*9 + y*5) % 220)
+		}
+	}
+	for i := range frame.U {
+		frame.U[i], frame.V[i] = byte((i*3)%224), byte((i*5)%224)
+		reference.U[i], reference.V[i] = byte((i*7)%224), byte((i*11)%224)
+	}
+
+	previous := runtime.GOMAXPROCS(1)
+	serial := analyzeMPEG2PredictiveMacroblocks(frame, reference, 4, 4)
+	serialReconstruction := reconstructMPEG2PredictiveFrame(frame, reference, serial, 4, 4, 8, true)
+	runtime.GOMAXPROCS(max(2, previous))
+	defer runtime.GOMAXPROCS(previous)
+	parallel := analyzeMPEG2PredictiveMacroblocks(frame, reference, 4, 4)
+	parallelReconstruction := reconstructMPEG2PredictiveFrame(frame, reference, parallel, 4, 4, 8, true)
+
+	if !reflect.DeepEqual(parallel, serial) {
+		t.Fatal("parallel macroblock analysis differs from serial analysis")
+	}
+	if !reflect.DeepEqual(parallelReconstruction, serialReconstruction) {
+		t.Fatal("parallel reconstruction differs from serial reconstruction")
 	}
 }
 
