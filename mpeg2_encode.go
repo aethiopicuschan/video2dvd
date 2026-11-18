@@ -426,12 +426,79 @@ func sameMPEG2LumaMacroblock(first, second DecodedVideoFrame, x, y int) bool {
 }
 
 func mpeg2MotionCost(frame, reference DecodedVideoFrame, x, y, motionX, motionY int, limit int64) int64 {
+	integerX, fractionX := halfMotionParts(motionX)
+	integerY, fractionY := halfMotionParts(motionY)
+	left, top := x+integerX, y+integerY
+	switch {
+	case fractionX == 0 && fractionY == 0:
+		return mpeg2IntegerMotionCost(frame.Y, reference.Y, frame.Width, x, y, left, top, limit)
+	case fractionX != 0 && fractionY == 0:
+		return mpeg2HorizontalHalfMotionCost(frame.Y, reference.Y, frame.Width, x, y, left, top, limit)
+	case fractionX == 0 && fractionY != 0:
+		return mpeg2VerticalHalfMotionCost(frame.Y, reference.Y, frame.Width, x, y, left, top, limit)
+	default:
+		return mpeg2DiagonalHalfMotionCost(frame.Y, reference.Y, frame.Width, x, y, left, top, limit)
+	}
+}
+
+func mpeg2IntegerMotionCost(current, reference []byte, stride, x, y, left, top int, limit int64) int64 {
 	var cost int64
 	for row := range 16 {
+		currentRow := (y+row)*stride + x
+		referenceRow := (top+row)*stride + left
 		for column := range 16 {
-			actual := int(frame.Y[(y+row)*frame.Width+x+column])
-			predicted := int(mpeg2MotionSample(reference.Y, reference.Width, x+column, y+row, motionX, motionY))
-			cost += int64(absInt(actual - predicted))
+			cost += int64(absInt(int(current[currentRow+column]) - int(reference[referenceRow+column])))
+			if cost > limit {
+				return cost
+			}
+		}
+	}
+	return cost
+}
+
+func mpeg2HorizontalHalfMotionCost(current, reference []byte, stride, x, y, left, top int, limit int64) int64 {
+	var cost int64
+	for row := range 16 {
+		currentRow := (y+row)*stride + x
+		referenceRow := (top+row)*stride + left
+		for column := range 16 {
+			predicted := (int(reference[referenceRow+column]) + int(reference[referenceRow+column+1])) / 2
+			cost += int64(absInt(int(current[currentRow+column]) - predicted))
+			if cost > limit {
+				return cost
+			}
+		}
+	}
+	return cost
+}
+
+func mpeg2VerticalHalfMotionCost(current, reference []byte, stride, x, y, left, top int, limit int64) int64 {
+	var cost int64
+	for row := range 16 {
+		currentRow := (y+row)*stride + x
+		referenceRow := (top+row)*stride + left
+		nextReferenceRow := referenceRow + stride
+		for column := range 16 {
+			predicted := (int(reference[referenceRow+column]) + int(reference[nextReferenceRow+column])) / 2
+			cost += int64(absInt(int(current[currentRow+column]) - predicted))
+			if cost > limit {
+				return cost
+			}
+		}
+	}
+	return cost
+}
+
+func mpeg2DiagonalHalfMotionCost(current, reference []byte, stride, x, y, left, top int, limit int64) int64 {
+	var cost int64
+	for row := range 16 {
+		currentRow := (y+row)*stride + x
+		referenceRow := (top+row)*stride + left
+		nextReferenceRow := referenceRow + stride
+		for column := range 16 {
+			predicted := (int(reference[referenceRow+column]) + int(reference[referenceRow+column+1]) +
+				int(reference[nextReferenceRow+column]) + int(reference[nextReferenceRow+column+1])) / 4
+			cost += int64(absInt(int(current[currentRow+column]) - predicted))
 			if cost > limit {
 				return cost
 			}
@@ -1028,9 +1095,14 @@ type mpeg2BitWriter struct {
 }
 
 func (w *mpeg2BitWriter) write(value uint64, width int) {
-	for bit := width - 1; bit >= 0; bit-- {
-		w.current = w.current<<1 | byte((value>>bit)&1)
-		w.used++
+	for width > 0 {
+		available := 8 - int(w.used)
+		take := min(width, available)
+		shift := width - take
+		mask := uint64(1<<take) - 1
+		w.current = w.current<<take | byte((value>>shift)&mask)
+		w.used += uint8(take)
+		width -= take
 		if w.used == 8 {
 			w.data = append(w.data, w.current)
 			w.current, w.used = 0, 0
