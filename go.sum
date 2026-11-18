@@ -1,5 +1,7 @@
 github.com/aethiopicuschan/go-vp9 v0.0.0-20261115145045-c2b2817f7f83 h1:zP7VNC7rYHB7TeVnUz2UtV/LeczqtcX73l8Ltm0vbQY=
 github.com/aethiopicuschan/go-vp9 v0.0.0-20261115145045-c2b2817f7f83/go.mod h1:00alyc82DTPTC8zwGk9kM2u1r8FP/WSiFWXdWAMbP7s=
+github.com/arabian9ts/aac-go v0.1.0 h1:e298pHWu+Xcv6VPU2hmS1UTmOq5C9KHD38eQcJR4K8c=
+github.com/arabian9ts/aac-go v0.1.0/go.mod h1:nQwjBOjeee+zm6JSmEd9yk1uUoyYFrvhJXYnWDsNXpU=
 github.com/deploymenttheory/go-sdk-winmediafoundry v0.8.0 h1:WzDwjZY/Vz3VCJBJ5kjonavRWmyEukgr3QRl56L6lLQ=
 github.com/deploymenttheory/go-sdk-winmediafoundry v0.8.0/go.mod h1:j6ONF9OAZUEPOA4bHc64tdhJbkNJv4G4/wOja3w4tUs=
 github.com/rcarmo/go-264 v0.0.0-20260913215118-afd03f5c69ed h1:pyW5AHeXClSDg7tw3Jd4TMLC4yGmW7tpQsMD7RtGpck=

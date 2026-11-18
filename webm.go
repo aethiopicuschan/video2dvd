@@ -20,7 +20,6 @@ import (
 	"github.com/thesyncim/goav/bundle"
 	"github.com/thesyncim/goav/component"
 	"github.com/thesyncim/goav/container/webm"
-	"github.com/thesyncim/govpx"
 )
 
 const (
@@ -192,9 +191,9 @@ func PrepareWebMAudioForDVD(ctx context.Context, path string, trackIndex *int, d
 }
 
 // DecodeWebMVideo sends owned 8-bit YUV 4:2:0 frames from a WebM video track
-// to handler. VP9 Profile 0 uses govpx; Profile 2 uses go-vp9 because govpx
-// currently supports Profile 0 only. VP8/AV1 use the bundled pure-Go media
-// pipeline.
+// to handler. VP9 Profile 0 and Profile 2 use the stateful go-vp9 decoder so
+// reference frames, hidden frames, superframes, and resolution changes are
+// processed consistently. VP8/AV1 use the bundled pure-Go media pipeline.
 func DecodeWebMVideo(ctx context.Context, path string, trackIndex *int, handler func(DecodedVideoFrame) error) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -207,6 +206,9 @@ func DecodeWebMVideo(ctx context.Context, path string, trackIndex *int, handler 
 	}()
 	if ctx == nil {
 		return errors.New("video2dvd: context must not be nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if handler == nil {
 		return errors.New("video2dvd: video frame handler is required")
@@ -348,11 +350,7 @@ func decodeWebMVP9(ctx context.Context, path string, track TrackInfo, handler fu
 		return fmt.Errorf("video2dvd: WebM track %d is not VP9 video", track.Index)
 	}
 	trackID := tracks[track.Index].ID
-	profile0Decoder, err := govpx.NewVP9Decoder(govpx.VP9DecoderOptions{})
-	if err != nil {
-		return fmt.Errorf("video2dvd: create VP9 Profile 0 decoder: %w", err)
-	}
-	defer profile0Decoder.Close()
+	profile0Decoder := vp9decoder.New()
 	profile2Decoder := vp9decoder.New()
 	resolver := newWebMFrameDurationResolver(track.DefaultDuration, handler)
 	packet := webm.Packet{Data: make([]byte, 0, maxWebMPacketBytes)}
@@ -389,27 +387,25 @@ func decodeWebMVP9(ctx context.Context, path string, track TrackInfo, handler fu
 			if err != nil {
 				return err
 			}
-			decodedVisible = true
+			decodedVisible = header.ShowFrame || header.ShowExistingFrame || hasVP9Superframe(packet.Data)
 		} else if header.Profile == 0 {
-			if err := profile0Decoder.Decode(packet.Data); err != nil {
+			frame, err := profile0Decoder.DecodeFrame(packet.Data)
+			if err != nil {
 				return fmt.Errorf("video2dvd: decode VP9 Profile 0: %w", err)
 			}
-			if frame, ok := profile0Decoder.NextFrame(); ok {
-				decoded, err = copyGovpxFrame(frame, time.Duration(packet.TimeNS), time.Duration(packet.DurationNS))
+			if frame != nil {
+				decoded, err = copyVP9Frame(frame, time.Duration(packet.TimeNS), time.Duration(packet.DurationNS))
 				if err != nil {
 					return err
 				}
-				decodedVisible = true
-			} else if info, ok := profile0Decoder.LastFrameInfo(); ok && info.Width > 0 && info.Height > 0 {
-				// Hidden Profile 0 frames still establish the dimensions used by
-				// subsequent inter-frame headers, even though they produce no
-				// displayable image for the resolver.
-				previousWidth, previousHeight = info.Width, info.Height
+				decodedVisible = header.ShowFrame || header.ShowExistingFrame || hasVP9Superframe(packet.Data)
 			}
 		} else {
 			return fmt.Errorf("video2dvd: VP9 profile %d is unsupported; supported profiles are 0 and 2 4:2:0", header.Profile)
 		}
-		if decodedVisible {
+		if header.FrameWidth > 0 && header.FrameHeight > 0 {
+			previousWidth, previousHeight = header.FrameWidth, header.FrameHeight
+		} else if decodedVisible {
 			previousWidth, previousHeight = decoded.Width, decoded.Height
 		}
 		if !decodedVisible && (packet.Invisible || (!header.ShowFrame && !header.ShowExistingFrame)) {
@@ -435,18 +431,18 @@ func decodeWebMVP9(ctx context.Context, path string, track TrackInfo, handler fu
 	return ctx.Err()
 }
 
-func copyGovpxFrame(src govpx.Image, pts, duration time.Duration) (DecodedVideoFrame, error) {
-	if src.Width <= 0 || src.Height <= 0 || src.Width%2 != 0 || src.Height%2 != 0 || src.YStride < src.Width || src.UStride < src.Width/2 || src.VStride < src.Width/2 {
-		return DecodedVideoFrame{}, errors.New("video2dvd: govpx VP9 decoder returned invalid I420 dimensions")
+func copyVP9Frame(src *refbuf.Frame, pts, duration time.Duration) (DecodedVideoFrame, error) {
+	if src == nil || src.Width <= 0 || src.Height <= 0 || src.Width%2 != 0 || src.Height%2 != 0 || src.YStride < src.Width || src.UVStride < src.Width/2 {
+		return DecodedVideoFrame{}, errors.New("video2dvd: VP9 decoder returned invalid I420 dimensions")
 	}
 	decoded := DecodedVideoFrame{PTS: pts, Duration: duration, Width: src.Width, Height: src.Height, Y: make([]byte, src.Width*src.Height), U: make([]byte, src.Width*src.Height/4), V: make([]byte, src.Width*src.Height/4)}
-	if err := copyPlaneFromOffset(decoded.Y, src.Y, 0, src.Width, src.Height, src.YStride); err != nil {
+	if err := copyPlaneFromOffset(decoded.Y, src.Y, src.YBase(), src.Width, src.Height, src.YStride); err != nil {
 		return DecodedVideoFrame{}, err
 	}
-	if err := copyPlaneFromOffset(decoded.U, src.U, 0, src.Width/2, src.Height/2, src.UStride); err != nil {
+	if err := copyPlaneFromOffset(decoded.U, src.U, src.UBase(), src.Width/2, src.Height/2, src.UVStride); err != nil {
 		return DecodedVideoFrame{}, err
 	}
-	if err := copyPlaneFromOffset(decoded.V, src.V, 0, src.Width/2, src.Height/2, src.VStride); err != nil {
+	if err := copyPlaneFromOffset(decoded.V, src.V, src.VBase(), src.Width/2, src.Height/2, src.UVStride); err != nil {
 		return DecodedVideoFrame{}, err
 	}
 	return decoded, nil

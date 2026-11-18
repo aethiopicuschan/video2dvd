@@ -4,6 +4,7 @@ go 1.27.4
 
 require (
 	github.com/aethiopicuschan/go-vp9 v0.0.0-20261115145045-c2b2817f7f83
+	github.com/arabian9ts/aac-go v0.1.0
 	github.com/deploymenttheory/go-sdk-winmediafoundry v0.8.0
 	github.com/rcarmo/go-264 v0.0.0-20260913215118-afd03f5c69ed
 	github.com/thesyncim/goav v0.0.0-20261021065620-74e15627cd11

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	pcmdecoder "github.com/rcarmo/go-264/audio"
@@ -147,7 +148,36 @@ func DecodeMP4Video(ctx context.Context, path string, trackIndex *int, handler f
 // DecodeMP4Audio decodes an AAC-LC or AC-3 MP4 audio track to 48 kHz stereo
 // S16 PCM. trackIndex selects the zero-based trak; nil selects a supported
 // track. Audio payloads and edit-list timing are validated by the decoder.
-func DecodeMP4Audio(ctx context.Context, path string, trackIndex *int, handler func(PCMChunk) error) error {
+func DecodeMP4Audio(ctx context.Context, path string, trackIndex *int, handler func(PCMChunk) error) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if ctx != nil && ctx.Err() != nil {
+				err = ctx.Err()
+				return
+			}
+			err = fmt.Errorf("video2dvd: decode MP4 audio %q panicked: %v", path, recovered)
+		}
+	}()
+	if handler == nil {
+		return errors.New("video2dvd: PCM handler is required")
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	var delivered bool
+	err = decodeMP4AudioPrimary(ctx, path, trackIndex, func(chunk PCMChunk) error {
+		delivered = true
+		return handler(chunk)
+	})
+	if err == nil || delivered || !strings.Contains(err.Error(), "non-zero alignment padding") {
+		return err
+	}
+	return decodeMP4AACFallback(ctx, path, trackIndex, handler)
+}
+
+func decodeMP4AudioPrimary(ctx context.Context, path string, trackIndex *int, handler func(PCMChunk) error) error {
 	if ctx == nil {
 		return errors.New("video2dvd: context must not be nil")
 	}

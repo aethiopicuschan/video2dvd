@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	vp9decoder "github.com/aethiopicuschan/go-vp9/decoder"
 	"github.com/thesyncim/govpx"
 )
 
@@ -37,20 +38,16 @@ func TestCopyGovpxFrameFromProfile0Decoder(t *testing.T) {
 		t.Fatalf("encode Profile 0 frame returned %d bytes", n)
 	}
 
-	decoder, err := govpx.NewVP9Decoder(govpx.VP9DecoderOptions{})
+	decoder := vp9decoder.New()
+	frame, err := decoder.DecodeFrame(packet[:n])
 	if err != nil {
-		t.Fatalf("create Profile 0 decoder: %v", err)
-	}
-	defer decoder.Close()
-	if err := decoder.Decode(packet[:n]); err != nil {
 		t.Fatalf("decode Profile 0 frame: %v", err)
 	}
-	frame, ok := decoder.NextFrame()
-	if !ok {
-		t.Fatal("Profile 0 decoder produced no visible frame")
+	if frame == nil {
+		t.Fatal("Profile 0 decoder produced no frame")
 	}
 
-	got, err := copyGovpxFrame(frame, 7*time.Millisecond, 33*time.Millisecond)
+	got, err := copyVP9Frame(frame, 7*time.Millisecond, 33*time.Millisecond)
 	if err != nil {
 		t.Fatalf("copy govpx frame: %v", err)
 	}

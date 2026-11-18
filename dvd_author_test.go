@@ -121,6 +121,14 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	if secondVOBU := binary.BigEndian.Uint32(admap[8:12]); secondVOBU == 0 || secondVOBU >= firstVOBSectors {
 		t.Fatalf("second VOBU sector = %d, outside the VOB", secondVOBU)
 	}
+
+	isoPath := filepath.Join(t.TempDir(), "authored.iso")
+	if err := WriteDVDISO(context.Background(), videoTS, isoPath); err != nil {
+		t.Fatalf("write ISO for titled DVD with a menu VOB: %v", err)
+	}
+	if info, err := os.Stat(isoPath); err != nil || info.Size() == 0 {
+		t.Fatalf("authored ISO is missing or empty: info=%v err=%v", info, err)
+	}
 }
 
 func TestDVDMenuPGCIContainsPagePGCs(t *testing.T) {

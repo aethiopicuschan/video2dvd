@@ -205,7 +205,8 @@ func inspectDVDImageSource(videoTS string) ([]dvdImageFile, int, error) {
 			dvdImageFile{name: fmt.Sprintf("VTS_%02d_0.IFO", i), fakeName: fmt.Sprintf("VTS_%02d_0.AAA", i)},
 			dvdImageFile{name: fmt.Sprintf("VTS_%02d_0.VOB", i), fakeName: fmt.Sprintf("VTS_%02d_0.MMM", i)},
 			dvdImageFile{name: fmt.Sprintf("VTS_%02d_1.VOB", i), fakeName: fmt.Sprintf("VTS_%02d_1.MMM", i)},
-			dvdImageFile{name: fmt.Sprintf("VTS_%02d_0.BUP", i), fakeName: fmt.Sprintf("VTS_%02d_0.ZZZ", i)},
+			// Keep the VTS BUP after both VOBs in the UDF file allocation order.
+			dvdImageFile{name: fmt.Sprintf("VTS_%02d_0.BUP", i), fakeName: fmt.Sprintf("VTS_%02d_2.ZZZ", i)},
 		)
 	}
 	if len(entries) != len(expected) {
