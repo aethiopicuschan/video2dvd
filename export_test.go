@@ -35,6 +35,9 @@ var (
 )
 
 func ExportProfile(options Options) (Profile, error) { return options.profile() }
+func ExportMakeDVDMenuButtons(start, end int, profile Profile, page, pageCount, titleLaunchBase int) []DVDNAVButton {
+	return makeDVDMenuButtons(start, end, profile, page, pageCount, titleLaunchBase)
+}
 func ExportAACSource(file *os.File, info pcm.Info, priming, leading int64) *aacPCMFileSource {
 	return &aacPCMFileSource{file: file, info: info, priming: priming, leading: leading}
 }

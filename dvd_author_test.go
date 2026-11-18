@@ -26,13 +26,36 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	if len(vmg)%DVDVOBSectorSize != 0 || string(vmg[:12]) != "DVDVIDEO-VMG" {
 		t.Fatalf("VMGI header/size invalid: %q, %d bytes", vmg[:12], len(vmg))
 	}
+	if got := binary.BigEndian.Uint16(vmg[0x0026:0x0028]); got != 1 {
+		t.Fatalf("VMGI volume count = %d, want 1", got)
+	}
+	if got := binary.BigEndian.Uint16(vmg[0x0028:0x002a]); got != 1 {
+		t.Fatalf("VMGI volume number = %d, want 1", got)
+	}
+	if got := vmg[0x002a]; got != 1 {
+		t.Fatalf("VMGI disc side = %d, want 1", got)
+	}
+	if !bytes.Equal(vmg[0x002b:0x003e], make([]byte, 0x13)) {
+		t.Fatalf("VMGI reserved bytes are not zero: % x", vmg[0x002b:0x003e])
+	}
+	if got, want := binary.BigEndian.Uint32(vmg[0x0080:0x0084]), uint32(len(vmg)-1); got != want {
+		t.Fatalf("VMGI last byte = %#x, want %#x", got, want)
+	}
 	firstPlayOffset := int(binary.BigEndian.Uint32(vmg[0x0084:0x0088]))
+	if firstPlayOffset >= int(binary.BigEndian.Uint32(vmg[0x0080:0x0084])) {
+		t.Fatalf("first-play PGC offset %#x is beyond VMGI last byte", firstPlayOffset)
+	}
 	firstPlay := vmg[firstPlayOffset:]
 	if firstPlay[2] != 0 || firstPlay[3] != 0 || binary.BigEndian.Uint16(firstPlay[0x00e4:0x00e6]) != 0x00ec {
 		t.Fatal("first-play PGC does not contain an isolated command-only chain")
 	}
-	if binary.BigEndian.Uint16(firstPlay[0x00ec:0x00ee]) != 1 || !bytes.Equal(firstPlay[0x00f4:0x00fc], []byte{0x30, 0x06, 0, 0, 0, 0x42, 0, 0}) {
-		t.Fatal("first-play PGC does not jump to the VMG menu")
+	if binary.BigEndian.Uint16(firstPlay[0x00ec:0x00ee]) != 2 ||
+		!bytes.Equal(firstPlay[0x00f4:0x00fc], []byte{0x71, 0, 0, 1, 0, 0, 0, 0}) ||
+		!bytes.Equal(firstPlay[0x00fc:0x0104], []byte{0x30, 0x06, 0, 0, 0, 0x42, 0, 0}) {
+		t.Fatal("first-play PGC does not initialize navigation state and jump to the VMG menu")
+	}
+	if got := binary.BigEndian.Uint16(firstPlay[0x00f2:0x00f4]); got != 23 {
+		t.Fatalf("first-play command table last byte = %d, want 23", got)
 	}
 	vmgSectors := uint32(len(vmg) / DVDVOBSectorSize)
 	vmgMenuCadtSector := binary.BigEndian.Uint32(vmg[0x00d8:0x00dc])
@@ -58,6 +81,27 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	tt := vmg[DVDVOBSectorSize:]
 	if got := binary.BigEndian.Uint16(tt[0:2]); got != 2 {
 		t.Fatalf("VMG title count = %d, want 2", got)
+	}
+	vmgMenuTable := vmg[int(binary.BigEndian.Uint32(vmg[0x00c8:0x00cc]))*DVDVOBSectorSize:]
+	menuUnitOffset := int(binary.BigEndian.Uint32(vmgMenuTable[12:16]))
+	menuUnit := vmgMenuTable[menuUnitOffset:]
+	if got := binary.BigEndian.Uint16(menuUnit[0:2]); got != 6 {
+		t.Fatalf("VMG menu PGCI PGC count = %d, want 6 (menu, PLAY ALL, two launchers, two continuations)", got)
+	}
+	for pgcIndex, want := range []byte{0x82, 0, 0, 0, 0, 0} {
+		entry := 8 + pgcIndex*8
+		if got := menuUnit[entry]; got != want {
+			t.Fatalf("VMG menu PGC %d entry ID = %#x, want %#x", pgcIndex+1, got, want)
+		}
+	}
+	advanceEntry := 8 + 4*8
+	advanceOffset := int(binary.BigEndian.Uint32(menuUnit[advanceEntry+4 : advanceEntry+8]))
+	advancePGC := menuUnit[advanceOffset:]
+	if got := binary.BigEndian.Uint16(advancePGC[0xec:0x00ee]); got != 1 {
+		t.Fatalf("title continuation PGC pre-command count = %d, want 1", got)
+	}
+	if !bytes.Equal(advancePGC[0xf4:0xfc], []byte{0x30, 0x02, 0, 0, 0, 2, 0, 0}) {
+		t.Fatalf("title continuation does not jump to title 2: % x", advancePGC[0xf4:0xfc])
 	}
 	firstVTSStart := binary.BigEndian.Uint32(tt[8+8 : 8+12])
 	secondVTSStart := binary.BigEndian.Uint32(tt[8+12+8 : 8+12+12])
@@ -86,6 +130,9 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	if string(firstIFO[:12]) != "DVDVIDEO-VTS" {
 		t.Fatalf("VTSI signature = %q", firstIFO[:12])
 	}
+	if got, want := binary.BigEndian.Uint32(firstIFO[0x0080:0x0084]), uint32(len(firstIFO)-1); got != want {
+		t.Fatalf("VTSI last byte = %#x, want %#x", got, want)
+	}
 	if got := binary.BigEndian.Uint32(firstIFO[0x00C4:0x00C8]); got != firstIFOSectors+menuSectors {
 		t.Fatalf("title VOB starts at sector %d, want %d", got, firstIFOSectors+menuSectors)
 	}
@@ -99,6 +146,9 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	}
 	vtsAtrt := vmg[2*DVDVOBSectorSize:]
 	atrEntry := int(binary.BigEndian.Uint32(vtsAtrt[8:12]))
+	if got := binary.BigEndian.Uint32(vtsAtrt[atrEntry : atrEntry+4]); got != 775 {
+		t.Fatalf("VMG VTS attribute record last byte = %d, want 775", got)
+	}
 	if !bytes.Equal(vtsAtrt[atrEntry+8:atrEntry+8+0x300], firstIFO[0x100:0x400]) {
 		t.Fatal("VMG VTS_ATRT attributes do not mirror the VTS IFO attributes")
 	}
@@ -126,6 +176,16 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	pgc := pgci[16:]
 	if pgc[2] != 1 || pgc[3] != 1 || pgc[0x0c] != 0x80 {
 		t.Fatalf("PGC program/cell/audio controls are invalid: % x", pgc[:0x1c])
+	}
+	if got := binary.BigEndian.Uint16(pgc[0x00ec+2 : 0x00ec+4]); got != 2 {
+		t.Fatalf("first title post-command count = %d, want 2", got)
+	}
+	if got := binary.BigEndian.Uint16(pgc[0x00ec+6 : 0x00ec+8]); got != 23 {
+		t.Fatalf("title PGC command table last byte = %d, want 23", got)
+	}
+	if !bytes.Equal(pgc[0xf4:0x00fc], []byte{0x30, 0x38, 0, 5, 0, 0xc0, 0, 1}) ||
+		!bytes.Equal(pgc[0x00fc:0x0104], []byte{0x30, 0x08, 0, 0, 0, 0x42, 0, 0}) {
+		t.Fatalf("first title post-commands are not a conditional continuation followed by a VMG menu call: % x", pgc[0xf4:0x0104])
 	}
 	cellPlaybackOffset := int(binary.BigEndian.Uint16(pgc[0x00e8:0x00ea]))
 	cellPositionOffset := int(binary.BigEndian.Uint16(pgc[0x00ea:0x00ec]))
@@ -180,12 +240,42 @@ func TestDVDMenuPGCIContainsPagePGCs(t *testing.T) {
 	unit := menu[16:]
 	for page := range 2 {
 		searchEntry := 8 + page*8
+		wantEntryID := byte(0)
+		if page == 0 {
+			wantEntryID = 0x82
+		}
+		if got := unit[searchEntry]; got != wantEntryID {
+			t.Fatalf("menu page %d entry ID = %#x, want %#x", page+1, got, wantEntryID)
+		}
+		if !bytes.Equal(unit[searchEntry+1:searchEntry+4], []byte{0, 0, 0}) {
+			t.Fatalf("menu page %d reserved search bytes are nonzero: % x", page+1, unit[searchEntry+1:searchEntry+4])
+		}
 		pgcOffset := int(binary.BigEndian.Uint32(unit[searchEntry+4 : searchEntry+8]))
 		pgc := unit[pgcOffset:]
+		if got := binary.BigEndian.Uint16(pgc[0xec+6 : 0xec+8]); got != 23 {
+			t.Fatalf("menu page %d command table last byte = %d, want 23", page+1, got)
+		}
 		positionOffset := int(binary.BigEndian.Uint16(pgc[0x00ea:0x00ec]))
 		if got, want := pgc[positionOffset+3], byte(page+1); got != want {
 			t.Fatalf("menu page %d cell ID = %d, want %d", page+1, got, want)
 		}
+	}
+	if got := unit[8+2*8]; got != 0 {
+		t.Fatalf("PLAY ALL entry ID = %#x, want an internal PGC", got)
+	}
+	playAllOffset := int(binary.BigEndian.Uint32(unit[8+2*8+4 : 8+3*8]))
+	playAll := unit[playAllOffset:]
+	if got := binary.BigEndian.Uint16(playAll[0xec+6 : 0xec+8]); got != 23 {
+		t.Fatalf("PLAY ALL command table last byte = %d, want 23", got)
+	}
+	vtsMenu := ExportBuildDVDVMGMenuPGCI(20, [4]byte{0, 0, 1, 0xc0}, []TestDVDVOBURecord{
+		{StartSector: 0, EndSector: 9},
+	}, 2, 1)
+	vtsUnit := vtsMenu[16:]
+	vtsPlayAllOffset := int(binary.BigEndian.Uint32(vtsUnit[8+1*8+4 : 8+2*8]))
+	vtsPlayAll := vtsUnit[vtsPlayAllOffset:]
+	if got := vtsPlayAll[0xfc+1]; got != 0x03 {
+		t.Fatalf("VTS menu PLAY ALL does not use JumpVTS_TT: opcode byte = %#x, want %#x", got, 0x03)
 	}
 }
 

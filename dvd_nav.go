@@ -27,7 +27,10 @@ type DVDNAVPackInfo struct {
 	StartPTM                  uint32
 	EndPTM                    uint32
 	CellElapsedTime           [4]byte
-	Buttons                   []DVDNAVButton
+	// ButtonDisplayType is the DVD highlight group display mask: bit 0 is
+	// widescreen, bit 1 letterbox, and bit 2 pan-and-scan.
+	ButtonDisplayType uint8
+	Buttons           []DVDNAVButton
 }
 
 // DVDNAVButton describes one rectangular menu button. Coordinates use the
@@ -51,6 +54,9 @@ func BuildDVDNAVPack(info DVDNAVPackInfo) ([]byte, error) {
 	if info.SCRBase > maxMPEGTimestamp {
 		return nil, errors.New("video2dvd: DVD NAV SCR exceeds the MPEG 33-bit range")
 	}
+	if info.ButtonDisplayType > 7 {
+		return nil, errors.New("video2dvd: DVD button display type exceeds the three-bit field")
+	}
 	pack := make([]byte, DVDVOBSectorSize)
 	copy(pack, buildMPEG2PackHeader(info.SCRBase, defaultProgramMuxRate/50))
 	systemHeader := buildDVDNAVSystemHeader()
@@ -63,7 +69,7 @@ func BuildDVDNAVPack(info DVDNAVPackInfo) ([]byte, error) {
 	binary.BigEndian.PutUint32(pci[12:16], info.StartPTM)
 	binary.BigEndian.PutUint32(pci[16:20], info.EndPTM)
 	copy(pci[20:24], info.CellElapsedTime[:])
-	if err := writeDVDNAVButtons(pci, info.Buttons); err != nil {
+	if err := writeDVDNAVButtons(pci, info.Buttons, info.ButtonDisplayType); err != nil {
 		return nil, err
 	}
 
@@ -82,7 +88,7 @@ func BuildDVDNAVPack(info DVDNAVPackInfo) ([]byte, error) {
 	return pack, nil
 }
 
-func writeDVDNAVButtons(pci []byte, buttons []DVDNAVButton) error {
+func writeDVDNAVButtons(pci []byte, buttons []DVDNAVButton, displayType uint8) error {
 	if len(buttons) == 0 {
 		return nil
 	}
@@ -90,13 +96,14 @@ func writeDVDNAVButtons(pci []byte, buttons []DVDNAVButton) error {
 		return errors.New("video2dvd: DVD menu supports at most 36 buttons per VOBU")
 	}
 	base := 0x60
-	pci[base+1] = 1       // all-new highlight information.
-	pci[base+0x0e] = 0x40 // one normal button group.
+	pci[base+1] = 1                     // all-new highlight information.
+	pci[base+0x0e] = 0x10 | displayType // one normal button group; reserved bits stay zero.
 	pci[base+0x10] = 1
 	pci[base+0x11] = byte(len(buttons))
 	pci[base+0x12] = byte(len(buttons))
 	pci[base+0x14] = 1
-	pci[base+0x15] = 1
+	// Select the first button initially without forcing its action.
+	pci[base+0x15] = 0
 	// White selection and yellow action emphasis with full contrast.
 	copy(pci[base+0x16:base+0x1e], []byte{0x03, 0x01, 0xff, 0xff, 0x30, 0x10, 0xff, 0xff})
 	for index, button := range buttons {

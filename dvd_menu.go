@@ -27,6 +27,9 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 		return EncodedTitle{}, nil, errors.New("video2dvd: automatically generated menu requires at least one title")
 	}
 	pages := (len(titles) + maxButtons - 1) / maxButtons
+	// PGCs are ordered as menu pages, PLAY ALL, then one title launcher per
+	// title and one PLAY ALL continuation per title.
+	titleLaunchBase := pages + 1
 	videoPath := filepath.Join(workDir, "menu.m2v")
 	videoFile, err := os.Create(videoPath)
 	if err != nil {
@@ -52,7 +55,7 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 			_ = videoFile.Close()
 			return EncodedTitle{}, nil, err
 		}
-		buttonPages = append(buttonPages, makeDVDMenuButtons(start, end, profile, page, pages))
+		buttonPages = append(buttonPages, makeDVDMenuButtons(start, end, profile, page, pages, titleLaunchBase))
 	}
 	if closeErr := videoFile.Close(); closeErr != nil {
 		return EncodedTitle{}, nil, closeErr
@@ -71,7 +74,7 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 	}, buttonPages, ctx.Err()
 }
 
-func makeDVDMenuButtons(start, end int, profile Profile, page, pageCount int) []DVDNAVButton {
+func makeDVDMenuButtons(start, end int, profile Profile, page, pageCount, titleLaunchBase int) []DVDNAVButton {
 	controls := 0
 	if pageCount > 1 {
 		controls = 2
@@ -82,31 +85,18 @@ func makeDVDMenuButtons(start, end int, profile Profile, page, pageCount int) []
 	}
 	buttons := make([]DVDNAVButton, end-start+controls+playAll)
 	if playAll != 0 {
-		buttons[0] = DVDNAVButton{XStart: 48, YStart: 52, XEnd: 300, YEnd: 76, Up: 1, Down: 2, Left: 1, Right: 1, Command: linkPGCNCommand(pageCount)}
+		buttons[0] = DVDNAVButton{XStart: 48, YStart: 52, XEnd: 300, YEnd: 76, Command: linkPGCNCommand(pageCount)}
 	}
 	if controls != 0 {
 		base := playAll
-		buttons[base] = DVDNAVButton{XStart: 48, YStart: 52, XEnd: 300, YEnd: 76, Up: uint8(base + 1), Down: uint8(base + 3), Left: uint8(base + 1), Right: uint8(base + 1), Command: linkPGCNCommand(page)}
-		buttons[base+1] = DVDNAVButton{XStart: 368, YStart: 52, XEnd: 704, YEnd: 76, Up: uint8(base + 2), Down: uint8(base + 4), Left: uint8(base + 2), Right: uint8(base + 2), Command: linkPGCNCommand((page + 1) % pageCount)}
+		buttons[base] = DVDNAVButton{XStart: 48, YStart: 52, XEnd: 300, YEnd: 76, Command: linkPGCNCommand(page)}
+		buttons[base+1] = DVDNAVButton{XStart: 368, YStart: 52, XEnd: 704, YEnd: 76, Command: linkPGCNCommand((page + 1) % pageCount)}
 	}
 	offset := controls + playAll
-	for i := range buttons[offset:] {
+	titleCount := end - start
+	for i := range titleCount {
 		index := i + offset
 		column, row := i/18, i%18
-		up, down := index-1, index+1
-		if row == 0 {
-			up = i + 17
-		}
-		if row == 17 || down >= len(buttons) || down/18 != column {
-			down = index - row
-		}
-		leftIndex, rightIndex := index, index
-		if column == 0 && i+18 < len(buttons)-controls {
-			rightIndex = index + 18
-		}
-		if column == 1 {
-			leftIndex = index - 18
-		}
 		left, right := 48, 672
 		if column == 1 {
 			left, right = 368, 704
@@ -117,9 +107,39 @@ func makeDVDMenuButtons(start, end int, profile Profile, page, pageCount int) []
 		top := 94 + row*20
 		buttons[index] = DVDNAVButton{
 			XStart: left, YStart: top, XEnd: right, YEnd: top + 16,
-			Up: uint8(up + 1), Down: uint8(down + 1),
-			Left: uint8(leftIndex + 1), Right: uint8(rightIndex + 1),
-			Command: dvdJumpTitleCommand(start + i + 1),
+			Command: linkPGCNCommand(titleLaunchBase + start + i),
+		}
+	}
+	if playAll != 0 {
+		target := offset + 1
+		buttons[0].Up, buttons[0].Down = 1, uint8(target)
+		buttons[0].Left, buttons[0].Right = 1, 1
+	}
+	if controls != 0 {
+		prev, next := playAll, playAll+1
+		target := offset + 1
+		buttons[prev].Up, buttons[prev].Down = uint8(prev+1), uint8(target)
+		buttons[prev].Left, buttons[prev].Right = uint8(prev+1), uint8(next+1)
+		buttons[next].Up, buttons[next].Down = uint8(next+1), uint8(target)
+		buttons[next].Left, buttons[next].Right = uint8(prev+1), uint8(next+1)
+	}
+	for i := range titleCount {
+		column, row := i/18, i%18
+		columnStart := column * 18
+		columnCount := min(18, titleCount-columnStart)
+		index := offset + i
+		upRow, downRow := (row+columnCount-1)%columnCount, (row+1)%columnCount
+		buttons[index].Up = uint8(offset + columnStart + upRow + 1)
+		buttons[index].Down = uint8(offset + columnStart + downRow + 1)
+		buttons[index].Left = uint8(index + 1)
+		buttons[index].Right = uint8(index + 1)
+		if column > 0 {
+			leftCount := min(18, titleCount-(column-1)*18)
+			buttons[index].Left = uint8(offset + (column-1)*18 + min(row, leftCount-1) + 1)
+		}
+		if rightStart := (column + 1) * 18; rightStart < titleCount {
+			rightCount := min(18, titleCount-rightStart)
+			buttons[index].Right = uint8(offset + rightStart + min(row, rightCount-1) + 1)
 		}
 	}
 	return buttons
@@ -129,12 +149,24 @@ func dvdJumpTitleCommand(titleNumber int) [8]byte {
 	return [8]byte{0x30, 0x02, 0, 0, 0, byte(titleNumber)}
 }
 
-// dvdConditionalJumpTitleCommand jumps when GPRM0 contains the PLAY ALL flag.
-func dvdConditionalJumpTitleCommand(titleNumber int) [8]byte {
-	return [8]byte{0x30, 0xa2, 0, 0, 0, byte(titleNumber), 0, 1}
+func dvdJumpVTSTitleCommand(titleNumber int) [8]byte {
+	return [8]byte{0x30, 0x03, 0, 0, 0, byte(titleNumber)}
 }
 
-func dvdSetPlayAllCommand() [8]byte { return [8]byte{0x71, 0, 0, 0, 0, 1, 0, 0} }
+func dvdCallMenuCommand() [8]byte {
+	return [8]byte{0x30, 0x08, 0, 0, 0, 0x42}
+}
+
+func dvdConditionalCallVMGPGCCommand(pgcNumber int) [8]byte {
+	return [8]byte{0x30, 0x38, byte(pgcNumber >> 8), byte(pgcNumber), 0, 0xc0, 0, 1}
+}
+
+func dvdSetGPRMCommand(register, value int) [8]byte {
+	return [8]byte{0x71, 0, 0, byte(register), byte(value >> 8), byte(value)}
+}
+
+// dvdSetPlayAllCommand marks playback initiated by the PLAY ALL menu item.
+func dvdSetPlayAllCommand() [8]byte { return dvdSetGPRMCommand(0, 1) }
 
 func dvdJumpMenuCommand() [8]byte {
 	return [8]byte{0x30, 0x06, 0, 0, 0, 0x42}

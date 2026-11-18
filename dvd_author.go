@@ -216,7 +216,7 @@ func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord
 	for i, record := range records {
 		binary.BigEndian.PutUint32(admap[4+i*4:8+i*4], record.StartSector)
 	}
-	menuPGCI := buildDVDVMGMenuPGCI(menuSectors, playbackTime, menuRecords)
+	menuPGCI := buildDVDVMGMenuPGCI(menuSectors, playbackTime, menuRecords, titleCount, titleIndex+1)
 	admapSectors := uint32((len(admap) + DVDVOBSectorSize - 1) / DVDVOBSectorSize)
 	menuPGCISectors := uint32((len(menuPGCI) + DVDVOBSectorSize - 1) / DVDVOBSectorSize)
 	menuPGCISector := dvdVTSIFOBaseSectors + admapSectors
@@ -236,7 +236,7 @@ func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord
 	binary.BigEndian.PutUint32(ifo[0x000C:0x0010], uint32(lastTitleSetSector))
 	binary.BigEndian.PutUint32(ifo[0x001C:0x0020], ifoSectors-1)
 	binary.BigEndian.PutUint16(ifo[0x0020:0x0022], 0x0011)
-	binary.BigEndian.PutUint32(ifo[0x0080:0x0084], 0x01ff)
+	binary.BigEndian.PutUint32(ifo[0x0080:0x0084], uint32(len(ifo)-1))
 	binary.BigEndian.PutUint32(ifo[0x00C0:0x00C4], ifoSectors)             // VTSM_VOBS follows VTSI/BUP.
 	binary.BigEndian.PutUint32(ifo[0x00C4:0x00C8], ifoSectors+menuSectors) // VTSTT_VOBS follows VTSM_VOBS.
 	binary.BigEndian.PutUint32(ifo[0x00C8:0x00CC], 1)                      // VTS_PTT_SRPT
@@ -261,10 +261,11 @@ func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord
 	binary.BigEndian.PutUint16(ptt[14:16], 1) // PGN
 	copy(ifo[DVDVOBSectorSize:], ptt)
 
-	post := [][8]byte{dvdJumpMenuCommand()}
+	post := make([][8]byte, 0, 2)
 	if titleIndex < titleCount-1 {
-		post = append([][8]byte{dvdConditionalJumpTitleCommand(titleIndex + 2)}, post...)
+		post = append(post, dvdConditionalCallVMGPGCCommand(dvdVMGTitleAdvancePGCN(len(menuRecords), titleCount, titleIndex)))
 	}
+	post = append(post, dvdCallMenuCommand())
 	pgc := buildDVDVTSProgramChain(playbackTime, records, vobSectors, post...)
 	pgci := make([]byte, 16+len(pgc))
 	binary.BigEndian.PutUint16(pgci[0:2], 1)
@@ -329,6 +330,7 @@ func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobS
 	binary.BigEndian.PutUint16(pgc[0x00ea:0x00ec], uint16(headerSize+commandTableSize+programMapSize+cellPlaybackSize))
 	commandTable := pgc[headerSize : headerSize+commandTableSize]
 	binary.BigEndian.PutUint16(commandTable[2:4], uint16(len(postCommands)))
+	binary.BigEndian.PutUint16(commandTable[6:8], uint16(commandTableSize-1))
 	for i, command := range postCommands {
 		copy(commandTable[8+i*8:16+i*8], command[:])
 	}
@@ -400,7 +402,7 @@ func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint3
 		entryOffset := uint32(8 + 4*len(titles) + i*776)
 		binary.BigEndian.PutUint32(attrTable[8+i*4:12+i*4], entryOffset)
 		entry := int(entryOffset)
-		copy(attrTable[entry+8:entry+776], attributes[i*776+8:(i+1)*776])
+		copy(attrTable[entry:entry+776], attributes[i*776:(i+1)*776])
 	}
 	tt := make([]byte, 8+12*len(titles))
 	binary.BigEndian.PutUint16(tt[0:2], uint16(len(titles)))
@@ -417,7 +419,7 @@ func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint3
 			binary.BigEndian.PutUint32(tt[base+8:base+12], titleSetStarts[i])
 		}
 	}
-	menuTable := buildDVDVMGMenuPGCI(menuSectors, menuTime, menuRecords)
+	menuTable := buildDVDVMGMenuPGCI(menuSectors, menuTime, menuRecords, len(titles), 0)
 	menuCellAddress := buildDVDCellAddressTable(menuRecords, menuSectors)
 	menuVOBUAddress := buildDVDVOBUAddressMap(menuRecords, menuSectors)
 	attrSectors := uint32((len(attrTable) + DVDVOBSectorSize - 1) / DVDVOBSectorSize)
@@ -439,11 +441,12 @@ func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint3
 	binary.BigEndian.PutUint32(image[0x000C:0x0010], uint32(lastVMGSector))
 	binary.BigEndian.PutUint32(image[0x001C:0x0020], vmgSectors-1)
 	binary.BigEndian.PutUint16(image[0x0020:0x0022], 0x0011)
-	binary.BigEndian.PutUint16(image[0x0028:0x002A], 1) // number of volumes.
-	binary.BigEndian.PutUint16(image[0x002A:0x002C], 1) // volume number.
+	binary.BigEndian.PutUint16(image[0x0026:0x0028], 1) // number of volumes.
+	binary.BigEndian.PutUint16(image[0x0028:0x002A], 1) // volume number.
+	image[0x002A] = 1                                   // disc side.
 	binary.BigEndian.PutUint16(image[0x003E:0x0040], uint16(len(titles)))
 	copy(image[0x0040:0x0040+12], []byte("VIDEO2DVD-GO"))
-	binary.BigEndian.PutUint32(image[0x0080:0x0084], 0x01ff)
+	binary.BigEndian.PutUint32(image[0x0080:0x0084], uint32(len(image)-1))
 	if menuSectors > 0 {
 		binary.BigEndian.PutUint32(image[0x00C0:0x00C4], vmgSectors)
 		binary.BigEndian.PutUint32(image[0x00C8:0x00CC], menuTableSector)
@@ -497,38 +500,58 @@ func buildDVDVOBUAddressMap(records []dvdVOBURecord, vobSectors uint32) []byte {
 
 func buildDVDFirstPlayPGC() []byte {
 	const pgcHeaderSize = 0xec
-	pgc := make([]byte, pgcHeaderSize+16)
+	pgc := make([]byte, pgcHeaderSize+24)
 	binary.BigEndian.PutUint16(pgc[0x00e4:0x00e6], pgcHeaderSize)
 	commands := pgc[pgcHeaderSize:]
-	binary.BigEndian.PutUint16(commands[0:2], 1) // one pre-command.
-	command := dvdJumpMenuCommand()
-	copy(commands[8:16], command[:])
+	binary.BigEndian.PutUint16(commands[0:2], 2) // set play-all sentinel, then enter the title menu.
+	binary.BigEndian.PutUint16(commands[6:8], uint16(len(commands)-1))
+	setMenuMode := dvdSetGPRMCommand(1, 0)
+	jumpMenu := dvdJumpMenuCommand()
+	copy(commands[8:16], setMenuMode[:])
+	copy(commands[16:24], jumpMenu[:])
 	return pgc
 }
 
-func buildDVDVMGMenuPGCI(menuSectors uint32, menuTime [4]byte, menuRecords []dvdVOBURecord) []byte {
+func buildDVDVMGMenuPGCI(menuSectors uint32, menuTime [4]byte, menuRecords []dvdVOBURecord, titleSettings ...int) []byte {
 	// Each encoded menu page is a separate VMG PGC/cell. This lets the
 	// highlight buttons use LinkPGCN for deterministic page navigation.
+	titleCount, localVTSTitle := 0, 0
+	if len(titleSettings) > 0 {
+		titleCount = titleSettings[0]
+	}
+	if len(titleSettings) > 1 {
+		localVTSTitle = titleSettings[1]
+	}
 	pageCount := len(menuRecords)
 	if pageCount == 0 {
 		pageCount = 1
 		menuRecords = []dvdVOBURecord{{StartSector: 0, EndSector: menuSectors - 1}}
 	}
-	pgcs := make([][]byte, 0, pageCount+1)
+	pgcs := make([][]byte, 0, pageCount+1+2*titleCount)
 	for page := 0; page < pageCount; page++ {
-		pgc := make([]byte, 0xec+16+2+24+4)
+		const commandTableSize = 24
+		const programMapSize = 2
+		const cellPlaybackSize = 24
+		pgc := make([]byte, 0xec+commandTableSize+programMapSize+cellPlaybackSize+4)
 		pgc[2], pgc[3] = 1, 1
 		pgc[0x0c] = 0x80
 		binary.BigEndian.PutUint16(pgc[0x00e4:0x00e6], 0xec)
-		binary.BigEndian.PutUint16(pgc[0x00e6:0x00e8], 0xfc)
-		binary.BigEndian.PutUint16(pgc[0x00e8:0x00ea], 0xfe)
-		binary.BigEndian.PutUint16(pgc[0x00ea:0x00ec], 0x116)
-		cmd := pgc[0xec:0xfc]
+		programMapOffset := 0xec + commandTableSize
+		cellPlaybackOffset := programMapOffset + programMapSize
+		cellPositionOffset := cellPlaybackOffset + cellPlaybackSize
+		binary.BigEndian.PutUint16(pgc[0x00e6:0x00e8], uint16(programMapOffset))
+		binary.BigEndian.PutUint16(pgc[0x00e8:0x00ea], uint16(cellPlaybackOffset))
+		binary.BigEndian.PutUint16(pgc[0x00ea:0x00ec], uint16(cellPositionOffset))
+		cmd := pgc[0xec:programMapOffset]
+		binary.BigEndian.PutUint16(cmd[0:2], 1) // clear the PLAY ALL flag when returning to the menu.
 		binary.BigEndian.PutUint16(cmd[2:4], 1)
+		binary.BigEndian.PutUint16(cmd[6:8], uint16(len(cmd)-1))
+		resetPlayAll := dvdSetGPRMCommand(0, 0)
 		loop := linkPGCNCommand((page + 1) % pageCount)
-		copy(cmd[8:16], loop[:])
-		pgc[0xfc] = 1
-		cell := pgc[0xfe:]
+		copy(cmd[8:16], resetPlayAll[:])
+		copy(cmd[16:24], loop[:])
+		pgc[programMapOffset] = 1
+		cell := pgc[cellPlaybackOffset:]
 		cell[3] = 1
 		copy(cell[4:8], menuTime[:])
 		binary.BigEndian.PutUint32(cell[8:12], menuRecords[page].StartSector)
@@ -546,11 +569,35 @@ func buildDVDVMGMenuPGCI(menuSectors uint32, menuTime [4]byte, menuRecords []dvd
 	binary.BigEndian.PutUint16(playAll[0x00ea:0x00ec], 0x104)
 	commands := playAll[0xec:0x104]
 	binary.BigEndian.PutUint16(commands[0:2], 2)
+	binary.BigEndian.PutUint16(commands[6:8], uint16(len(commands)-1))
 	setPlayAll := dvdSetPlayAllCommand()
 	jumpFirst := dvdJumpTitleCommand(1)
+	if localVTSTitle != 0 {
+		jumpFirst = dvdJumpVTSTitleCommand(1)
+	}
 	copy(commands[8:16], setPlayAll[:])
 	copy(commands[16:24], jumpFirst[:])
 	pgcs = append(pgcs, playAll)
+	for title := 1; title <= titleCount; title++ {
+		commands := [][8]byte{dvdSetGPRMCommand(0, 0)}
+		if localVTSTitle == 0 {
+			commands = append(commands, dvdJumpTitleCommand(title))
+		} else if title == localVTSTitle {
+			commands = append(commands, dvdJumpVTSTitleCommand(1))
+		} else {
+			commands = append(commands, dvdJumpMenuCommand())
+		}
+		pgcs = append(pgcs, buildDVDCommandOnlyPGC(commands...))
+	}
+	for title := 0; title < titleCount; title++ {
+		var command [8]byte
+		if localVTSTitle != 0 || title+1 == titleCount {
+			command = dvdJumpMenuCommand()
+		} else {
+			command = dvdJumpTitleCommand(title + 2)
+		}
+		pgcs = append(pgcs, buildDVDCommandOnlyPGC(command))
+	}
 	pgcCount := len(pgcs)
 	luSize := 8 + 8*pgcCount
 	for _, pgc := range pgcs {
@@ -562,7 +609,9 @@ func buildDVDVMGMenuPGCI(menuSectors uint32, menuTime [4]byte, menuRecords []dvd
 	pos := 8 + 8*pgcCount
 	for i, pgc := range pgcs {
 		entry := 8 + i*8
-		binary.BigEndian.PutUint32(lu[entry:entry+4], 0x80000000|uint32(i+2))
+		if i == 0 {
+			lu[entry] = 0x82 // title-menu entry; additional pages link by PGCN.
+		}
 		binary.BigEndian.PutUint32(lu[entry+4:entry+8], uint32(pos))
 		copy(lu[pos:], pgc)
 		pos += len(pgc)
@@ -575,6 +624,24 @@ func buildDVDVMGMenuPGCI(menuSectors uint32, menuTime [4]byte, menuRecords []dvd
 	binary.BigEndian.PutUint32(table[12:16], 16)
 	copy(table[16:], lu)
 	return table
+}
+
+func buildDVDCommandOnlyPGC(commands ...[8]byte) []byte {
+	const pgcHeaderSize = 0xec
+	commandTableSize := 8 + len(commands)*8
+	pgc := make([]byte, pgcHeaderSize+commandTableSize)
+	binary.BigEndian.PutUint16(pgc[0x00e4:0x00e6], pgcHeaderSize)
+	commandTable := pgc[pgcHeaderSize:]
+	binary.BigEndian.PutUint16(commandTable[0:2], uint16(len(commands)))
+	binary.BigEndian.PutUint16(commandTable[6:8], uint16(commandTableSize-1))
+	for i, command := range commands {
+		copy(commandTable[8+i*8:16+i*8], command[:])
+	}
+	return pgc
+}
+
+func dvdVMGTitleAdvancePGCN(pageCount, titleCount, titleIndex int) int {
+	return pageCount + 2 + titleCount + titleIndex
 }
 
 func writeIFOAndBUP(dir, stem string, contents []byte) error {

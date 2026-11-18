@@ -67,6 +67,36 @@ func TestBuildDVDNAVPackRejectsMissingIDs(t *testing.T) {
 	}
 }
 
+func TestBuildDVDNAVPackWritesValidHighlightGroup(t *testing.T) {
+	pack, err := BuildDVDNAVPack(DVDNAVPackInfo{
+		VOBID: 1, CellID: 1, ButtonDisplayType: 0x07,
+		Buttons: []DVDNAVButton{{
+			XStart: 10, YStart: 10, XEnd: 100, YEnd: 30,
+			Up: 1, Down: 1, Left: 1, Right: 1,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pci := pack[45:]
+	const highlightInfo = 0x60
+	if got := pci[highlightInfo+0x0e]; got != 0x17 {
+		t.Fatalf("highlight group flags = %#x, want 0x17 (reserved bits clear, one group, all display modes)", got)
+	}
+	if pci[highlightInfo+0x15] != 0 {
+		t.Fatalf("forced-action button = %d, want 0", pci[highlightInfo+0x15])
+	}
+	if pci[highlightInfo+0x14] != 1 {
+		t.Fatalf("forced-selection button = %d, want 1", pci[highlightInfo+0x14])
+	}
+}
+
+func TestBuildDVDNAVPackRejectsInvalidButtonDisplayType(t *testing.T) {
+	if _, err := BuildDVDNAVPack(DVDNAVPackInfo{VOBID: 1, CellID: 1, ButtonDisplayType: 8}); err == nil {
+		t.Fatal("expected an out-of-range DVD button display mask to fail")
+	}
+}
+
 func TestDVDCellElapsedTimeUsesDVDBCDAndFrameRateCode(t *testing.T) {
 	ntsc, err := ExportDVDCellElapsedTime(time.Hour+2*time.Minute+3*time.Second+500*time.Millisecond, 30000, 1001)
 	if err != nil {

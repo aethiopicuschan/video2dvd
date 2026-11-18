@@ -684,7 +684,9 @@ func reconstructMPEG2IntraFrame(frame DecodedVideoFrame, blocks []mpeg2IntraBloc
 
 func reconstructMPEG2IntraBlock(block mpeg2IntraBlock, quantizer int, includeAC bool) [64]byte {
 	var coefficients [64]int
-	coefficients[0] = block.dc * 8
+	// MPEG-2's intra DC predictor is absolute (initialized to 128), while
+	// the transform operates on samples centered around 128.
+	coefficients[0] = (block.dc - 128) * 8
 	if includeAC {
 		for scanPosition := 1; scanPosition < 64; scanPosition++ {
 			index := mpeg2ZigZag[scanPosition]
@@ -854,7 +856,9 @@ func analyzeMPEG2Block(plane []byte, stride, x, y int, chroma bool) mpeg2IntraBl
 			source[row][column] = float64(value - 128)
 		}
 	}
-	block.dc = (sum+32)/64 - 128
+	// The bitstream's DC predictor stores the absolute sample level. AC
+	// coefficients below use samples centered around 128 for the DCT.
+	block.dc = (sum + 32) / 64
 	for row := range 8 {
 		for horizontal := range 8 {
 			var value float64

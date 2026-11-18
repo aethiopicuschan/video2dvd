@@ -138,6 +138,10 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 			return errors.New("video2dvd: VOB title exceeds the 1 GiB single-file limit")
 		}
 		var buttons []DVDNAVButton
+		buttonDisplayType := uint8(0)
+		if title.Aspect == AspectRatio16x9 {
+			buttonDisplayType = 0x07
+		}
 		cellID := uint8(1)
 		if menuVOBUIndex < len(buttonPages) {
 			buttons = buttonPages[menuVOBUIndex]
@@ -158,6 +162,7 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 			StartPTM:                  groupStartPTS,
 			EndPTM:                    groupEndPTS,
 			CellElapsedTime:           groupCellElapsed,
+			ButtonDisplayType:         buttonDisplayType,
 			Buttons:                   buttons,
 		})
 		if err != nil {
