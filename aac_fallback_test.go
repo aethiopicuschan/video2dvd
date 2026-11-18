@@ -35,10 +35,11 @@ func TestAACPCMFileSourceAppliesEditTimeline(t *testing.T) {
 		t.Fatal(err)
 	}
 	var raw []byte
-	for frame := int16(0); frame < 6; frame++ {
+	for frame := range 6 {
+		sample := int16(frame + 1)
 		var bytes [4]byte
-		binary.LittleEndian.PutUint16(bytes[0:2], uint16(frame+1))
-		binary.LittleEndian.PutUint16(bytes[2:4], uint16(-(frame + 1)))
+		binary.LittleEndian.PutUint16(bytes[0:2], uint16(sample))
+		binary.LittleEndian.PutUint16(bytes[2:4], uint16(-sample))
 		raw = append(raw, bytes[:]...)
 	}
 	if err := ExportWriteAll(file, raw); err != nil {
