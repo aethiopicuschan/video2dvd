@@ -1,8 +1,8 @@
 // Package video2dvd provides APIs for preparing DVD-compatible media and
 // orchestrating DVD-Video directory creation from MP4 and WebM media.
 //
-// The package itself does not start external processes. It includes a basic
-// in-process Encoder; DVD directory generation still requires an Authorer.
+// The package itself does not start external processes. It includes in-process
+// encoder and authorer implementations for creating menu-less DVD-Video output.
 package video2dvd
 
 import (
