@@ -101,13 +101,13 @@ func TestMPEG2VideoEncoderHonorsConfiguredBitrate(t *testing.T) {
 }
 
 func TestMPEG2InverseQuantizationMatchesH262Scale(t *testing.T) {
-	if got, want := ExportMPEG2InverseIntraAC(4, 16, 16), 64; got != want {
+	if got, want := ExportMPEG2InverseIntraAC(4, 16, 16), 128; got != want {
 		t.Errorf("intra AC inverse quantization = %d, want %d", got, want)
 	}
-	if got, want := ExportMPEG2InverseNonIntra(4, 16), 72; got != want {
+	if got, want := ExportMPEG2InverseNonIntra(4, 16), 144; got != want {
 		t.Errorf("positive non-intra inverse quantization = %d, want %d", got, want)
 	}
-	if got, want := ExportMPEG2InverseNonIntra(-4, 16), -72; got != want {
+	if got, want := ExportMPEG2InverseNonIntra(-4, 16), -144; got != want {
 		t.Errorf("negative non-intra inverse quantization = %d, want %d", got, want)
 	}
 }
@@ -119,8 +119,8 @@ func TestMPEG2NonIntraQuantizationMatchesInverseScale(t *testing.T) {
 		wantLevel   int
 		wantDecoded int
 	}{
-		{coefficient: 20, quantizer: 5, wantLevel: 4, wantDecoded: 22},
-		{coefficient: -17, quantizer: 5, wantLevel: -3, wantDecoded: -17},
+		{coefficient: 20, quantizer: 5, wantLevel: 2, wantDecoded: 25},
+		{coefficient: -17, quantizer: 5, wantLevel: -2, wantDecoded: -25},
 	} {
 		level := ExportMPEG2QuantizeNonIntra(tc.coefficient, tc.quantizer)
 		if level != tc.wantLevel {
@@ -181,6 +181,9 @@ func TestMPEG2VideoEncoderCodesACAndStaysWithinFrameBudget(t *testing.T) {
 	}
 	if output.Len() > ExportMPEG2FrameBytes(encoder)+4 {
 		t.Fatalf("output size %d exceeds one-frame budget %d plus sequence end", output.Len(), ExportMPEG2FrameBytes(encoder))
+	}
+	if output.Len() <= len(withoutAC)+4 {
+		t.Fatalf("encoded texture size %d is no larger than its DC-only fallback size %d", output.Len(), len(withoutAC)+4)
 	}
 }
 

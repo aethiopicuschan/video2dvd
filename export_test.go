@@ -73,4 +73,9 @@ func ExportMPEG2PredictivePicture(e *MPEG2VideoEncoder, macroblocks []mpeg2Predi
 func ExportMPEG2PredictivePictureSize(e *MPEG2VideoEncoder, macroblocks []mpeg2PredictiveMacroblock, w, h, q int, ac bool) int {
 	return e.measurePredictivePicture(macroblocks, w, h, q, ac)
 }
+func ExportMPEG2DCTRunLevel(run, level int, firstNonIntra bool) []byte {
+	var bits mpeg2BitWriter
+	writeMPEG2DCTRunLevel(&bits, run, level, firstNonIntra)
+	return bits.bytes()
+}
 func ExportProgramStreamClosedError(w *MPEGProgramStreamWriter) error { return w.closedErr }

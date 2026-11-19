@@ -135,7 +135,6 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 	}
 	var encoded []byte
 	selectedQuantizer := 0
-	includeAC := true
 	for quantizer := 1; quantizer <= 31; quantizer++ {
 		var size int
 		if isIntra {
@@ -149,14 +148,22 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 		}
 	}
 	if selectedQuantizer == 0 {
-		// At the upper quantizer limit, drop AC coefficients as a lower-rate fallback.
+		// Preserve low-frequency detail when even the coarsest complete picture
+		// exceeds its frame budget. Dropping every AC coefficient causes visible
+		// macroblock blur, so keep the largest zig-zag prefix that fits instead.
 		selectedQuantizer = 31
-		includeAC = false
+		if isIntra {
+			limit := fitMPEG2IntraACLimit(e, frame, intraBlocks, mbWidth, mbHeight)
+			intraBlocks = limitMPEG2IntraAC(intraBlocks, limit)
+		} else {
+			limit := fitMPEG2PredictiveACLimit(e, predictiveMacroblocks, mbWidth, mbHeight)
+			predictiveMacroblocks = limitMPEG2PredictiveAC(predictiveMacroblocks, limit)
+		}
 	}
 	if isIntra {
-		encoded = e.encodeIntraPicture(frame, intraBlocks, mbWidth, mbHeight, selectedQuantizer, includeAC)
+		encoded = e.encodeIntraPicture(frame, intraBlocks, mbWidth, mbHeight, selectedQuantizer, true)
 	} else {
-		encoded = e.encodePredictivePicture(predictiveMacroblocks, mbWidth, mbHeight, selectedQuantizer, includeAC)
+		encoded = e.encodePredictivePicture(predictiveMacroblocks, mbWidth, mbHeight, selectedQuantizer, true)
 	}
 	if err := writeAll(e.dst, encoded); err != nil {
 		e.writeErr = fmt.Errorf("video2dvd: write MPEG-2 picture %d: %w", e.frameNo, err)
@@ -164,13 +171,71 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 	}
 	var reference DecodedVideoFrame
 	if isIntra {
-		reference = reconstructMPEG2IntraFrame(frame, intraBlocks, mbWidth, mbHeight, selectedQuantizer, includeAC)
+		reference = reconstructMPEG2IntraFrame(frame, intraBlocks, mbWidth, mbHeight, selectedQuantizer, true)
 	} else {
-		reference = reconstructMPEG2PredictiveFrame(frame, *e.reference, predictiveMacroblocks, mbWidth, mbHeight, selectedQuantizer, includeAC)
+		reference = reconstructMPEG2PredictiveFrame(frame, *e.reference, predictiveMacroblocks, mbWidth, mbHeight, selectedQuantizer, true)
 	}
 	e.reference = &reference
 	e.frameNo++
 	return nil
+}
+
+func fitMPEG2IntraACLimit(e *MPEG2VideoEncoder, frame DecodedVideoFrame, blocks []mpeg2IntraBlock, mbWidth, mbHeight int) int {
+	low, high, best := 1, 64, 1
+	for low <= high {
+		limit := low + (high-low)/2
+		limited := limitMPEG2IntraAC(blocks, limit)
+		if e.measureIntraPicture(frame, limited, mbWidth, mbHeight, 31, true) <= e.frameBytes {
+			best = limit
+			low = limit + 1
+		} else {
+			high = limit - 1
+		}
+	}
+	return best
+}
+
+func fitMPEG2PredictiveACLimit(e *MPEG2VideoEncoder, macroblocks []mpeg2PredictiveMacroblock, mbWidth, mbHeight int) int {
+	low, high, best := 1, 64, 1
+	for low <= high {
+		limit := low + (high-low)/2
+		limited := limitMPEG2PredictiveAC(macroblocks, limit)
+		if e.measurePredictivePicture(limited, mbWidth, mbHeight, 31, true) <= e.frameBytes {
+			best = limit
+			low = limit + 1
+		} else {
+			high = limit - 1
+		}
+	}
+	return best
+}
+
+func limitMPEG2IntraAC(blocks []mpeg2IntraBlock, coefficientLimit int) []mpeg2IntraBlock {
+	if coefficientLimit >= 64 {
+		return blocks
+	}
+	limited := append([]mpeg2IntraBlock(nil), blocks...)
+	for blockIndex := range limited {
+		for scanPosition := max(1, coefficientLimit); scanPosition < 64; scanPosition++ {
+			limited[blockIndex].coeff[mpeg2ZigZag[scanPosition]] = 0
+		}
+	}
+	return limited
+}
+
+func limitMPEG2PredictiveAC(macroblocks []mpeg2PredictiveMacroblock, coefficientLimit int) []mpeg2PredictiveMacroblock {
+	if coefficientLimit >= 64 {
+		return macroblocks
+	}
+	limited := append([]mpeg2PredictiveMacroblock(nil), macroblocks...)
+	for macroblockIndex := range limited {
+		for blockIndex := range limited[macroblockIndex].blocks {
+			for scanPosition := coefficientLimit; scanPosition < 64; scanPosition++ {
+				limited[macroblockIndex].blocks[blockIndex].coeff[mpeg2ZigZag[scanPosition]] = 0
+			}
+		}
+	}
+	return limited
 }
 
 func (e *MPEG2VideoEncoder) encodeIntraPicture(frame DecodedVideoFrame, blocks []mpeg2IntraBlock, mbWidth, mbHeight, quantizer int, includeAC bool) []byte {
@@ -765,18 +830,20 @@ func reconstructMPEG2NonIntraBlock(levels [64]int16, quantizer int) [64]int {
 }
 
 func inverseMPEG2IntraACCoefficient(level, weight, quantizer int) int {
-	// H.262 7.4.2.2: intra AC coefficients use 2*QF*W*qscale/32.
-	return level * weight * quantizer / 16
+	// MPEG-2 doubles the linear quantizer scale code before inverse
+	// quantization: qscale*2*W/16 = qscale*W/8.
+	return level * weight * quantizer / 8
 }
 
 func inverseMPEG2NonIntraCoefficient(level, quantizer int) int {
-	// With the default non-intra matrix (16), H.262 7.4.2.2 reduces to
-	// sign(level)*(2*abs(level)+1)*qscale/2.
+	// MPEG-2 doubles the linear quantizer scale code before inverse
+	// quantization. With the default non-intra matrix (16), this reduces to
+	// sign(level)*(2*abs(level)+1)*qscale.
 	sign := 1
 	if level < 0 {
 		sign = -1
 	}
-	return sign * ((2*absInt(level) + 1) * quantizer / 2)
+	return sign * ((2*absInt(level) + 1) * quantizer)
 }
 
 func newMPEG2FrameLike(frame DecodedVideoFrame) DecodedVideoFrame {
@@ -969,7 +1036,7 @@ func quantizeMPEG2ResidualMacroblock(macroblock mpeg2PredictiveMacroblock, quant
 }
 
 func quantizeMPEG2NonIntraCoefficient(value float64, quantizer int) int {
-	level := min(int(math.Floor(math.Abs(value)/float64(quantizer)+0.5)), 2047)
+	level := min(int(math.Floor(math.Abs(value)/float64(2*quantizer)+0.5)), 2047)
 	if value < 0 {
 		return -level
 	}
@@ -983,16 +1050,16 @@ func writeMPEG2CodedBlockPattern(bits *mpeg2BitWriter, pattern uint8) {
 
 func writeMPEG2NonIntraBlock(bits *mpeg2BitWriter, levels [64]int16) {
 	lastPosition := -1
+	firstCoefficient := true
 	for scanPosition := range 64 {
 		level := int(levels[mpeg2ZigZag[scanPosition]])
 		if level == 0 {
 			continue
 		}
 		run := scanPosition - lastPosition - 1
-		bits.write(1, 6) // DCT escape code 000001.
-		bits.write(uint64(run), 6)
-		bits.write(uint64(level)&0x0fff, 12) // MPEG-2 signed_level.
+		writeMPEG2DCTRunLevel(bits, run, level, firstCoefficient)
 		lastPosition = scanPosition
+		firstCoefficient = false
 	}
 	bits.write(0b10, 2) // End of block.
 }
@@ -1110,16 +1177,14 @@ func writeMPEG2ACCoefficients(bits *mpeg2BitWriter, coefficients [64]float64, qu
 		if level == 0 {
 			continue
 		}
-		bits.write(1, 6) // DCT escape code 000001.
-		bits.write(uint64(scanPosition-lastPosition-1), 6)
-		bits.write(uint64(level)&0x0fff, 12) // MPEG-2 signed_level.
+		writeMPEG2DCTRunLevel(bits, scanPosition-lastPosition-1, level, false)
 		lastPosition = scanPosition
 	}
 	bits.write(0b10, 2) // end_of_block
 }
 
 func quantizeMPEG2IntraCoefficient(value float64, quantizer, weight int) int {
-	level := min(int(math.Floor(math.Abs(value)*16/(float64(quantizer*weight))+0.5)), 2047)
+	level := min(int(math.Floor(math.Abs(value)*8/(float64(quantizer*weight))+0.5)), 2047)
 	if value < 0 {
 		return -level
 	}
