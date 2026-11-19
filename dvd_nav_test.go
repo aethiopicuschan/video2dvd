@@ -31,6 +31,10 @@ func TestBuildDVDNAVPackWritesPCIAndDSIAtFixedOffsets(t *testing.T) {
 	if len(pack) != DVDVOBSectorSize {
 		t.Fatalf("NAV pack size = %d, want %d", len(pack), DVDVOBSectorSize)
 	}
+	systemHeader := pack[14:]
+	if got := uint32(systemHeader[6]&0x7f)<<15 | uint32(systemHeader[7])<<7 | uint32(systemHeader[8]>>1); got != 25_200 {
+		t.Fatalf("DVD system-header rate_bound = %d units of 50 bytes/s, want 25200 (10.08 Mbit/s)", got)
+	}
 	if !bytes.Equal(pack[:4], []byte{0, 0, 1, 0xba}) {
 		t.Fatal("NAV pack has no MPEG pack header")
 	}
