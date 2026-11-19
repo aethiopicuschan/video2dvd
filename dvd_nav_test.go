@@ -13,6 +13,8 @@ func TestBuildDVDNAVPackWritesPCIAndDSIAtFixedOffsets(t *testing.T) {
 		SCRBase:                   90_000,
 		LogicalBlockNumber:        321,
 		VOBUEndAddress:            14,
+		NextVOBU:                  0x8000000f,
+		PreviousVOBU:              0x80000004,
 		FirstReferenceEndAddress:  4,
 		SecondReferenceEndAddress: 8,
 		ThirdReferenceEndAddress:  12,
@@ -59,6 +61,13 @@ func TestBuildDVDNAVPackWritesPCIAndDSIAtFixedOffsets(t *testing.T) {
 		!bytes.Equal(dsi[28:32], info.CellElapsedTime[:]) {
 		t.Fatal("NAV pack DSI general information does not match the input")
 	}
+	const vobuSriOffset = 32 + 148 + 54
+	if binary.BigEndian.Uint32(dsi[vobuSriOffset:vobuSriOffset+4]) != info.NextVOBU ||
+		binary.BigEndian.Uint32(dsi[dvdNavTestNextVOBUOffset:dvdNavTestNextVOBUOffset+4]) != info.NextVOBU ||
+		binary.BigEndian.Uint32(dsi[dvdNavTestPreviousVOBUOffset:dvdNavTestPreviousVOBUOffset+4]) != info.PreviousVOBU ||
+		binary.BigEndian.Uint32(dsi[dvdNavTestPreviousVideoOffset:dvdNavTestPreviousVideoOffset+4]) != info.PreviousVOBU {
+		t.Fatal("NAV pack DSI VOBU search pointers do not match the input")
+	}
 }
 
 func TestBuildDVDNAVPackRejectsMissingIDs(t *testing.T) {
@@ -89,6 +98,22 @@ func TestBuildDVDNAVPackWritesValidHighlightGroup(t *testing.T) {
 	if pci[highlightInfo+0x14] != 1 {
 		t.Fatalf("forced-selection button = %d, want 1", pci[highlightInfo+0x14])
 	}
+	dsi := pack[0x407:]
+	if got := binary.BigEndian.Uint32(dsi[dvdNavTestNextVOBUOffset : dvdNavTestNextVOBUOffset+4]); got != DVDNAVSRIEndOfCell {
+		t.Fatalf("default next VOBU pointer = %#x, want end-of-cell %#x", got, DVDNAVSRIEndOfCell)
+	}
+	if got := binary.BigEndian.Uint32(dsi[dvdNavTestPreviousVOBUOffset : dvdNavTestPreviousVOBUOffset+4]); got != DVDNAVSRIEndOfCell {
+		t.Fatalf("default previous VOBU pointer = %#x, want end-of-cell %#x", got, DVDNAVSRIEndOfCell)
+	}
+}
+
+func TestBuildDVDNAVPackRejectsInvalidVOBUSearchPointers(t *testing.T) {
+	if _, err := BuildDVDNAVPack(DVDNAVPackInfo{VOBID: 1, CellID: 1, NextVOBU: 1}); err == nil {
+		t.Fatal("expected a VOBU pointer without the valid bit to fail")
+	}
+	if _, err := BuildDVDNAVPack(DVDNAVPackInfo{VOBID: 1, CellID: 1, PreviousVOBU: 0x80000000}); err == nil {
+		t.Fatal("expected a valid-bit VOBU pointer with a zero offset to fail")
+	}
 }
 
 func TestBuildDVDNAVPackRejectsInvalidButtonDisplayType(t *testing.T) {
@@ -113,3 +138,9 @@ func TestDVDCellElapsedTimeUsesDVDBCDAndFrameRateCode(t *testing.T) {
 		t.Fatalf("PAL cell time = % x, want 00 00 01 58", pal)
 	}
 }
+
+const (
+	dvdNavTestNextVOBUOffset      = 0x13a
+	dvdNavTestPreviousVOBUOffset  = 0x13e
+	dvdNavTestPreviousVideoOffset = 0x18e
+)

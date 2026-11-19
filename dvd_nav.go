@@ -7,18 +7,33 @@ import (
 )
 
 const (
-	dvdNAVSystemHeaderSize = 24
-	dvdNAVPCIDataSize      = 979
-	dvdNAVDSIDataSize      = 1017
+	dvdNAVSystemHeaderSize   = 24
+	dvdNAVPCIDataSize        = 979
+	dvdNAVDSIDataSize        = 1017
+	dvdNAVDSIVOBUSRIOffset   = 32 + 148 + 54
+	dvdNAVDSINextVOBUOffset  = dvdNAVDSIVOBUSRIOffset + 4 + 19*4
+	dvdNAVDSIPrevVOBUOffset  = dvdNAVDSINextVOBUOffset + 4
+	dvdNAVDSIPrevVideoOffset = dvdNAVDSIPrevVOBUOffset + 4 + 19*4
+	dvdNAVSRIPointerValid    = uint32(1 << 31)
+	dvdNAVSRINoVideo         = uint32(0xbfffffff)
 )
+
+// DVDNAVSRIEndOfCell marks the boundary of a DVD cell in a VOBU search
+// pointer. It is used for a VOBU with no next or previous VOBU in its cell.
+const DVDNAVSRIEndOfCell uint32 = 0x3fffffff
 
 // DVDNAVPackInfo contains the navigation fields associated with one VOBU.
 // Sector addresses are relative to the beginning of the VOB file. Reference
 // end addresses are relative to the NAV pack, as required by DSI_GI.
 type DVDNAVPackInfo struct {
-	SCRBase                   uint64
-	LogicalBlockNumber        uint32
-	VOBUEndAddress            uint32
+	SCRBase            uint64
+	LogicalBlockNumber uint32
+	VOBUEndAddress     uint32
+	// NextVOBU and PreviousVOBU are raw DSI VOBU_SRI pointers. Valid
+	// pointers contain the relative sector offset and bit 31; use
+	// DVDNAVSRIEndOfCell at a cell boundary. Zero defaults to end-of-cell.
+	NextVOBU                  uint32
+	PreviousVOBU              uint32
 	FirstReferenceEndAddress  uint32
 	SecondReferenceEndAddress uint32
 	ThirdReferenceEndAddress  uint32
@@ -57,6 +72,15 @@ func BuildDVDNAVPack(info DVDNAVPackInfo) ([]byte, error) {
 	if info.ButtonDisplayType > 7 {
 		return nil, errors.New("video2dvd: DVD button display type exceeds the three-bit field")
 	}
+	if info.NextVOBU == 0 {
+		info.NextVOBU = DVDNAVSRIEndOfCell
+	}
+	if info.PreviousVOBU == 0 {
+		info.PreviousVOBU = DVDNAVSRIEndOfCell
+	}
+	if !validDVDNAVSRIPointer(info.NextVOBU) || !validDVDNAVSRIPointer(info.PreviousVOBU) {
+		return nil, errors.New("video2dvd: DVD NAV VOBU search pointers are invalid")
+	}
 	pack := make([]byte, DVDVOBSectorSize)
 	copy(pack, buildMPEG2PackHeader(info.SCRBase, defaultProgramMuxRate/50))
 	systemHeader := buildDVDNAVSystemHeader()
@@ -85,7 +109,26 @@ func BuildDVDNAVPack(info DVDNAVPackInfo) ([]byte, error) {
 	binary.BigEndian.PutUint16(dsi[24:26], info.VOBID)
 	dsi[27] = info.CellID
 	copy(dsi[28:32], info.CellElapsedTime[:])
+	nextVideo, previousVideo := info.NextVOBU, info.PreviousVOBU
+	if nextVideo == DVDNAVSRIEndOfCell {
+		nextVideo = dvdNAVSRINoVideo
+	}
+	if previousVideo == DVDNAVSRIEndOfCell {
+		previousVideo = dvdNAVSRINoVideo
+	}
+	binary.BigEndian.PutUint32(dsi[dvdNAVDSIVOBUSRIOffset:dvdNAVDSIVOBUSRIOffset+4], nextVideo)
+	binary.BigEndian.PutUint32(dsi[dvdNAVDSINextVOBUOffset:dvdNAVDSINextVOBUOffset+4], info.NextVOBU)
+	binary.BigEndian.PutUint32(dsi[dvdNAVDSIPrevVOBUOffset:dvdNAVDSIPrevVOBUOffset+4], info.PreviousVOBU)
+	binary.BigEndian.PutUint32(dsi[dvdNAVDSIPrevVideoOffset:dvdNAVDSIPrevVideoOffset+4], previousVideo)
 	return pack, nil
+}
+
+func validDVDNAVSRIPointer(pointer uint32) bool {
+	if pointer == DVDNAVSRIEndOfCell {
+		return true
+	}
+	offset := pointer & 0x3fffffff
+	return pointer&dvdNAVSRIPointerValid != 0 && offset != 0 && offset != 0x3fffffff
 }
 
 func writeDVDNAVButtons(pci []byte, buttons []DVDNAVButton, displayType uint8) error {

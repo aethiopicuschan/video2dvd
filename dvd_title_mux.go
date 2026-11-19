@@ -90,6 +90,8 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 	frameNumber := int64(0)
 	var audioSampleNumber int64
 	var nextVOBUSector uint32
+	var previousVOBUSector uint32
+	var havePreviousVOBU bool
 	var groupStartPTS uint32
 	var groupEndPTS uint32
 	var groupStartTime time.Duration
@@ -126,7 +128,7 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 		program.dst = mediaBuffer
 		return nil
 	}
-	flushVOBU := func() error {
+	flushVOBU := func(hasNextVOBU bool) error {
 		if mediaBuffer.Len() == 0 || mediaBuffer.Len()%DVDVOBSectorSize != 0 {
 			return errors.New("video2dvd: VOBU media is empty or not sector-aligned")
 		}
@@ -150,10 +152,22 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 			}
 			cellID = uint8(menuVOBUIndex + 1)
 		}
+		nextVOBU := DVDNAVSRIEndOfCell
+		previousVOBU := DVDNAVSRIEndOfCell
+		if len(buttonPages) == 0 {
+			if hasNextVOBU {
+				nextVOBU = dvdNAVSRIPointerValid | (mediaSectors + 1)
+			}
+			if havePreviousVOBU {
+				previousVOBU = dvdNAVSRIPointerValid | (nextVOBUSector - previousVOBUSector)
+			}
+		}
 		nav, err := BuildDVDNAVPack(DVDNAVPackInfo{
 			SCRBase:                   groupSCR,
 			LogicalBlockNumber:        nextVOBUSector,
 			VOBUEndAddress:            mediaSectors,
+			NextVOBU:                  nextVOBU,
+			PreviousVOBU:              previousVOBU,
 			FirstReferenceEndAddress:  referenceEnds[0],
 			SecondReferenceEndAddress: referenceEnds[1],
 			ThirdReferenceEndAddress:  referenceEnds[2],
@@ -179,6 +193,8 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 				return err
 			}
 		}
+		previousVOBUSector = nextVOBUSector
+		havePreviousVOBU = true
 		menuVOBUIndex++
 		nextVOBUSector += mediaSectors + 1
 		return nil
@@ -250,7 +266,7 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 			if !mpeg2PictureHasSequenceHeader(videoPacket) {
 				return errors.New("video2dvd: each VOBU I picture must include a sequence header")
 			}
-			if err := flushVOBU(); err != nil {
+			if err := flushVOBU(true); err != nil {
 				return err
 			}
 			if err := startVOBU(videoPTS); err != nil {
@@ -296,7 +312,7 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 	if err := program.Close(); err != nil {
 		return err
 	}
-	return flushVOBU()
+	return flushVOBU(false)
 }
 
 func validDVDFrameRate(numerator, denominator int) bool {

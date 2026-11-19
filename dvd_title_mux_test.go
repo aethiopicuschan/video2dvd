@@ -115,6 +115,8 @@ func TestMuxDVDTitleVOBInterleavesVideoAndLPCM(t *testing.T) {
 	var timestamps []uint64
 	var navAddresses []uint32
 	var navEnds []uint32
+	var navNextVOBUs []uint32
+	var navPreviousVOBUs []uint32
 	var navCellTimes [][4]byte
 	for offset := 0; offset < vob.Len(); offset += DVDVOBSectorSize {
 		sector := vob.Bytes()[offset : offset+DVDVOBSectorSize]
@@ -125,6 +127,8 @@ func TestMuxDVDTitleVOBInterleavesVideoAndLPCM(t *testing.T) {
 			dsi := sector[0x407:]
 			navAddresses = append(navAddresses, binary.BigEndian.Uint32(dsi[4:8]))
 			navEnds = append(navEnds, binary.BigEndian.Uint32(dsi[8:12]))
+			navNextVOBUs = append(navNextVOBUs, binary.BigEndian.Uint32(dsi[0x13a:0x13e]))
+			navPreviousVOBUs = append(navPreviousVOBUs, binary.BigEndian.Uint32(dsi[0x13e:0x142]))
 			var elapsed [4]byte
 			copy(elapsed[:], sector[65:69])
 			navCellTimes = append(navCellTimes, elapsed)
@@ -146,6 +150,13 @@ func TestMuxDVDTitleVOBInterleavesVideoAndLPCM(t *testing.T) {
 	}
 	if len(navAddresses) != 2 || navAddresses[0] != 0 || navAddresses[1] != navEnds[0]+1 {
 		t.Fatalf("NAV sectors addresses=%v ends=%v, want two linked VOBUs", navAddresses, navEnds)
+	}
+	nextVOBUOffset := navAddresses[1] - navAddresses[0]
+	if navNextVOBUs[0] != 0x80000000|nextVOBUOffset || navNextVOBUs[1] != DVDNAVSRIEndOfCell {
+		t.Fatalf("next VOBU pointers = %#v, want first offset %#x and final end-of-cell %#x", navNextVOBUs, 0x80000000|nextVOBUOffset, DVDNAVSRIEndOfCell)
+	}
+	if navPreviousVOBUs[0] != DVDNAVSRIEndOfCell || navPreviousVOBUs[1] != 0x80000000|nextVOBUOffset {
+		t.Fatalf("previous VOBU pointers = %#v, want first end-of-cell %#x and previous offset %#x", navPreviousVOBUs, DVDNAVSRIEndOfCell, 0x80000000|nextVOBUOffset)
 	}
 	if navCellTimes[1] != [4]byte{0x00, 0x00, 0x00, 0xcf} {
 		t.Fatalf("second NAV cell elapsed time = % x, want NTSC frame 15", navCellTimes[1])

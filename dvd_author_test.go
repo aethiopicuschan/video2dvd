@@ -63,6 +63,13 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	vmgMenuCadt := vmg[int(vmgMenuCadtSector)*DVDVOBSectorSize:]
 	vmgMenuAdmap := vmg[int(vmgMenuAdmapSector)*DVDVOBSectorSize:]
 	menuVOB := readAuthorerTestFile(t, videoTS, "VIDEO_TS.VOB")
+	menuDSI := menuVOB[0x407:]
+	if got := binary.BigEndian.Uint32(menuDSI[0x13a:0x13e]); got != DVDNAVSRIEndOfCell {
+		t.Fatalf("single-cell menu next VOBU pointer = %#x, want end-of-cell %#x", got, DVDNAVSRIEndOfCell)
+	}
+	if got := binary.BigEndian.Uint32(menuDSI[0x13e:0x142]); got != DVDNAVSRIEndOfCell {
+		t.Fatalf("single-cell menu previous VOBU pointer = %#x, want end-of-cell %#x", got, DVDNAVSRIEndOfCell)
+	}
 	menuSectors := uint32(len(menuVOB) / DVDVOBSectorSize)
 	if vmgiCount := binary.BigEndian.Uint16(vmgMenuCadt[0:2]); vmgiCount != 1 ||
 		binary.BigEndian.Uint16(vmgMenuCadt[8:10]) != 1 || vmgMenuCadt[10] != 1 ||
@@ -88,6 +95,13 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	if got := binary.BigEndian.Uint16(menuUnit[0:2]); got != 6 {
 		t.Fatalf("VMG menu PGCI PGC count = %d, want 6 (menu, PLAY ALL, two launchers, two continuations)", got)
 	}
+	menuPGCOffset := int(binary.BigEndian.Uint32(menuUnit[12:16]))
+	menuPGC := menuUnit[menuPGCOffset:]
+	menuCellPlaybackOffset := int(binary.BigEndian.Uint16(menuPGC[0x00e8:0x00ea]))
+	if !bytes.Equal(menuPGC[4:8], []byte{0, 0, 1, 0xc0}) ||
+		!bytes.Equal(menuPGC[4:8], menuPGC[menuCellPlaybackOffset+4:menuCellPlaybackOffset+8]) {
+		t.Fatal("VMG menu PGC duration does not match its cell playback duration")
+	}
 	for pgcIndex, want := range []byte{0x82, 0, 0, 0, 0, 0} {
 		entry := 8 + pgcIndex*8
 		if got := menuUnit[entry]; got != want {
@@ -111,6 +125,15 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	}
 
 	firstIFO := readAuthorerTestFile(t, videoTS, "VTS_01_0.IFO")
+	vtsMenuTableSector := binary.BigEndian.Uint32(firstIFO[0x00d0:0x00d4])
+	vtsMenuTable := firstIFO[int(vtsMenuTableSector)*DVDVOBSectorSize:]
+	vtsMenuUnit := vtsMenuTable[int(binary.BigEndian.Uint32(vtsMenuTable[12:16])):]
+	vtsMenuPGC := vtsMenuUnit[int(binary.BigEndian.Uint32(vtsMenuUnit[12:16])):]
+	vtsMenuCellPlaybackOffset := int(binary.BigEndian.Uint16(vtsMenuPGC[0x00e8:0x00ea]))
+	if !bytes.Equal(vtsMenuPGC[4:8], []byte{0, 0, 1, 0xc0}) ||
+		!bytes.Equal(vtsMenuPGC[4:8], vtsMenuPGC[vtsMenuCellPlaybackOffset+4:vtsMenuCellPlaybackOffset+8]) {
+		t.Fatal("VTS menu PGC duration does not match its one-second cell playback duration")
+	}
 	if menuVTS := readAuthorerTestFile(t, videoTS, "VTS_01_0.VOB"); !bytes.Equal(menuVTS, menuVOB) {
 		t.Fatal("VTS menu VOB does not mirror the title menu")
 	}
@@ -252,6 +275,18 @@ func TestDVDMenuPGCIContainsPagePGCs(t *testing.T) {
 		}
 		pgcOffset := int(binary.BigEndian.Uint32(unit[searchEntry+4 : searchEntry+8]))
 		pgc := unit[pgcOffset:]
+		cellCommandCount := binary.BigEndian.Uint16(pgc[0xec+4 : 0xec+6])
+		cellPlaybackOffset := int(binary.BigEndian.Uint16(pgc[0x00e8:0x00ea]))
+		if cellCommandCount != 0 || pgc[cellPlaybackOffset+3] != 0 {
+			t.Fatalf("menu page %d references a cell command without a cell command table", page+1)
+		}
+		if pgc[cellPlaybackOffset+2] != 0xff {
+			t.Fatalf("menu page %d still time = %d, want 255 (indefinite)", page+1, pgc[cellPlaybackOffset+2])
+		}
+		if !bytes.Equal(pgc[4:8], []byte{0, 0, 1, 0xc0}) ||
+			!bytes.Equal(pgc[4:8], pgc[cellPlaybackOffset+4:cellPlaybackOffset+8]) {
+			t.Fatalf("menu page %d PGC duration does not match its cell playback duration", page+1)
+		}
 		if got := binary.BigEndian.Uint16(pgc[0xec+6 : 0xec+8]); got != 23 {
 			t.Fatalf("menu page %d command table last byte = %d, want 23", page+1, got)
 		}

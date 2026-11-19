@@ -89,11 +89,11 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 		return errors.New("video2dvd: generated title menu has an invalid sector count")
 	}
 	menuSectors := uint32(menuInfo.Size() / DVDVOBSectorSize)
-	menuTime, err := dvdIFOTime(menuTitle.Duration, profile.Standard)
+	menuPageTime, err := dvdIFOTime(time.Second, profile.Standard)
 	if err != nil {
 		return err
 	}
-	vmgPlaceholder, vmgSectors, err := buildDVDVMGI(titles, profile, nil, menuSectors, menuTime, menuRecords)
+	vmgPlaceholder, vmgSectors, err := buildDVDVMGI(titles, profile, nil, menuSectors, menuPageTime, menuRecords)
 	if err != nil {
 		return err
 	}
@@ -153,7 +153,7 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 			return fmt.Errorf("video2dvd: title %d VOB has an invalid sector count", i+1)
 		}
 		vobSectors := uint32(vobInfo.Size() / DVDVOBSectorSize)
-		ifo, ifoSectors, err := buildDVDVTSIFO(title, profile, records, vobSectors, menuSectors, menuRecords, i, len(titles))
+		ifo, ifoSectors, err := buildDVDVTSIFO(title, profile, records, vobSectors, menuSectors, menuPageTime, menuRecords, i, len(titles))
 		if err != nil {
 			return fmt.Errorf("video2dvd: build title %d IFO: %w", i+1, err)
 		}
@@ -168,7 +168,7 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 	for i := range authored {
 		starts[i] = authored[i].titleSetBase
 	}
-	vmg, finalVMGSectors, err := buildDVDVMGI(titles, profile, starts, menuSectors, menuTime, menuRecords)
+	vmg, finalVMGSectors, err := buildDVDVMGI(titles, profile, starts, menuSectors, menuPageTime, menuRecords)
 	if err != nil {
 		return err
 	}
@@ -198,7 +198,7 @@ func validateAuthoringProfile(profile Profile) error {
 	return nil
 }
 
-func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord, vobSectors, menuSectors uint32, menuRecords []dvdVOBURecord, titleIndex, titleCount int) ([]byte, uint32, error) {
+func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord, vobSectors, menuSectors uint32, menuPageTime [4]byte, menuRecords []dvdVOBURecord, titleIndex, titleCount int) ([]byte, uint32, error) {
 	if len(records) == 0 || records[0].StartSector != 0 || records[len(records)-1].EndSector+1 != vobSectors {
 		return nil, 0, errors.New("VOBU records do not cover the title VOB")
 	}
@@ -216,7 +216,7 @@ func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord
 	for i, record := range records {
 		binary.BigEndian.PutUint32(admap[4+i*4:8+i*4], record.StartSector)
 	}
-	menuPGCI := buildDVDVMGMenuPGCI(menuSectors, playbackTime, menuRecords, titleCount, titleIndex+1)
+	menuPGCI := buildDVDVMGMenuPGCI(menuSectors, menuPageTime, menuRecords, titleCount, titleIndex+1)
 	admapSectors := uint32((len(admap) + DVDVOBSectorSize - 1) / DVDVOBSectorSize)
 	menuPGCISectors := uint32((len(menuPGCI) + DVDVOBSectorSize - 1) / DVDVOBSectorSize)
 	menuPGCISector := dvdVTSIFOBaseSectors + admapSectors
@@ -378,7 +378,7 @@ func dvdIFOTime(duration time.Duration, standard VideoStandard) ([4]byte, error)
 	return [4]byte{toPackedBCD(hours), toPackedBCD(minutes), toPackedBCD(seconds), rateCode<<6 | toPackedBCD(framePart)}, nil
 }
 
-func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint32, menuSectors uint32, menuTime [4]byte, menuRecords []dvdVOBURecord) ([]byte, uint32, error) {
+func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint32, menuSectors uint32, menuPageTime [4]byte, menuRecords []dvdVOBURecord) ([]byte, uint32, error) {
 	if len(titles) == 0 || len(titles) > dvdMaxTitles {
 		return nil, 0, errors.New("video2dvd: VMGI requires between 1 and 99 titles")
 	}
@@ -419,7 +419,7 @@ func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint3
 			binary.BigEndian.PutUint32(tt[base+8:base+12], titleSetStarts[i])
 		}
 	}
-	menuTable := buildDVDVMGMenuPGCI(menuSectors, menuTime, menuRecords, len(titles), 0)
+	menuTable := buildDVDVMGMenuPGCI(menuSectors, menuPageTime, menuRecords, len(titles), 0)
 	menuCellAddress := buildDVDCellAddressTable(menuRecords, menuSectors)
 	menuVOBUAddress := buildDVDVOBUAddressMap(menuRecords, menuSectors)
 	attrSectors := uint32((len(attrTable) + DVDVOBSectorSize - 1) / DVDVOBSectorSize)
@@ -512,7 +512,7 @@ func buildDVDFirstPlayPGC() []byte {
 	return pgc
 }
 
-func buildDVDVMGMenuPGCI(menuSectors uint32, menuTime [4]byte, menuRecords []dvdVOBURecord, titleSettings ...int) []byte {
+func buildDVDVMGMenuPGCI(menuSectors uint32, menuPageTime [4]byte, menuRecords []dvdVOBURecord, titleSettings ...int) []byte {
 	// Each encoded menu page is a separate VMG PGC/cell. This lets the
 	// highlight buttons use LinkPGCN for deterministic page navigation.
 	titleCount, localVTSTitle := 0, 0
@@ -534,6 +534,7 @@ func buildDVDVMGMenuPGCI(menuSectors uint32, menuTime [4]byte, menuRecords []dvd
 		const cellPlaybackSize = 24
 		pgc := make([]byte, 0xec+commandTableSize+programMapSize+cellPlaybackSize+4)
 		pgc[2], pgc[3] = 1, 1
+		copy(pgc[4:8], menuPageTime[:])
 		pgc[0x0c] = 0x80
 		binary.BigEndian.PutUint16(pgc[0x00e4:0x00e6], 0xec)
 		programMapOffset := 0xec + commandTableSize
@@ -552,8 +553,11 @@ func buildDVDVMGMenuPGCI(menuSectors uint32, menuTime [4]byte, menuRecords []dvd
 		copy(cmd[16:24], loop[:])
 		pgc[programMapOffset] = 1
 		cell := pgc[cellPlaybackOffset:]
-		cell[3] = 1
-		copy(cell[4:8], menuTime[:])
+		// Menu pages contain a single still frame. Keep that frame visible
+		// until the user chooses a button instead of letting navigation
+		// immediately execute the PGC post command and loop the menu cell.
+		cell[2] = 0xff
+		copy(cell[4:8], menuPageTime[:])
 		binary.BigEndian.PutUint32(cell[8:12], menuRecords[page].StartSector)
 		binary.BigEndian.PutUint32(cell[20:24], menuRecords[page].EndSector)
 		binary.BigEndian.PutUint16(cell[24:26], 1)
