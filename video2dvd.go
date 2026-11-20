@@ -54,19 +54,31 @@ type Profile struct {
 	MenuTitle          string
 	MenuBackgroundLuma uint8
 	MenuTextLuma       uint8
-	VideoBitrate       int
+	// MenuFont, if not nil, draws the menu text; see Options.MenuFont.
+	MenuFont     *MenuFont
+	VideoBitrate int
 }
 
 // Options controls conversion and DVD authoring. The zero value selects NTSC,
 // 16:9, and the full-resolution DVD raster for that standard.
 type Options struct {
-	Standard           VideoStandard
-	Aspect             AspectRatio
-	DiscCapacityBytes  int64
+	Standard          VideoStandard
+	Aspect            AspectRatio
+	DiscCapacityBytes int64
+	// MenuTitle is the heading of the generated title menu; empty selects
+	// VIDEO2DVD. It and the title names may contain Japanese text.
 	MenuTitle          string
 	MenuBackgroundLuma uint8
 	MenuTextLuma       uint8
-	VideoBitrate       int
+	// MenuFont is an optional TrueType or OpenType font, made by
+	// ParseMenuFont, for the text of the title menu. Text is drawn
+	// anti-aliased, in the case it was written in, and with the proportions
+	// of the font on the display. Characters the font lacks are drawn with
+	// the built-in fonts. With a nil MenuFont all text uses the built-in
+	// fonts: ASCII in upper case, and Japanese in an embedded 16-pixel
+	// bitmap font.
+	MenuFont     *MenuFont
+	VideoBitrate int
 	// VolumeID is the volume name of an ISO image, as shown when the disc is
 	// mounted. It may contain up to 32 ASCII letters, digits, underscores,
 	// and spaces; letters are stored in upper case. Empty selects VIDEO2DVD.
@@ -93,9 +105,9 @@ func (o Options) profile() (Profile, error) {
 
 	switch o.Standard {
 	case VideoStandardNTSC:
-		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 480, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma, VideoBitrate: o.VideoBitrate}, nil
+		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 480, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma, MenuFont: o.MenuFont, VideoBitrate: o.VideoBitrate}, nil
 	case VideoStandardPAL:
-		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 576, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma, VideoBitrate: o.VideoBitrate}, nil
+		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 576, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma, MenuFont: o.MenuFont, VideoBitrate: o.VideoBitrate}, nil
 	default:
 		return Profile{}, ErrInvalidProfile
 	}

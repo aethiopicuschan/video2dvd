@@ -181,7 +181,7 @@ func TestDVDMenuFontCoversLabelsAndMarksUnsupportedCharacters(t *testing.T) {
 		}
 		return cells
 	}
-	const supported = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+	const supported = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.!\"#$%&'()*+,/:;<=>@[\\]^`{|}~"
 	questionMark := render("?")[0]
 	seen := map[string]rune{}
 	for i, glyph := range render(supported) {
@@ -195,17 +195,22 @@ func TestDVDMenuFontCoversLabelsAndMarksUnsupportedCharacters(t *testing.T) {
 		seen[string(glyph)] = char
 	}
 	// Unsupported characters, including multi-byte ones, take one cell each.
-	cells := render("A日é a/")
+	// Small letters are drawn as capitals.
+	const text = "A한é a€"
+	cells := render(text)
 	if len(cells) != 6 {
 		t.Fatalf("rendered %d cells, want 6", len(cells))
 	}
-	for _, index := range []int{1, 2, 4, 5} {
+	for _, index := range []int{1, 2, 5} {
 		if !bytes.Equal(cells[index], questionMark) {
-			t.Errorf("cell %d of %q is not drawn as '?'", index, "A日é a/")
+			t.Errorf("cell %d of %q is not drawn as '?'", index, text)
 		}
 	}
 	if !bytes.Equal(cells[3], make([]byte, len(cells[3]))) {
 		t.Error("space is not blank")
+	}
+	if !bytes.Equal(cells[4], cells[0]) {
+		t.Error("a small letter is not drawn like its capital")
 	}
 }
 

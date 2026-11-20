@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"image"
 	"os"
 	"path/filepath"
 	"slices"
@@ -17,14 +18,15 @@ const (
 	dvdMenuMaxButtons    = 36
 	dvdMenuRowsPerColumn = 18
 
-	// Menu geometry on the 720-pixel-wide DVD raster. Text is drawn with
-	// 12-pixel character cells and 14-pixel-high glyphs; a button rectangle
-	// extends dvdMenuButtonMarginX left and right of its text column and
-	// covers the 18 lines from two above the glyphs to two below.
+	// Menu geometry on the 720-pixel-wide DVD raster. The built-in 5x7 font
+	// is drawn with 12-pixel character cells and 14-pixel-high glyphs; a
+	// button rectangle extends dvdMenuButtonMarginX left and right of its
+	// text column and covers the 18 lines from two above those glyphs to
+	// two below. Japanese and outline glyphs use up to 16 of these lines.
 	dvdMenuCharWidth     = 12
 	dvdMenuHeadingX      = 48
 	dvdMenuHeadingY      = 24
-	dvdMenuHeadingChars  = (720 - 2*dvdMenuHeadingX) / dvdMenuCharWidth
+	dvdMenuHeadingWidth  = 720 - 2*dvdMenuHeadingX
 	dvdMenuControlY      = 54
 	dvdMenuFirstRowY     = 94
 	dvdMenuRowStep       = 20
@@ -38,6 +40,8 @@ const (
 	dvdMenuPlayAllX      = 56
 	dvdMenuPreviousX     = 440
 	dvdMenuNextX         = 560
+	// dvdMenuControlGap is the least distance between two control buttons.
+	dvdMenuControlGap = 2
 
 	// dvdMenuSubpictureSubstream is the private_stream_1 substream of the
 	// first DVD subpicture stream.
@@ -95,6 +99,7 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 	for i, title := range titles {
 		names[i] = dvdMenuTitleName(title)
 	}
+	text := newDVDMenuText(profile)
 	videoPath := filepath.Join(workDir, "menu.m2v")
 	videoFile, err := os.Create(videoPath)
 	if err != nil {
@@ -104,11 +109,11 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 	for page := range pages {
 		start := page * maxButtons
 		end := min(len(titles), start+maxButtons)
-		layout := layoutDVDMenuPage(names[start:end], start, profile.Aspect, page, pages, titleLaunchBase)
+		layout := layoutDVDMenuPage(text, names[start:end], start, profile.Aspect, page, pages, titleLaunchBase)
 		var encoded bytes.Buffer
 		encoder, encodeErr := NewMPEG2VideoEncoder(&encoded, profile)
 		if encodeErr == nil {
-			encodeErr = encoder.WriteFrame(newDVDMenuFrame(profile, layout))
+			encodeErr = encoder.WriteFrame(newDVDMenuFrame(profile, layout, text))
 		}
 		if encodeErr == nil {
 			encodeErr = encoder.Close()
@@ -152,23 +157,26 @@ func dvdMenuTitleName(title EncodedTitle) string {
 
 // layoutDVDMenuPage places the controls and the titles names[i], which are
 // titles start+i of the disc, on one page. 4:3 pages with more than one
-// column of titles use two half-width columns.
-func layoutDVDMenuPage(names []string, start int, aspect AspectRatio, page, pageCount, titleLaunchBase int) dvdMenuPage {
+// column of titles use two half-width columns. Labels are measured with text,
+// which must also draw the page, and cut to the width of their buttons.
+func layoutDVDMenuPage(text *dvdMenuText, names []string, start int, aspect AspectRatio, page, pageCount, titleLaunchBase int) dvdMenuPage {
 	var layout dvdMenuPage
-	control := func(label string, textX int, command [8]byte) {
+	// A control is as wide as its label, which may extend to nextX.
+	control := func(label string, textX, nextX int, command [8]byte) {
+		label = text.truncate(label, nextX-dvdMenuControlGap-2*dvdMenuButtonMarginX-textX)
 		layout.controls = append(layout.controls, dvdMenuEntry{
 			label: label, textX: textX, textY: dvdMenuControlY,
 			left:    textX - dvdMenuButtonMarginX,
-			right:   textX + len(label)*dvdMenuCharWidth + dvdMenuButtonMarginX - 1,
+			right:   textX + text.width(label) + dvdMenuButtonMarginX - 1,
 			command: command,
 		})
 	}
 	if page == 0 {
-		control("PLAY ALL", dvdMenuPlayAllX, linkPGCNCommand(pageCount))
+		control("PLAY ALL", dvdMenuPlayAllX, dvdMenuPreviousX, linkPGCNCommand(pageCount))
 	}
 	if pageCount > 1 {
-		control("PREV", dvdMenuPreviousX, linkPGCNCommand((page+pageCount-1)%pageCount))
-		control("NEXT", dvdMenuNextX, linkPGCNCommand((page+1)%pageCount))
+		control("PREV", dvdMenuPreviousX, dvdMenuNextX, linkPGCNCommand((page+pageCount-1)%pageCount))
+		control("NEXT", dvdMenuNextX, dvdMenuWideColumnEnd+1+dvdMenuButtonMarginX+dvdMenuControlGap, linkPGCNCommand((page+1)%pageCount))
 	}
 	twoColumns := aspect != AspectRatio16x9 && len(names) > dvdMenuRowsPerColumn
 	for i, name := range names {
@@ -182,24 +190,16 @@ func layoutDVDMenuPage(names []string, start int, aspect AspectRatio, page, page
 		}
 		label := padMenuNumber(start + i + 1)
 		if name != "" {
-			label += " " + strings.ToUpper(name)
+			label += " " + text.normalize(name)
 		}
 		layout.titles = append(layout.titles, dvdMenuEntry{
-			label: truncateDVDMenuText(label, (right+1-dvdMenuButtonMarginX-textX)/dvdMenuCharWidth),
+			label: text.truncate(label, right+1-dvdMenuButtonMarginX-textX),
 			textX: textX, textY: dvdMenuFirstRowY + row*dvdMenuRowStep,
 			left: textX - dvdMenuButtonMarginX, right: right,
 			command: linkPGCNCommand(titleLaunchBase + start + i),
 		})
 	}
 	return layout
-}
-
-func truncateDVDMenuText(text string, maxChars int) string {
-	runes := []rune(text)
-	if len(runes) > maxChars {
-		runes = runes[:maxChars]
-	}
-	return string(runes)
 }
 
 // buttons returns the page's highlight buttons: the controls followed by the
@@ -271,7 +271,7 @@ func (p dvdMenuPage) buttons() []DVDNAVButton {
 }
 
 func makeDVDMenuButtons(start, end int, profile Profile, page, pageCount, titleLaunchBase int) []DVDNAVButton {
-	return layoutDVDMenuPage(make([]string, end-start), start, profile.Aspect, page, pageCount, titleLaunchBase).buttons()
+	return layoutDVDMenuPage(newDVDMenuText(profile), make([]string, end-start), start, profile.Aspect, page, pageCount, titleLaunchBase).buttons()
 }
 
 func dvdJumpTitleCommand(titleNumber int) [8]byte {
@@ -315,7 +315,8 @@ func menuFrameRateDenominator(standard VideoStandard) int {
 	return 1001
 }
 
-func newDVDMenuFrame(profile Profile, page dvdMenuPage) DecodedVideoFrame {
+// newDVDMenuFrame draws a menu page that was laid out with text.
+func newDVDMenuFrame(profile Profile, page dvdMenuPage, text *dvdMenuText) DecodedVideoFrame {
 	frame := DecodedVideoFrame{Width: profile.FrameWidth, Height: profile.FrameHeight, Duration: time.Second,
 		Y: make([]byte, profile.FrameWidth*profile.FrameHeight), U: make([]byte, profile.FrameWidth*profile.FrameHeight/4), V: make([]byte, profile.FrameWidth*profile.FrameHeight/4)}
 	background := profile.MenuBackgroundLuma
@@ -336,12 +337,16 @@ func newDVDMenuFrame(profile Profile, page dvdMenuPage) DecodedVideoFrame {
 	if textLuma == 0 {
 		textLuma = 220
 	}
-	drawDVDMenuText(&frame, dvdMenuHeadingX, dvdMenuHeadingY, truncateDVDMenuText(strings.ToUpper(title), dvdMenuHeadingChars), textLuma)
-	for _, entry := range page.controls {
-		drawDVDMenuText(&frame, entry.textX, entry.textY, entry.label, textLuma)
+	// Text stays within the lines of a button, and within its rectangle
+	// where it has one.
+	lines := func(left, right, textY int) image.Rectangle {
+		return image.Rect(left, textY-dvdMenuButtonTop, right+1, textY+dvdMenuButtonBottom+1)
 	}
-	for _, entry := range page.titles {
-		drawDVDMenuText(&frame, entry.textX, entry.textY, entry.label, textLuma)
+	heading := text.truncate(text.normalize(title), dvdMenuHeadingWidth)
+	text.draw(&frame, dvdMenuHeadingX, dvdMenuHeadingY, heading, textLuma,
+		lines(dvdMenuHeadingX-dvdMenuButtonMarginX, dvdMenuHeadingX+dvdMenuHeadingWidth+dvdMenuButtonMarginX-1, dvdMenuHeadingY))
+	for _, entry := range slices.Concat(page.controls, page.titles) {
+		text.draw(&frame, entry.textX, entry.textY, entry.label, textLuma, lines(entry.left, entry.right, entry.textY))
 	}
 	return frame
 }
@@ -353,8 +358,9 @@ func padMenuNumber(number int) string {
 	return string(rune('0'+number/10)) + string(rune('0'+number%10))
 }
 
-// dvdMenuFont holds 5x7 glyphs, one byte per row with bit 4 leftmost.
-// Characters without a glyph are drawn as '?'.
+// dvdMenuFont holds the 5x7 glyphs of ASCII, one byte per row with bit 4
+// leftmost. It has capital letters only; dvdMenuText draws small letters
+// with them.
 var dvdMenuFont = map[rune][7]byte{
 	'?': {0x0e, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04}, ' ': {0, 0, 0, 0, 0, 0, 0},
 	'-': {0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00}, '_': {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f},
@@ -377,28 +383,20 @@ var dvdMenuFont = map[rune][7]byte{
 	'U': {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}, 'V': {0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04},
 	'W': {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0a}, 'X': {0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11},
 	'Y': {0x11, 0x11, 0x11, 0x0a, 0x04, 0x04, 0x04}, 'Z': {0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f},
-}
-
-// drawDVDMenuText draws one character cell per rune of text.
-func drawDVDMenuText(frame *DecodedVideoFrame, x, y int, text string, value byte) {
-	for _, char := range text {
-		glyph, ok := dvdMenuFont[char]
-		if !ok {
-			glyph = dvdMenuFont['?']
-		}
-		for row, bits := range glyph {
-			for column := range 5 {
-				if bits&(1<<(4-column)) != 0 && x+column*2+1 < frame.Width && y+row*2+1 < frame.Height {
-					for dy := range 2 {
-						for dx := range 2 {
-							frame.Y[(y+row*2+dy)*frame.Width+x+column*2+dx] = value
-						}
-					}
-				}
-			}
-		}
-		x += dvdMenuCharWidth
-	}
+	'!': {0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04}, '"': {0x0a, 0x0a, 0x0a, 0x00, 0x00, 0x00, 0x00},
+	'#': {0x0a, 0x0a, 0x1f, 0x0a, 0x1f, 0x0a, 0x0a}, '$': {0x04, 0x0f, 0x14, 0x0e, 0x05, 0x1e, 0x04},
+	'%': {0x18, 0x19, 0x02, 0x04, 0x08, 0x13, 0x03}, '&': {0x0c, 0x12, 0x14, 0x08, 0x15, 0x12, 0x0d},
+	'\'': {0x04, 0x04, 0x08, 0x00, 0x00, 0x00, 0x00}, '(': {0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02},
+	')': {0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08}, '*': {0x00, 0x04, 0x15, 0x0e, 0x15, 0x04, 0x00},
+	'+': {0x00, 0x04, 0x04, 0x1f, 0x04, 0x04, 0x00}, ',': {0x00, 0x00, 0x00, 0x00, 0x0c, 0x04, 0x08},
+	'/': {0x00, 0x01, 0x02, 0x04, 0x08, 0x10, 0x00}, ':': {0x00, 0x0c, 0x0c, 0x00, 0x0c, 0x0c, 0x00},
+	';': {0x00, 0x0c, 0x0c, 0x00, 0x0c, 0x04, 0x08}, '<': {0x02, 0x04, 0x08, 0x10, 0x08, 0x04, 0x02},
+	'=': {0x00, 0x00, 0x1f, 0x00, 0x1f, 0x00, 0x00}, '>': {0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08},
+	'@': {0x0e, 0x11, 0x01, 0x0d, 0x15, 0x15, 0x0e}, '[': {0x0e, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0e},
+	'\\': {0x00, 0x10, 0x08, 0x04, 0x02, 0x01, 0x00}, ']': {0x0e, 0x02, 0x02, 0x02, 0x02, 0x02, 0x0e},
+	'^': {0x04, 0x0a, 0x11, 0x00, 0x00, 0x00, 0x00}, '`': {0x08, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00},
+	'{': {0x02, 0x04, 0x04, 0x08, 0x04, 0x04, 0x02}, '|': {0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
+	'}': {0x08, 0x04, 0x04, 0x02, 0x04, 0x04, 0x08}, '~': {0x00, 0x00, 0x08, 0x15, 0x02, 0x00, 0x00},
 }
 
 // The menu highlight is a DVD subpicture with "pattern" pixels over every

@@ -1,2 +1,6 @@
 [default.extend-words]
 trak = "trak"
+
+[files]
+# Generated binary font table (see gen/menufont).
+extend-exclude = ["dvd_menu_font_shinonome16.bin"]
