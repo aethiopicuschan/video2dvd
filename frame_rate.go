@@ -20,9 +20,12 @@ type DVDFrameRateConverter struct {
 	nextIndex       int64
 	width           int
 	height          int
-	haveInput       bool
-	fixedOrigin     bool
-	finished        bool
+	// side remembers on which side of an output timestamp the last input
+	// frame near one fell: -1 at or before it, +1 after it, 0 not yet known.
+	side        int8
+	haveInput   bool
+	fixedOrigin bool
+	finished    bool
 }
 
 // NewDVDFrameRateConverter creates a streaming DVD frame-rate converter.
@@ -97,7 +100,11 @@ func (c *DVDFrameRateConverter) push(frame DecodedVideoFrame, cloneFrame bool) e
 		if err != nil {
 			return err
 		}
-		if err := c.emitBefore(limit); err != nil {
+		threshold, err := c.steadyThreshold(limit - c.tolerance())
+		if err != nil {
+			return err
+		}
+		if err := c.emitBefore(threshold); err != nil {
 			return err
 		}
 	} else {
@@ -135,7 +142,7 @@ func (c *DVDFrameRateConverter) Finish() error {
 	if err != nil {
 		return err
 	}
-	return c.emitBefore(end)
+	return c.emitBefore(end - c.tolerance())
 }
 
 func subtractDurations(left, right time.Duration) (time.Duration, error) {
@@ -148,16 +155,19 @@ func subtractDurations(left, right time.Duration) (time.Duration, error) {
 	return left - right, nil
 }
 
-func (c *DVDFrameRateConverter) emitBefore(limit time.Duration) error {
+// emitBefore shows the pending frame at every output timestamp before
+// threshold. Callers pass the next frame's start (or the last frame's end)
+// less tolerance: source timestamps are rounded to container ticks, so a
+// frame that starts within a quarter of an output period after an output
+// timestamp is the one meant for it; otherwise equal cadences would repeat
+// and drop frames.
+func (c *DVDFrameRateConverter) emitBefore(threshold time.Duration) error {
 	for c.pending != nil {
 		pts, err := c.outputTimestamp(c.nextIndex)
 		if err != nil {
 			return err
 		}
-		// Source timestamps are rounded to container ticks, so a frame that
-		// starts within a quarter of an output period after pts is the one
-		// meant for it; otherwise equal cadences would repeat and drop frames.
-		if pts >= limit-c.tolerance() {
+		if pts >= threshold {
 			return nil
 		}
 		nextPTS, err := c.outputTimestamp(c.nextIndex + 1)
@@ -175,8 +185,51 @@ func (c *DVDFrameRateConverter) emitBefore(limit time.Duration) error {
 	return nil
 }
 
+func (c *DVDFrameRateConverter) period() time.Duration {
+	return time.Duration(c.rateDenominator) * time.Second / time.Duration(c.rateNumerator)
+}
+
 func (c *DVDFrameRateConverter) tolerance() time.Duration {
-	return time.Duration(c.rateDenominator) * time.Second / time.Duration(c.rateNumerator) / 4
+	return c.period() / 4
+}
+
+// steadyThreshold adds hysteresis to the decision whether an input frame
+// starts before or after an output timestamp. A source whose cadence is close
+// to a multiple of the output rate drifts across that decision slowly, and
+// timestamp rounding would otherwise flip it back and forth for dozens of
+// frames, each flip a dropped or repeated frame. A threshold within a
+// sixteenth of an output period of an output timestamp is therefore moved to
+// the side the preceding nearby frames were on; the side changes only once a
+// frame is clearly, by more than that margin, on the other one.
+func (c *DVDFrameRateConverter) steadyThreshold(threshold time.Duration) (time.Duration, error) {
+	margin := c.period() / 16
+	index := int64(math.Round(float64(threshold) * float64(c.rateNumerator) / (float64(c.rateDenominator) * float64(time.Second))))
+	if index < 0 || margin <= 0 {
+		return threshold, nil
+	}
+	nearest, err := c.outputTimestamp(index)
+	if err != nil {
+		return 0, err
+	}
+	distance := threshold - nearest
+	side := int8(-1)
+	if distance > 0 {
+		side = 1
+	}
+	if distance <= -margin || distance >= margin {
+		if distance > -2*margin && distance < 2*margin {
+			c.side = side
+		}
+		return threshold, nil
+	}
+	if c.side == 0 {
+		c.side = side
+	}
+	if c.side > 0 {
+		// Just past the timestamp: the pending frame keeps that slot.
+		return nearest + 1, nil
+	}
+	return nearest, nil
 }
 
 func (c *DVDFrameRateConverter) outputTimestamp(index int64) (time.Duration, error) {
@@ -215,6 +268,7 @@ func cloneDecodedVideoFrame(frame DecodedVideoFrame) DecodedVideoFrame {
 		Duration: frame.Duration,
 		Width:    frame.Width,
 		Height:   frame.Height,
+		Color:    frame.Color,
 		Y:        append([]byte(nil), frame.Y...),
 		U:        append([]byte(nil), frame.U...),
 		V:        append([]byte(nil), frame.V...),

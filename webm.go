@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -117,6 +118,7 @@ func probeWebMReader(r io.Reader) (MP4Info, error) {
 			default:
 				track.Codec = source.CodecName
 			}
+			track.Color = webMContainerColor(source.Video.Colour)
 			if source.Video.DisplayWidth > 0 && source.Video.DisplayHeight > 0 && track.Width > 0 && track.Height > 0 {
 				parN := uint64(source.Video.DisplayWidth) * uint64(track.Height)
 				parD := uint64(source.Video.DisplayHeight) * uint64(track.Width)
@@ -147,9 +149,24 @@ func probeWebMReader(r io.Reader) (MP4Info, error) {
 	return info, nil
 }
 
+// webMContainerColor maps a Matroska Colour element. Range value 2 is the
+// only explicit full-range signal.
+func webMContainerColor(colour webm.VideoColourConfig) VideoColor {
+	var color VideoColor
+	if colour.MatrixCoefficientsSet {
+		color.Matrix = colorMatrixFromCode(colour.MatrixCoefficients)
+	}
+	color.FullRange = colour.RangeSet && colour.Range == 2
+	return color
+}
+
 // PrepareWebMVideoForDVD decodes WebM VP9 (including 10/12-bit VP9 Profile 2),
 // VP8, or AV1 video, converts frames to 8-bit YUV 4:2:0, and prepares the DVD
-// raster and frame rate. High-bit-depth VP9 is reduced to 8-bit for DVD.
+// raster, colour encoding (see FitVideoFrameForDVD) and frame rate.
+// High-bit-depth VP9 is reduced to 8-bit for DVD. Timestamps of
+// constant-frame-rate video, which WebM stores rounded to its millisecond
+// tick, are put back on their exact frame times before frame-rate conversion;
+// the first frame's timestamp is kept.
 func PrepareWebMVideoForDVD(
 	ctx context.Context,
 	path string,
@@ -181,8 +198,15 @@ func prepareWebMVideoForDVD(
 	if err != nil {
 		return 0, err
 	}
+	cadence := webMCadence{}
+	if info, probeErr := ProbeWebM(path); probeErr == nil {
+		if track, selectErr := selectWebMVideoTrack(info, trackIndex); selectErr == nil {
+			cadence.hint = track.DefaultDuration
+		}
+	}
 	err = DecodeWebMVideo(ctx, path, trackIndex, func(frame DecodedVideoFrame) error {
-		fitted, err := FitVideoFrame(frame, profile, sourceAspectNumerator, sourceAspectDenominator, mode)
+		frame.PTS, frame.Duration = cadence.regularize(frame.PTS, frame.Duration)
+		fitted, err := FitVideoFrameForDVD(frame, profile, sourceAspectNumerator, sourceAspectDenominator, mode)
 		if err != nil {
 			return err
 		}
@@ -192,6 +216,96 @@ func prepareWebMVideoForDVD(
 		return 0, err
 	}
 	return rateConverter.origin, rateConverter.Finish()
+}
+
+const (
+	// webMTimestampTick is the resolution WebM timestamps are stored at; the
+	// format fixes TimestampScale at one millisecond in practice.
+	webMTimestampTick = time.Millisecond
+	// webMCadenceSlack is how far two rounded timestamps may be from their
+	// exact distance: one tick, plus a quarter for muxers that round the
+	// frame times they were given a second time.
+	webMCadenceSlack = webMTimestampTick + webMTimestampTick/4
+	// webMCadenceMinFrames is the run of evenly spaced frames required before
+	// their timestamps are replaced, so variable-frame-rate video keeps its
+	// own timestamps.
+	webMCadenceMinFrames = 8
+	webMCadenceMaxRate   = 240
+)
+
+// webMCadence recovers exact frame times from tick-rounded timestamps of
+// constant-frame-rate video. It tracks the range of frame periods consistent
+// with every timestamp since an anchor frame; while that range is not empty
+// the n-th frame after the anchor is placed at anchor + n*period. A timestamp
+// that no single period can explain makes that frame the new anchor, so
+// variable-frame-rate video and streams with gaps follow their container
+// timestamps.
+type webMCadence struct {
+	// hint is the track's DefaultDuration, zero when absent.
+	hint      time.Duration
+	anchor    time.Duration
+	last      time.Duration
+	count     int64
+	low, high float64
+	started   bool
+}
+
+func (c *webMCadence) regularize(pts, duration time.Duration) (time.Duration, time.Duration) {
+	delta := pts - c.anchor
+	fits := c.started && delta > 0
+	if fits {
+		frames := float64(c.count + 1)
+		low := max(c.low, (float64(delta)-float64(webMCadenceSlack))/frames)
+		high := min(c.high, (float64(delta)+float64(webMCadenceSlack))/frames)
+		if fits = low <= high; fits {
+			c.low, c.high = low, high
+		}
+	}
+	if !fits {
+		c.anchor, c.count, c.low, c.high = pts, 0, 0, math.Inf(1)
+		if c.started {
+			pts = max(pts, c.last)
+		}
+		c.started, c.last = true, pts
+		return pts, duration
+	}
+	c.count++
+	if c.count >= webMCadenceMinFrames {
+		period := c.period()
+		pts = c.anchor + time.Duration(math.Round(float64(c.count)*period))
+		duration = max(time.Duration(math.Round(period)), 1)
+	}
+	// Refining the period may move a frame time by a fraction of a tick,
+	// but never before its predecessor.
+	pts = max(pts, c.last)
+	c.last = pts
+	return pts, duration
+}
+
+// period picks the frame period in nanoseconds from the consistent range:
+// the common rate (whole frames per second, or the NTSC-style 1000/1001 of
+// one) closest to the DefaultDuration hint or else to the middle of the
+// range, and that target itself when no common rate fits.
+func (c *webMCadence) period() float64 {
+	target := (c.low + c.high) / 2
+	if hint := float64(c.hint); hint >= c.low && hint <= c.high {
+		target = hint
+	}
+	best, bestDistance := target, math.Inf(1)
+	for rate := 1; rate <= webMCadenceMaxRate; rate++ {
+		for _, candidate := range [2]float64{
+			float64(time.Second) / float64(rate),
+			float64(time.Second) * 1001 / (float64(rate) * 1000),
+		} {
+			if candidate < c.low || candidate > c.high {
+				continue
+			}
+			if distance := math.Abs(candidate - target); distance < bestDistance {
+				best, bestDistance = candidate, distance
+			}
+		}
+	}
+	return best
 }
 
 // PrepareWebMAudioForDVD decodes an Opus track to 48 kHz stereo and writes DVD
@@ -245,6 +359,14 @@ func DecodeWebMVideo(ctx context.Context, path string, trackIndex *int, handler 
 			decoded, err := copyGoAVVideoFrame(frame)
 			if err != nil {
 				return err
+			}
+			decoded.Color = track.Color
+			if track.Codec == "vp8" && decoded.Color.Matrix == ColorMatrixUnspecified {
+				// The VP8 bitstream defines its samples as BT.601. AV1
+				// carries a colour description in its sequence header,
+				// which is not read; untagged AV1 falls back to the
+				// picture-size rule.
+				decoded.Color.Matrix = ColorMatrixBT601
 			}
 			return resolver.pushOwned(decoded)
 		})
@@ -381,6 +503,12 @@ func decodeWebMVP9(ctx context.Context, path string, track TrackInfo, handler fu
 		return fmt.Errorf("video2dvd: WebM track %d is not VP9 video", track.Index)
 	}
 	trackID := tracks[track.Index].ID
+	// The Colour element overrides the bitstream wherever it is specific;
+	// the bitstream's own description is refreshed on every key frame.
+	containerColour := tracks[track.Index].Video.Colour
+	containerColor := webMContainerColor(containerColour)
+	containerRange := containerColour.RangeSet && (containerColour.Range == 1 || containerColour.Range == 2)
+	color := containerColor
 	profile0Decoder := vp9decoder.New()
 	profile2Decoder := vp9decoder.New()
 	resolver := newWebMFrameDurationResolver(track.DefaultDuration, handler)
@@ -406,6 +534,14 @@ func decodeWebMVP9(ctx context.Context, path string, track TrackInfo, handler fu
 		header, err := vp9frame.Parse(packet.Data, previousWidth, previousHeight)
 		if err != nil {
 			return fmt.Errorf("video2dvd: parse VP9 frame header: %w", err)
+		}
+		if header.FrameType == vp9frame.FrameKey && !header.ShowExistingFrame {
+			if containerColor.Matrix == ColorMatrixUnspecified {
+				color.Matrix = vp9ColorMatrix(header.ColorSpace)
+			}
+			if !containerRange {
+				color.FullRange = header.ColorRange
+			}
 		}
 		var decoded DecodedVideoFrame
 		var decodedVisible bool
@@ -448,6 +584,7 @@ func decodeWebMVP9(ctx context.Context, path string, track TrackInfo, handler fu
 		if !decodedVisible {
 			return errors.New("video2dvd: VP9 decoder produced no visible frame")
 		}
+		decoded.Color = color
 		if err := resolver.pushOwned(decoded); err != nil {
 			return err
 		}
@@ -460,6 +597,19 @@ func decodeWebMVP9(ctx context.Context, path string, track TrackInfo, handler fu
 		return err
 	}
 	return ctx.Err()
+}
+
+// vp9ColorMatrix maps the color_space field of a VP9 key frame header.
+func vp9ColorMatrix(colorSpace int) ColorMatrix {
+	switch colorSpace {
+	case vp9frame.ColorspaceBT601, vp9frame.ColorspaceSMPTE170:
+		return ColorMatrixBT601
+	case vp9frame.ColorspaceBT709:
+		return ColorMatrixBT709
+	case 0:
+		return ColorMatrixUnspecified
+	}
+	return ColorMatrixOther
 }
 
 func copyVP9Frame(src *refbuf.Frame, pts, duration time.Duration) (DecodedVideoFrame, error) {
@@ -484,7 +634,10 @@ func copyVP9HighBitDepthFrame(src *refbuf.Frame16, bitDepth int, pts, duration t
 		return DecodedVideoFrame{}, errors.New("video2dvd: VP9 decoder returned invalid high-bit-depth I420 dimensions")
 	}
 	decoded := DecodedVideoFrame{PTS: pts, Duration: duration, Width: src.Width, Height: src.Height, Y: make([]byte, src.Width*src.Height), U: make([]byte, src.Width*src.Height/4), V: make([]byte, src.Width*src.Height/4)}
-	maxSample := (1 << bitDepth) - 1
+	// A rounded shift keeps the studio-range levels on their 8-bit code
+	// values: 10-bit white 940 becomes 235 and black 64 becomes 16.
+	shift := bitDepth - 8
+	rounding := 1 << (shift - 1)
 	convert := func(dst []byte, plane []uint16, offset, width, height, stride int) error {
 		if offset < 0 || stride < width || len(plane) < offset+(height-1)*stride+width {
 			return errors.New("video2dvd: VP9 decoder returned a truncated high-bit-depth plane")
@@ -492,7 +645,7 @@ func copyVP9HighBitDepthFrame(src *refbuf.Frame16, bitDepth int, pts, duration t
 		for row := range height {
 			for col := range width {
 				sample := int(plane[offset+row*stride+col])
-				dst[row*width+col] = byte((sample*255 + maxSample/2) / maxSample)
+				dst[row*width+col] = byte(min((sample+rounding)>>shift, 255))
 			}
 		}
 		return nil

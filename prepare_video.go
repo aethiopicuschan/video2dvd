@@ -6,7 +6,8 @@ import (
 )
 
 // PrepareMP4VideoForDVD decodes an MP4 H.264 track, fits frames to the DVD
-// raster, and converts the presentation timestamps to the selected DVD frame
+// raster and its BT.601 studio-range colour encoding (see FitVideoFrameForDVD),
+// and converts the presentation timestamps to the selected DVD frame
 // rate. Source display aspect ratio must be supplied by the caller because
 // some MP4 files use non-square pixels or rotation metadata not represented by
 // the decoded frame dimensions. The handler receives owned DVD-raster frames.
@@ -38,7 +39,7 @@ func PrepareMP4VideoForDVD(
 		}
 	}
 	err = DecodeMP4Video(ctx, path, trackIndex, func(frame DecodedVideoFrame) error {
-		fitted, err := FitVideoFrame(frame, profile, sourceAspectNumerator, sourceAspectDenominator, mode)
+		fitted, err := FitVideoFrameForDVD(frame, profile, sourceAspectNumerator, sourceAspectDenominator, mode)
 		if err != nil {
 			return err
 		}

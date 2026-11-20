@@ -13,9 +13,12 @@ import (
 // InProcessEncoder is a built-in Encoder that uses only Go code. Its MPEG-2
 // video coder emits closed GOPs of I and P pictures with half-sample motion
 // compensation and VBV rate control, without B pictures, so it needs more
-// bits than a dedicated encoder for the same quality. It converts MP4
-// AAC-LC/AC-3 and WebM Opus audio to LPCM, padded or trimmed to the encoded
-// video length, and creates silent LPCM when the input has no audio track.
+// bits than a dedicated encoder for the same quality. Pictures are fitted to
+// the DVD raster with FitVideoFrameForDVD, so BT.709 and full-range sources
+// are converted to the BT.601 studio-range encoding players assume. It
+// converts MP4 AAC-LC/AC-3 and WebM Opus audio to LPCM, padded or trimmed to
+// the encoded video length, and creates silent LPCM when the input has no
+// audio track.
 type InProcessEncoder struct{}
 
 // NewInProcessEncoder returns the built-in Encoder implementation.

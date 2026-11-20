@@ -30,28 +30,41 @@ const (
 	// (vbv_buffer_size 112), the largest DVD-Video allows.
 	mpeg2VBVBufferBits = 112 * 16384
 	// mpeg2VBVStartBits is the occupancy rate control assumes at the first
-	// picture and steers back to before every I picture; mpeg2VBVCeilingBits
-	// is the most it ever counts on, so unspent bits carry over only up to
-	// that level. Staying below the declared size means a multiplexer only has
-	// to deliver the start occupancy ahead of the first decoding time, and
-	// keeps the largest picture well inside the buffer.
-	mpeg2VBVStartBits   = 100 * 1024 * 8
-	mpeg2VBVCeilingBits = 150 * 1024 * 8
+	// picture and steers back to before every I picture, which is the
+	// picture that needs the reserve; mpeg2VBVCeilingBits is the most it ever
+	// counts on, so unspent bits carry over only up to that level. Both stay
+	// below the declared size for the multiplexer's sake: it sends a picture
+	// at most 0.3 s ahead of its decoding time, also the first one, and in
+	// that time the video share of the DVD mux rate carries about 300 KiB.
+	// Whatever the model holds can therefore arrive in time, with a third to
+	// spare.
+	mpeg2VBVStartBits   = 150 * 1024 * 8
+	mpeg2VBVCeilingBits = 190 * 1024 * 8
 	// mpeg2VBVGuardBits is kept in the modelled buffer after every picture to
 	// absorb pack granularity and audio/NAV interleaving in the multiplexer.
 	mpeg2VBVGuardBits = 6 * DVDVOBSectorSize * 8
 
-	// An I picture may take at most this fraction of the bits left for its
-	// GOP, so that a scene change after it does not starve the P pictures.
-	mpeg2MaxIntraShare = 0.5
 	// Share of a GOP given to the first I picture, before any P picture has
 	// shown how the content codes.
 	mpeg2FirstIntraShare = 0.25
-	// An I picture is coded at this multiple of the previous GOP's mean P
-	// quantizer scale. The intra matrix quantizes high frequencies more
-	// coarsely than the flat non-intra one, and every P picture of the GOP
-	// predicts from the I picture, so it is given the finer scale.
+	// No picture may take more than this fraction of the bits left for its
+	// GOP, so that a change after it does not starve the other pictures.
+	mpeg2MaxPictureShare = 0.5
+	// An I picture is budgeted at this multiple of the quantizer scale it
+	// leaves for the P pictures of its GOP. The intra matrix quantizes high
+	// frequencies more coarsely than the flat non-intra one, and every
+	// P picture of the GOP predicts from the I picture, so it is given the
+	// finer scale.
 	mpeg2IntraQuantizerRatio = 0.75
+	// Weight of the latest P picture in the running complexity estimate.
+	mpeg2ComplexityAdaptation = 1.0 / 3
+	// A scene change inside a GOP is budgeted like the picture that opens
+	// one, on the assumption that cheap P pictures follow it. Each further
+	// scene change in the same GOP contradicts that, so the n-th may take at
+	// most the share of a picture weighing this much, divided by n, among
+	// equal others. Without the bound a run of unrelated pictures spends
+	// half of what is left on each and leaves the last ones nothing.
+	mpeg2SceneChangeWeight = 6.0
 )
 
 func profileVideoBitrate(profile Profile) int {
@@ -75,43 +88,133 @@ type mpeg2RateControl struct {
 	// fullness is the modelled occupancy in bits just before the next picture
 	// is removed.
 	fullness float64
-	// Quantizer scales of the P pictures coded since the last I picture.
-	predictiveQuantizerSum   int
-	predictiveQuantizerCount int
+	// complexity is the running mean, over P pictures, of coded bits times
+	// quantizer scale: the bits a typical P picture takes at scale 1. It is
+	// zero until a P picture has been coded.
+	complexity float64
+	// predictiveFloor is the finest scale worth giving a P picture: the one
+	// its reference picture was budgeted at.
+	predictiveFloor int
+	// sceneChanges counts the scene-change P pictures budgeted in the
+	// current GOP.
+	sceneChanges int
 }
 
 func newMPEG2RateControl(bitsPerPicture float64) mpeg2RateControl {
-	return mpeg2RateControl{bitsPerPicture: bitsPerPicture, fullness: mpeg2VBVStartBits}
+	return mpeg2RateControl{bitsPerPicture: bitsPerPicture, fullness: mpeg2VBVStartBits, predictiveFloor: 1}
 }
 
-// pictureBudget returns, in bytes, the size to aim for and the size that must
-// not be exceeded for the next picture, and the finest quantizer scale worth
-// trying. remaining counts the pictures left in the GOP including this one.
-func (rc *mpeg2RateControl) pictureBudget(isIntra bool, remaining int) (targetBytes, limitBytes, minQuantizer int) {
-	limit := max(rc.fullness-mpeg2VBVGuardBits, 0)
-	// Spend what brings the buffer back to its start level by the next
-	// I picture, which is the picture that needs the reserve.
-	gopBits := rc.fullness + float64(remaining)*rc.bitsPerPicture - mpeg2VBVStartBits
-	target := gopBits / float64(remaining)
-	minQuantizer = 1
-	if isIntra {
-		if rc.predictiveQuantizerCount > 0 {
-			mean := float64(rc.predictiveQuantizerSum) / float64(rc.predictiveQuantizerCount)
-			minQuantizer = max(1, min(31, int(mean*mpeg2IntraQuantizerRatio+0.5)))
-			target = gopBits * mpeg2MaxIntraShare
-		} else {
-			target = gopBits * mpeg2FirstIntraShare
-		}
-		rc.predictiveQuantizerSum, rc.predictiveQuantizerCount = 0, 0
+// mpeg2PictureBudget is what rate control grants the next picture.
+type mpeg2PictureBudget struct {
+	// limitBytes must not be exceeded, or the decoder buffer underflows.
+	limitBytes int
+	// floorQuantizer is the finest quantizer scale the picture is meant to
+	// have. A finer one may only spend spareBytes, which the buffer could
+	// not keep for later pictures anyway.
+	floorQuantizer int
+	spareBytes     int
+	// The size to aim for depends on the scale the picture is coded at:
+	// gopBits is left for the picture and the rest of its GOP, and the rest
+	// is expected to take otherBits divided by that scale. minBits and
+	// maxBits bound the result where the estimate is off.
+	gopBits, otherBits float64
+	minBits, maxBits   float64
+}
+
+// targetBytes is the size to aim for at a quantizer scale, ignoring the
+// decoder buffer.
+func (b mpeg2PictureBudget) targetBytes(quantizer int) int {
+	return int(max(min(b.gopBits-b.otherBits/float64(quantizer), b.maxBits), b.minBits)) / 8
+}
+
+// budgetBytes is the size a picture coded at a quantizer scale may have.
+func (b mpeg2PictureBudget) budgetBytes(quantizer int) int {
+	budget := min(b.targetBytes(quantizer), b.limitBytes)
+	if quantizer < b.floorQuantizer {
+		budget = min(budget, b.spareBytes)
 	}
-	target = min(max(target, rc.bitsPerPicture/8), limit)
-	return int(target) / 8, int(limit) / 8, minQuantizer
+	return budget
 }
 
-func (rc *mpeg2RateControl) pictureCoded(isIntra bool, sizeBytes, quantizer int) {
-	if !isIntra {
-		rc.predictiveQuantizerSum += quantizer
-		rc.predictiveQuantizerCount++
+// pictureBudget returns the budget of the next picture: an I picture, the
+// P picture of a scene change, or an ordinary P picture. The pictures after
+// either of the first two depend on it alone. remaining counts the pictures
+// left in the GOP including this one.
+//
+// The budget aims at one picture quality for the rest of the GOP: the scale
+// at which this picture, measured, and the others, estimated from the
+// complexity of earlier P pictures, together spend what brings the buffer
+// back to its start level by the next I picture.
+func (rc *mpeg2RateControl) pictureBudget(intra, sceneChange bool, remaining int) mpeg2PictureBudget {
+	unpredicted := intra || sceneChange
+	if intra {
+		rc.sceneChanges = 0
+	} else if sceneChange {
+		rc.sceneChanges++
+	}
+	gopBits := rc.fullness + float64(remaining)*rc.bitsPerPicture - mpeg2VBVStartBits
+	others := float64(remaining - 1)
+	equalShare := 1 / float64(remaining)
+	budget := mpeg2PictureBudget{
+		limitBytes: int(max(rc.fullness-mpeg2VBVGuardBits, 0)) / 8,
+		gopBits:    gopBits,
+	}
+	// The complexity estimate lags behind the content. The bounds keep a
+	// picture from starving the rest of its GOP when the estimate is too low,
+	// as it is when motion starts in a still scene, and from being starved
+	// itself when it is too high, as it is after a busy scene.
+	var minShare, maxShare float64
+	switch {
+	case rc.complexity == 0 && unpredicted:
+		minShare, maxShare = mpeg2FirstIntraShare, mpeg2FirstIntraShare
+	case rc.complexity == 0:
+		minShare, maxShare = equalShare, equalShare
+	case unpredicted:
+		budget.otherBits = others * rc.complexity * mpeg2IntraQuantizerRatio
+		maxShare = max(mpeg2MaxPictureShare, equalShare)
+		minShare = min(max(mpeg2FirstIntraShare/2, 2*equalShare), maxShare)
+		if rc.sceneChanges >= 2 {
+			weight := max(mpeg2SceneChangeWeight/float64(rc.sceneChanges), 1)
+			maxShare = max(min(maxShare, weight/(weight+others)), equalShare)
+			minShare = equalShare
+		}
+	default:
+		budget.otherBits = others * rc.complexity
+		minShare = equalShare / 2
+		maxShare = max(min(mpeg2MaxPictureShare, 3*equalShare), equalShare)
+		if rc.sceneChanges >= 2 {
+			// Between repeated scene changes the estimate of the other
+			// pictures, made from ordinary P pictures, is too low.
+			maxShare = equalShare
+		}
+		// Bits that the estimate leaves over stay in the buffer for the next
+		// I picture instead of making the last pictures of this GOP finer
+		// than the rest, up to what the buffer is counted on to hold.
+		budget.floorQuantizer = rc.predictiveFloor
+		budget.spareBytes = int(max(rc.fullness+rc.bitsPerPicture-mpeg2VBVCeilingBits, 0)) / 8
+	}
+	budget.minBits = max(gopBits*minShare, rc.bitsPerPicture/8)
+	budget.maxBits = max(gopBits*maxShare, budget.minBits)
+	return budget
+}
+
+// pictureCoded accounts for a coded picture. For an unpredicted picture,
+// floor is the quantizer scale its budget left for the pictures predicted
+// from it.
+func (rc *mpeg2RateControl) pictureCoded(unpredicted bool, sizeBytes, quantizer, floor int) {
+	if unpredicted {
+		rc.predictiveFloor = floor
+	}
+	// The first scene change of a GOP says nothing about the pictures after
+	// it. Repeated ones are what the rest of the GOP has to be expected to
+	// look like.
+	if !unpredicted || rc.sceneChanges >= 2 {
+		complexity := float64(sizeBytes*8) * float64(quantizer)
+		if rc.complexity == 0 {
+			rc.complexity = complexity
+		} else {
+			rc.complexity += (complexity - rc.complexity) * mpeg2ComplexityAdaptation
+		}
 	}
 	rc.fullness = min(rc.fullness-float64(sizeBytes)*8+rc.bitsPerPicture, mpeg2VBVCeilingBits)
 }
@@ -122,7 +225,7 @@ var mpeg2DefaultIntraMatrix = [64]int{
 	8, 16, 19, 22, 26, 27, 29, 34,
 	16, 16, 22, 24, 27, 29, 34, 37,
 	19, 22, 26, 27, 29, 34, 34, 38,
-	22, 22, 26, 27, 29, 32, 36, 40,
+	22, 22, 26, 27, 29, 34, 37, 40,
 	22, 26, 27, 29, 32, 35, 40, 48,
 	26, 27, 29, 32, 35, 40, 48, 58,
 	26, 27, 29, 34, 38, 46, 56, 69,
@@ -156,7 +259,10 @@ func buildMPEG2DCTBasis() [8][8]float64 {
 
 // MPEG2VideoEncoder writes a DVD-raster MPEG-2 elementary stream from planar
 // YUV 4:2:0 frames. It emits closed GOPs containing I pictures and P pictures.
-// P pictures use half-sample forward motion vectors and quantized DCT residuals.
+// P pictures use half-sample forward motion vectors of up to 32 samples and
+// quantized DCT residuals, and code macroblocks that have no usable
+// prediction as intra macroblocks. A GOP holds at most 15 pictures; a scene
+// change may end it earlier, but not before it lasts 0.4 s.
 //
 // The writer does not close dst. Call Close after the final frame to write the
 // MPEG sequence-end code.
@@ -166,9 +272,18 @@ type MPEG2VideoEncoder struct {
 	frameRate int
 	rate      mpeg2RateControl
 	frameNo   int64
-	reference *DecodedVideoFrame
-	closed    bool
-	writeErr  error
+	// gopStart is the number of the I picture that opened the current GOP.
+	gopStart int64
+	// minGOPPictures is the shortest GOP a scene change may leave behind.
+	minGOPPictures int
+	reference      *DecodedVideoFrame
+	// motion is the vector field of the latest P picture with motion in it,
+	// used to seed the next search; motionLambda is the vector-bit weight
+	// derived from the latest P picture's quantizer scale.
+	motion       []mpeg2MotionVector
+	motionLambda int
+	closed       bool
+	writeErr     error
 }
 
 // NewMPEG2VideoEncoder prepares an encoder for NTSC or PAL full-raster DVD
@@ -182,7 +297,7 @@ func NewMPEG2VideoEncoder(dst io.Writer, profile Profile) (*MPEG2VideoEncoder, e
 	if err := validateEncoderProfile(profile); err != nil {
 		return nil, err
 	}
-	encoder := &MPEG2VideoEncoder{dst: dst, profile: profile}
+	encoder := &MPEG2VideoEncoder{dst: dst, profile: profile, motionLambda: mpeg2DefaultMotionLambda}
 	bitrate := profileVideoBitrate(profile)
 	if bitrate < mpeg2MinVideoBitrate || bitrate > mpeg2MaxVideoBitrate {
 		return nil, fmt.Errorf("video2dvd: video bitrate must be between %d and %d bit/s", mpeg2MinVideoBitrate, mpeg2MaxVideoBitrate)
@@ -191,9 +306,11 @@ func NewMPEG2VideoEncoder(dst io.Writer, profile Profile) (*MPEG2VideoEncoder, e
 	switch profile.Standard {
 	case VideoStandardNTSC:
 		encoder.frameRate = 30
+		encoder.minGOPPictures = 12
 		encoder.rate = newMPEG2RateControl(float64(bitrate) * 1001 / 30000)
 	case VideoStandardPAL:
 		encoder.frameRate = 25
+		encoder.minGOPPictures = 10
 		encoder.rate = newMPEG2RateControl(float64(bitrate) / 25)
 	default:
 		return nil, ErrInvalidProfile
@@ -221,14 +338,31 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 	}
 	mbWidth := frame.Width / 16
 	mbHeight := frame.Height / 16
-	gopPosition := int(e.frameNo % mpeg2GOPPictures)
-	isIntra := e.reference == nil || gopPosition == 0
+	gopPosition := int(e.frameNo - e.gopStart)
+	isIntra := e.reference == nil || gopPosition >= mpeg2GOPPictures
 	var intraBlocks []mpeg2IntraBlock
 	var predictiveMacroblocks []mpeg2PredictiveMacroblock
+	sceneChange := false
+	if !isIntra {
+		predictiveMacroblocks = analyzeMPEG2PredictivePicture(frame, *e.reference, mbWidth, mbHeight, e.motion, e.motionLambda)
+		intraCount := 0
+		for index := range predictiveMacroblocks {
+			if predictiveMacroblocks[index].intra {
+				intraCount++
+			}
+		}
+		sceneChange = float64(intraCount) > mpeg2SceneChangeIntraShare*float64(len(predictiveMacroblocks))
+		// A scene change late in the GOP starts the next GOP early, so that
+		// the new scene is not coded intra twice within a few pictures.
+		// Earlier ones stay P pictures made of intra macroblocks: a DVD
+		// VOBU, which is one GOP here, has to last at least 0.4 s.
+		if sceneChange && gopPosition >= e.minGOPPictures {
+			isIntra, predictiveMacroblocks = true, nil
+		}
+	}
 	if isIntra {
+		e.gopStart, gopPosition = e.frameNo, 0
 		intraBlocks = collectMPEG2IntraBlocks(frame, mbWidth, mbHeight)
-	} else {
-		predictiveMacroblocks = analyzeMPEG2PredictiveMacroblocks(frame, *e.reference, mbWidth, mbHeight)
 	}
 	measure := func(quantizer int) int {
 		if isIntra {
@@ -236,8 +370,28 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 		}
 		return e.measurePredictivePicture(predictiveMacroblocks, mbWidth, mbHeight, quantizer, true)
 	}
-	targetBytes, limitBytes, minQuantizer := e.rate.pictureBudget(isIntra, mpeg2GOPPictures-gopPosition)
-	selectedQuantizer := selectMPEG2Quantizer(measure, targetBytes, minQuantizer)
+	unpredicted := isIntra || sceneChange
+	budget := e.rate.pictureBudget(isIntra, sceneChange, mpeg2GOPPictures-gopPosition)
+	selectedQuantizer, predictiveFloor := 0, 1
+	if unpredicted {
+		// The pictures predicted from this one keep to the scale that
+		// balances the GOP, also when the decoder buffer forces a coarser
+		// one on this picture, but not when the balance was overruled as
+		// unreliable.
+		selectedQuantizer = selectMPEG2Quantizer(measure, budget.targetBytes, 1)
+		if selectedQuantizer != 0 {
+			granted := budget.targetBytes(selectedQuantizer)
+			if float64(granted)*8 > budget.minBits {
+				predictiveFloor = selectedQuantizer
+			}
+			if granted > budget.limitBytes {
+				selectedQuantizer = selectMPEG2Quantizer(measure, budget.budgetBytes, selectedQuantizer)
+			}
+		}
+	} else {
+		selectedQuantizer = selectMPEG2Quantizer(measure, budget.budgetBytes, 1)
+	}
+	targetBytes, limitBytes := budget.budgetBytes(31), budget.limitBytes
 	if selectedQuantizer == 0 {
 		// Preserve low-frequency detail when even the coarsest complete picture
 		// exceeds its budget. Dropping every AC coefficient causes visible
@@ -270,12 +424,14 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 		e.writeErr = fmt.Errorf("video2dvd: write MPEG-2 picture %d: %w", e.frameNo, err)
 		return e.writeErr
 	}
-	e.rate.pictureCoded(isIntra, len(encoded), selectedQuantizer)
+	e.rate.pictureCoded(unpredicted, len(encoded), selectedQuantizer, predictiveFloor)
 	var reference DecodedVideoFrame
 	if isIntra {
 		reference = reconstructMPEG2IntraFrame(frame, intraBlocks, mbWidth, mbHeight, selectedQuantizer, true)
 	} else {
 		reference = reconstructMPEG2PredictiveFrame(frame, *e.reference, predictiveMacroblocks, mbWidth, mbHeight, selectedQuantizer, true)
+		e.motionLambda = selectedQuantizer
+		e.rememberMotion(predictiveMacroblocks)
 	}
 	e.reference = &reference
 	e.frameNo++
@@ -283,14 +439,14 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 }
 
 // selectMPEG2Quantizer returns the finest quantizer scale from minQuantizer up
-// whose picture fits budgetBytes, or 0 when even the coarsest does not.
-// Picture size falls as the scale rises, so a bisection needs five
-// measurements instead of up to 31.
-func selectMPEG2Quantizer(measure func(quantizer int) int, budgetBytes, minQuantizer int) int {
+// whose picture fits the budget of that scale, or 0 when even the coarsest
+// does not. Picture size falls as the scale rises and the budget does not, so
+// a bisection needs five measurements instead of up to 31.
+func selectMPEG2Quantizer(measure, budgetBytes func(quantizer int) int, minQuantizer int) int {
 	low, high, best := minQuantizer, 31, 0
 	for low <= high {
 		quantizer := low + (high-low)/2
-		if measure(quantizer) <= budgetBytes {
+		if measure(quantizer) <= budgetBytes(quantizer) {
 			best = quantizer
 			high = quantizer - 1
 		} else {
@@ -362,12 +518,33 @@ func (e *MPEG2VideoEncoder) measureIntraPicture(frame DecodedVideoFrame, blocks 
 	return size
 }
 
+// writeIntraPictureHeader opens a GOP: every I picture starts one, behind a
+// repeated sequence header, which is what makes it a DVD VOBU entry point.
 func (e *MPEG2VideoEncoder) writeIntraPictureHeader(bits *mpeg2BitWriter) {
-	if e.frameNo%mpeg2GOPPictures == 0 {
-		writeMPEG2SequenceHeader(bits, e.profile)
-		writeMPEG2GOPHeader(bits, e.frameNo, e.frameRate)
+	writeMPEG2SequenceHeader(bits, e.profile)
+	writeMPEG2GOPHeader(bits, e.frameNo, e.frameRate)
+	writeMPEG2PictureHeader(bits, 0, 1)
+}
+
+// rememberMotion keeps a P picture's vector field as search seeds for the
+// next one. A picture that barely moves keeps the earlier field: frame-rate
+// conversion repeats source frames, and the motion resumes after a repeat.
+func (e *MPEG2VideoEncoder) rememberMotion(macroblocks []mpeg2PredictiveMacroblock) {
+	moving := 0
+	for index := range macroblocks {
+		if macroblocks[index].motionX != 0 || macroblocks[index].motionY != 0 {
+			moving++
+		}
 	}
-	writeMPEG2PictureHeader(bits, uint16(e.frameNo%mpeg2GOPPictures), 1)
+	if e.motion != nil && moving*16 < len(macroblocks) {
+		return
+	}
+	if len(e.motion) != len(macroblocks) {
+		e.motion = make([]mpeg2MotionVector, len(macroblocks))
+	}
+	for index := range macroblocks {
+		e.motion[index] = mpeg2MotionVector{x: int8(macroblocks[index].motionX), y: int8(macroblocks[index].motionY)}
+	}
 }
 
 func (e *MPEG2VideoEncoder) encodePredictivePicture(macroblocks []mpeg2PredictiveMacroblock, mbWidth, mbHeight, quantizer int, includeAC bool) []byte {
@@ -389,7 +566,7 @@ func (e *MPEG2VideoEncoder) measurePredictivePicture(macroblocks []mpeg2Predicti
 }
 
 func (e *MPEG2VideoEncoder) writePredictivePictureHeader(bits *mpeg2BitWriter) {
-	writeMPEG2PictureHeader(bits, uint16(e.frameNo%mpeg2GOPPictures), 2)
+	writeMPEG2PictureHeader(bits, uint16(e.frameNo-e.gopStart), 2)
 }
 
 func encodeMPEG2PictureRows(header *mpeg2BitWriter, rowCount int, writeRow func(*mpeg2BitWriter, int)) ([]byte, int) {
@@ -491,6 +668,25 @@ func writeMPEG2SequenceHeader(bits *mpeg2BitWriter, profile Profile) {
 	bits.write(0, 1)    // low_delay
 	bits.write(0, 2)    // frame_rate_extension_n
 	bits.write(0, 5)    // frame_rate_extension_d
+
+	// Without a sequence_display_extension a decoder has to guess the colour
+	// description; DVD players assume the standard-definition one of the
+	// television system, which is what the samples are expected to be in.
+	videoFormat, colourDescription := uint64(2), uint64(6) // NTSC, SMPTE 170M
+	if profile.Standard == VideoStandardPAL {
+		videoFormat, colourDescription = 1, 5 // PAL, ITU-R BT.470 System B/G
+	}
+	bits.startCode(0xb5)
+	bits.write(2, 4) // sequence_display_extension_identifier
+	bits.write(videoFormat, 3)
+	bits.write(1, 1)                 // colour_description
+	bits.write(colourDescription, 8) // colour_primaries
+	bits.write(colourDescription, 8) // transfer_characteristics
+	bits.write(colourDescription, 8) // matrix_coefficients
+	bits.write(uint64(profile.FrameWidth), 14)
+	bits.write(1, 1) // marker_bit
+	bits.write(uint64(profile.FrameHeight), 14)
+	bits.write(0, 3) // The syntax ends three bits short of a byte.
 }
 
 func writeMPEG2GOPHeader(bits *mpeg2BitWriter, frameNo int64, nominalRate int) {
@@ -514,33 +710,40 @@ func writeMPEG2PictureHeader(bits *mpeg2BitWriter, temporalReference uint16, pic
 	bits.write(uint64(temporalReference), 10)
 	bits.write(uint64(pictureType), 3)
 	bits.write(0xffff, 16) // vbv_delay
+	// MPEG-2 carries the vector range in the picture coding extension; the
+	// MPEG-1 fields here are fixed (H.262 6.3.9).
 	if pictureType == 2 || pictureType == 3 {
 		bits.write(0, 1) // full_pel_forward_vector
-		bits.write(1, 3) // forward_f_code
+		bits.write(7, 3) // forward_f_code
 	}
 	if pictureType == 3 {
 		bits.write(0, 1) // full_pel_backward_vector
-		bits.write(1, 3) // backward_f_code
+		bits.write(7, 3) // backward_f_code
 	}
 	bits.write(0, 1) // extra_bit_picture
 
 	bits.startCode(0xb5)
-	bits.write(8, 4) // picture_coding_extension_identifier
-	for range 4 {
-		bits.write(1, 4) // f_code (unused for I pictures)
+	bits.write(8, 4)           // picture_coding_extension_identifier
+	forwardFCode := uint64(15) // 15 marks an f_code the picture does not use.
+	if pictureType == 2 {
+		forwardFCode = mpeg2MotionFCode
 	}
-	bits.write(0, 2) // intra_dc_precision
-	bits.write(3, 2) // frame picture
-	bits.write(1, 1) // top_field_first
-	bits.write(1, 1) // frame_pred_frame_dct
-	bits.write(0, 1) // concealment_motion_vectors
-	bits.write(0, 1) // q_scale_type
-	bits.write(0, 1) // intra_vlc_format
-	bits.write(0, 1) // alternate_scan
-	bits.write(0, 1) // repeat_first_field
-	bits.write(1, 1) // chroma_420_type
-	bits.write(1, 1) // progressive_frame
-	bits.write(0, 1) // composite_display_flag
+	bits.write(forwardFCode, 4) // f_code[0][0], forward horizontal
+	bits.write(forwardFCode, 4) // f_code[0][1], forward vertical
+	bits.write(15, 4)           // f_code[1][0], backward horizontal
+	bits.write(15, 4)           // f_code[1][1], backward vertical
+	bits.write(0, 2)            // intra_dc_precision
+	bits.write(3, 2)            // frame picture
+	bits.write(1, 1)            // top_field_first
+	bits.write(1, 1)            // frame_pred_frame_dct
+	bits.write(0, 1)            // concealment_motion_vectors
+	bits.write(0, 1)            // q_scale_type
+	bits.write(0, 1)            // intra_vlc_format
+	bits.write(0, 1)            // alternate_scan
+	bits.write(0, 1)            // repeat_first_field
+	bits.write(1, 1)            // chroma_420_type
+	bits.write(1, 1)            // progressive_frame
+	bits.write(0, 1)            // composite_display_flag
 }
 
 type mpeg2IntraBlock struct {
@@ -553,20 +756,155 @@ type mpeg2ResidualBlock struct {
 	coeff [64]float64
 }
 
+// mpeg2PredictiveMacroblock is one macroblock of a P picture. A predicted
+// macroblock holds its motion vector in half samples and the DCT of the
+// prediction residual. An intra macroblock holds the DCT of the samples
+// themselves, with the quantized DC levels in dc and a zero vector.
 type mpeg2PredictiveMacroblock struct {
 	motionX int
 	motionY int
+	intra   bool
+	dc      [6]int
 	blocks  [6]mpeg2ResidualBlock
 }
 
+const (
+	// mpeg2MotionFCode is the forward f_code of P pictures. Code 3 spans
+	// -64..63 half samples, which is -32..+31.5 luma samples.
+	mpeg2MotionFCode  = 3
+	mpeg2MotionRSize  = mpeg2MotionFCode - 1
+	mpeg2MotionLow    = -16 << mpeg2MotionRSize
+	mpeg2MotionHigh   = 16<<mpeg2MotionRSize - 1
+	mpeg2MotionModulo = 32 << mpeg2MotionRSize
+
+	// A macroblock is coded intra when the luma deviation from its own mean
+	// is this much below the best prediction error. The margin covers the
+	// extra cost of intra coding: every block carries a DC value and the
+	// intra matrix is coarser than the non-intra one.
+	mpeg2IntraDecisionMargin = 256
+	// Once more than this share of a picture's macroblocks is coded intra the
+	// picture is a scene change: it is budgeted like an I picture and, where
+	// the GOP may end, becomes one.
+	mpeg2SceneChangeIntraShare = 0.5
+
+	// mpeg2DefaultMotionLambda weights vector bits against the luma SAD when
+	// no quantizer scale of an earlier P picture is known.
+	mpeg2DefaultMotionLambda = 4
+	// Below this luma SAD (one level per sample) a predictor is accepted
+	// without searching its surroundings beyond one sample.
+	mpeg2MotionGoodSAD = 256
+	// Above this luma SAD (six levels per sample) no predictor describes the
+	// motion and the whole vector range is scanned on a coarse grid.
+	mpeg2MotionPoorSAD = 1536
+)
+
+// mpeg2MotionVector is a macroblock's forward vector in half samples.
+type mpeg2MotionVector struct {
+	x, y int8
+}
+
+// mpeg2MotionDeltaBits holds the coded size of a vector component by its
+// difference from the predictor, wrapped into the f_code range and offset by
+// -mpeg2MotionLow.
+var mpeg2MotionDeltaBits = buildMPEG2MotionDeltaBits()
+
+func buildMPEG2MotionDeltaBits() [mpeg2MotionModulo]uint8 {
+	var bits [mpeg2MotionModulo]uint8
+	for delta := mpeg2MotionLow; delta <= mpeg2MotionHigh; delta++ {
+		motionCode, _ := mpeg2MotionCode(delta)
+		size := len(mpeg2MotionCodeCodes[motionCode+16])
+		if motionCode != 0 {
+			size += mpeg2MotionRSize
+		}
+		bits[delta-mpeg2MotionLow] = uint8(size)
+	}
+	return bits
+}
+
+// wrapMPEG2MotionDelta maps a vector difference to the one in the f_code
+// range that a decoder's modular vector arithmetic (H.262 7.6.3.1) turns back
+// into the same vector.
+func wrapMPEG2MotionDelta(delta int) int {
+	return (delta-mpeg2MotionLow)&(mpeg2MotionModulo-1) + mpeg2MotionLow
+}
+
+// mpeg2MotionCode splits a wrapped vector difference into motion_code and
+// motion_residual.
+func mpeg2MotionCode(delta int) (motionCode, residual int) {
+	if delta == 0 {
+		return 0, 0
+	}
+	scaled := absInt(delta) + 1<<mpeg2MotionRSize - 1
+	motionCode, residual = scaled>>mpeg2MotionRSize, scaled&(1<<mpeg2MotionRSize-1)
+	if delta < 0 {
+		motionCode = -motionCode
+	}
+	return motionCode, residual
+}
+
+func (m *mpeg2PredictiveMacroblock) intraBlock(block int) mpeg2IntraBlock {
+	return mpeg2IntraBlock{dc: m.dc[block], coeff: m.blocks[block].coeff, chroma: block >= 4}
+}
+
 func analyzeMPEG2PredictiveMacroblocks(frame, reference DecodedVideoFrame, mbWidth, mbHeight int) []mpeg2PredictiveMacroblock {
+	return analyzeMPEG2PredictivePicture(frame, reference, mbWidth, mbHeight, nil, mpeg2DefaultMotionLambda)
+}
+
+// analyzeMPEG2PredictivePicture chooses a coding mode and vector for every
+// macroblock of a P picture and transforms what is left to code. previous is
+// the vector field of an earlier P picture, or nil; lambda is the SAD worth
+// of one vector bit. The result depends only on the arguments, not on how the
+// rows are distributed over workers.
+func analyzeMPEG2PredictivePicture(frame, reference DecodedVideoFrame, mbWidth, mbHeight int, previous []mpeg2MotionVector, lambda int) []mpeg2PredictiveMacroblock {
 	macroblocks := make([]mpeg2PredictiveMacroblock, mbWidth*mbHeight)
+	if len(previous) != len(macroblocks) {
+		previous = nil
+	}
 	parallelMPEG2Rows(mbHeight, func(row int) {
+		search := mpeg2MotionSearch{current: frame.Y, reference: reference.Y, stride: frame.Width, lambda: int64(lambda)}
+		// The slice's vector predictor follows the previous macroblock and is
+		// zero at the start of a row and after an intra, skipped or unmoved
+		// macroblock, all of which have a zero vector here.
+		leftX, leftY := 0, 0
 		for column := range mbWidth {
-			motionX, motionY := estimateMPEG2Motion(frame, reference, column*16, row*16)
-			macroblock := &macroblocks[row*mbWidth+column]
-			macroblock.motionX, macroblock.motionY = motionX, motionY
+			index := row*mbWidth + column
 			baseX, baseY := column*16, row*16
+			search.begin(baseX, baseY, frame.Width, frame.Height, leftX, leftY)
+			if !sameMPEG2LumaMacroblock(frame, reference, baseX, baseY) {
+				search.tryFirst()
+				search.try(leftX, leftY)
+				if previous != nil {
+					search.tryVector(previous[index])
+					if column+1 < mbWidth {
+						search.tryVector(previous[index+1])
+					}
+					if row > 0 {
+						search.tryVector(previous[index-mbWidth])
+					}
+					if row+1 < mbHeight {
+						search.tryVector(previous[index+mbWidth])
+					}
+				}
+				search.refine()
+			}
+			macroblock := &macroblocks[index]
+			if search.bestSAD > mpeg2IntraDecisionMargin &&
+				mpeg2LumaDeviation(frame.Y, frame.Width, baseX, baseY)+mpeg2IntraDecisionMargin < search.bestSAD {
+				macroblock.intra = true
+				for block := range 4 {
+					intra := analyzeMPEG2Block(frame.Y, frame.Width, baseX+(block%2)*8, baseY+(block/2)*8, false)
+					macroblock.dc[block], macroblock.blocks[block].coeff = intra.dc, intra.coeff
+				}
+				for block, plane := range [2][]byte{frame.U, frame.V} {
+					intra := analyzeMPEG2Block(plane, frame.Width/2, column*8, row*8, true)
+					macroblock.dc[4+block], macroblock.blocks[4+block].coeff = intra.dc, intra.coeff
+				}
+				leftX, leftY = 0, 0
+				continue
+			}
+			motionX, motionY := search.bestX, search.bestY
+			macroblock.motionX, macroblock.motionY = motionX, motionY
+			leftX, leftY = motionX, motionY
 			for block := range 4 {
 				x := baseX + (block%2)*8
 				y := baseY + (block/2)*8
@@ -609,49 +947,118 @@ func parallelMPEG2Rows(rows int, process func(int)) {
 	wait.Wait()
 }
 
-func estimateMPEG2Motion(frame, reference DecodedVideoFrame, x, y int) (int, int) {
-	if sameMPEG2LumaMacroblock(frame, reference, x, y) {
-		return 0, 0
+// mpeg2MotionSearch finds the forward vector of one macroblock at a time. A
+// candidate costs its luma SAD plus lambda times the bits its difference from
+// the slice predictor takes, so that a vector has to earn its side
+// information and flat areas keep the predictor instead of following noise.
+type mpeg2MotionSearch struct {
+	current, reference []byte
+	stride             int
+	lambda             int64
+
+	x, y         int
+	predX, predY int
+	// Vectors outside these bounds would reference samples outside the
+	// picture or exceed the f_code range.
+	minX, maxX, minY, maxY int
+
+	bestX, bestY int
+	bestCost     int64
+	bestSAD      int64
+}
+
+// mpeg2MotionBounds returns the vector range, in half samples, of a
+// macroblock at luma position along a picture dimension of the given size.
+// H.262 7.6.3.8 forbids predictions from outside the picture. A luma vector
+// inside the picture keeps the derived 4:2:0 chroma vector inside too: the
+// chroma vector is the luma one halved towards zero, and at either limit the
+// luma vector is a multiple of four half samples.
+func mpeg2MotionBounds(position, size int) (low, high int) {
+	return max(mpeg2MotionLow, -2*position), min(mpeg2MotionHigh, 2*(size-16-position))
+}
+
+func (s *mpeg2MotionSearch) begin(x, y, width, height, predX, predY int) {
+	s.x, s.y = x, y
+	s.predX, s.predY = predX, predY
+	s.minX, s.maxX = mpeg2MotionBounds(x, width)
+	s.minY, s.maxY = mpeg2MotionBounds(y, height)
+	s.bestX, s.bestY, s.bestCost, s.bestSAD = 0, 0, 0, 0
+}
+
+func (s *mpeg2MotionSearch) vectorCost(motionX, motionY int) int64 {
+	bits := mpeg2MotionDeltaBits[(motionX-s.predX-mpeg2MotionLow)&(mpeg2MotionModulo-1)] +
+		mpeg2MotionDeltaBits[(motionY-s.predY-mpeg2MotionLow)&(mpeg2MotionModulo-1)]
+	return s.lambda * int64(bits)
+}
+
+// tryFirst costs the zero vector, which every macroblock may use.
+func (s *mpeg2MotionSearch) tryFirst() {
+	s.bestSAD = mpeg2MotionCost(s.current, s.reference, s.stride, s.x, s.y, 0, 0, math.MaxInt64)
+	s.bestCost = s.bestSAD + s.vectorCost(0, 0)
+}
+
+func (s *mpeg2MotionSearch) tryVector(vector mpeg2MotionVector) {
+	s.try(int(vector.x), int(vector.y))
+}
+
+func (s *mpeg2MotionSearch) try(motionX, motionY int) {
+	if motionX == s.bestX && motionY == s.bestY ||
+		motionX < s.minX || motionX > s.maxX || motionY < s.minY || motionY > s.maxY {
+		return
 	}
-	bestX, bestY := 0, 0
-	bestCost := mpeg2MotionCost(frame, reference, x, y, 0, 0, math.MaxInt64)
-	for motionY := -16; motionY <= 8; motionY += 8 {
-		for motionX := -16; motionX <= 8; motionX += 8 {
-			if motionX == 0 && motionY == 0 || !validMPEG2Motion(reference, x, y, motionX, motionY) {
-				continue
-			}
-			cost := mpeg2MotionCost(frame, reference, x, y, motionX, motionY, bestCost)
-			if cost < bestCost {
-				bestX, bestY, bestCost = motionX, motionY, cost
+	penalty := s.vectorCost(motionX, motionY)
+	if penalty >= s.bestCost {
+		return
+	}
+	sad := mpeg2MotionCost(s.current, s.reference, s.stride, s.x, s.y, motionX, motionY, s.bestCost-penalty)
+	if sad+penalty < s.bestCost {
+		s.bestX, s.bestY, s.bestCost, s.bestSAD = motionX, motionY, sad+penalty, sad
+	}
+}
+
+// tryAround costs the eight neighbours of the best vector at the given
+// distance in half samples.
+func (s *mpeg2MotionSearch) tryAround(step int) {
+	centerX, centerY := s.bestX, s.bestY
+	for offsetY := -step; offsetY <= step; offsetY += step {
+		for offsetX := -step; offsetX <= step; offsetX += step {
+			if offsetX != 0 || offsetY != 0 {
+				s.try(centerX+offsetX, centerY+offsetY)
 			}
 		}
 	}
-	coarseX, coarseY := bestX, bestY
-	for motionY := max(-16, coarseY-4); motionY <= min(15, coarseY+4); motionY++ {
-		for motionX := max(-16, coarseX-4); motionX <= min(15, coarseX+4); motionX++ {
-			if motionX == coarseX && motionY == coarseY || !validMPEG2Motion(reference, x, y, motionX, motionY) {
-				continue
+}
+
+// refine improves the best of the candidates tried so far: over the whole
+// range when none of them predicts well, then in whole samples, then by half
+// a sample.
+func (s *mpeg2MotionSearch) refine() {
+	if s.bestSAD > mpeg2MotionPoorSAD {
+		const pitch = 16 // 8 luma samples
+		for motionY := mpeg2MotionLow; motionY <= mpeg2MotionHigh; motionY += pitch {
+			for motionX := mpeg2MotionLow; motionX <= mpeg2MotionHigh; motionX += pitch {
+				s.try(motionX, motionY)
 			}
-			cost := mpeg2MotionCost(frame, reference, x, y, motionX, motionY, bestCost)
-			if cost < bestCost {
-				bestX, bestY, bestCost = motionX, motionY, cost
+		}
+		s.tryAround(8)
+		s.tryAround(4)
+	}
+	if s.bestSAD > mpeg2MotionGoodSAD {
+		// Follow the gradient in whole samples from the nearest
+		// whole-sample position.
+		s.try(s.bestX&^1, s.bestY&^1)
+		for range 4 {
+			centerX, centerY := s.bestX, s.bestY
+			s.try(centerX-2, centerY)
+			s.try(centerX+2, centerY)
+			s.try(centerX, centerY-2)
+			s.try(centerX, centerY+2)
+			if s.bestX == centerX && s.bestY == centerY {
+				break
 			}
 		}
 	}
-	return bestX, bestY
-}
-
-func validMPEG2Motion(reference DecodedVideoFrame, x, y, motionX, motionY int) bool {
-	return validMPEG2MotionRegion(reference.Width, reference.Height, x, y, 16, 16, motionX, motionY) &&
-		validMPEG2MotionRegion(reference.Width/2, reference.Height/2, x/2, y/2, 8, 8, halfMotionVector(motionX), halfMotionVector(motionY))
-}
-
-func validMPEG2MotionRegion(width, height, x, y, blockWidth, blockHeight, motionX, motionY int) bool {
-	integerX, fractionX := halfMotionParts(motionX)
-	integerY, fractionY := halfMotionParts(motionY)
-	left, top := x+integerX, y+integerY
-	right, bottom := left+blockWidth-1+fractionX, top+blockHeight-1+fractionY
-	return left >= 0 && top >= 0 && right < width && bottom < height
+	s.tryAround(1)
 }
 
 func sameMPEG2LumaMacroblock(first, second DecodedVideoFrame, x, y int) bool {
@@ -664,86 +1071,89 @@ func sameMPEG2LumaMacroblock(first, second DecodedVideoFrame, x, y int) bool {
 	return true
 }
 
-func mpeg2MotionCost(frame, reference DecodedVideoFrame, x, y, motionX, motionY int, limit int64) int64 {
+// mpeg2LumaDeviation is the sum of absolute differences between a luma
+// macroblock and its mean: what intra coding has to spend on AC coefficients.
+func mpeg2LumaDeviation(plane []byte, stride, x, y int) int64 {
+	sum := 0
+	for row := range 16 {
+		start := (y+row)*stride + x
+		for _, sample := range plane[start : start+16] {
+			sum += int(sample)
+		}
+	}
+	mean := (sum + 128) / 256
+	deviation := 0
+	for row := range 16 {
+		start := (y+row)*stride + x
+		for _, sample := range plane[start : start+16] {
+			deviation += absInt(int(sample) - mean)
+		}
+	}
+	return int64(deviation)
+}
+
+// mpeg2MotionCost returns the luma SAD of a macroblock against its
+// prediction with the given vector. It may stop early with a value above
+// limit once the sum exceeds it.
+func mpeg2MotionCost(current, reference []byte, stride, x, y, motionX, motionY int, limit int64) int64 {
 	integerX, fractionX := halfMotionParts(motionX)
 	integerY, fractionY := halfMotionParts(motionY)
-	left, top := x+integerX, y+integerY
+	currentStart := y*stride + x
+	referenceStart := (y+integerY)*stride + x + integerX
+	cost := 0
 	switch {
 	case fractionX == 0 && fractionY == 0:
-		return mpeg2IntegerMotionCost(frame.Y, reference.Y, frame.Width, x, y, left, top, limit)
-	case fractionX != 0 && fractionY == 0:
-		return mpeg2HorizontalHalfMotionCost(frame.Y, reference.Y, frame.Width, x, y, left, top, limit)
-	case fractionX == 0 && fractionY != 0:
-		return mpeg2VerticalHalfMotionCost(frame.Y, reference.Y, frame.Width, x, y, left, top, limit)
+		for row := range 16 {
+			currentRow := current[currentStart+row*stride:][:16]
+			referenceRow := reference[referenceStart+row*stride:][:16]
+			for column, sample := range currentRow {
+				cost += absInt(int(sample) - int(referenceRow[column]))
+			}
+			if int64(cost) > limit {
+				break
+			}
+		}
+	case fractionY == 0:
+		for row := range 16 {
+			currentRow := current[currentStart+row*stride:][:16]
+			referenceRow := reference[referenceStart+row*stride:][:17]
+			for column, sample := range currentRow {
+				predicted := (int(referenceRow[column]) + int(referenceRow[column+1]) + 1) >> 1
+				cost += absInt(int(sample) - predicted)
+			}
+			if int64(cost) > limit {
+				break
+			}
+		}
+	case fractionX == 0:
+		for row := range 16 {
+			currentRow := current[currentStart+row*stride:][:16]
+			referenceRow := reference[referenceStart+row*stride:][:16]
+			nextReferenceRow := reference[referenceStart+(row+1)*stride:][:16]
+			for column, sample := range currentRow {
+				predicted := (int(referenceRow[column]) + int(nextReferenceRow[column]) + 1) >> 1
+				cost += absInt(int(sample) - predicted)
+			}
+			if int64(cost) > limit {
+				break
+			}
+		}
 	default:
-		return mpeg2DiagonalHalfMotionCost(frame.Y, reference.Y, frame.Width, x, y, left, top, limit)
-	}
-}
-
-func mpeg2IntegerMotionCost(current, reference []byte, stride, x, y, left, top int, limit int64) int64 {
-	var cost int64
-	for row := range 16 {
-		currentRow := (y+row)*stride + x
-		referenceRow := (top+row)*stride + left
-		for column := range 16 {
-			cost += int64(absInt(int(current[currentRow+column]) - int(reference[referenceRow+column])))
-			if cost > limit {
-				return cost
+		for row := range 16 {
+			currentRow := current[currentStart+row*stride:][:16]
+			referenceRow := reference[referenceStart+row*stride:][:17]
+			nextReferenceRow := reference[referenceStart+(row+1)*stride:][:17]
+			for column, sample := range currentRow {
+				predicted := (int(referenceRow[column]) + int(referenceRow[column+1]) +
+					int(nextReferenceRow[column]) + int(nextReferenceRow[column+1]) + 2) >> 2
+				cost += absInt(int(sample) - predicted)
+			}
+			if int64(cost) > limit {
+				break
 			}
 		}
 	}
-	return cost
-}
-
-func mpeg2HorizontalHalfMotionCost(current, reference []byte, stride, x, y, left, top int, limit int64) int64 {
-	var cost int64
-	for row := range 16 {
-		currentRow := (y+row)*stride + x
-		referenceRow := (top+row)*stride + left
-		for column := range 16 {
-			predicted := (int(reference[referenceRow+column]) + int(reference[referenceRow+column+1]) + 1) / 2
-			cost += int64(absInt(int(current[currentRow+column]) - predicted))
-			if cost > limit {
-				return cost
-			}
-		}
-	}
-	return cost
-}
-
-func mpeg2VerticalHalfMotionCost(current, reference []byte, stride, x, y, left, top int, limit int64) int64 {
-	var cost int64
-	for row := range 16 {
-		currentRow := (y+row)*stride + x
-		referenceRow := (top+row)*stride + left
-		nextReferenceRow := referenceRow + stride
-		for column := range 16 {
-			predicted := (int(reference[referenceRow+column]) + int(reference[nextReferenceRow+column]) + 1) / 2
-			cost += int64(absInt(int(current[currentRow+column]) - predicted))
-			if cost > limit {
-				return cost
-			}
-		}
-	}
-	return cost
-}
-
-func mpeg2DiagonalHalfMotionCost(current, reference []byte, stride, x, y, left, top int, limit int64) int64 {
-	var cost int64
-	for row := range 16 {
-		currentRow := (y+row)*stride + x
-		referenceRow := (top+row)*stride + left
-		nextReferenceRow := referenceRow + stride
-		for column := range 16 {
-			predicted := (int(reference[referenceRow+column]) + int(reference[referenceRow+column+1]) +
-				int(reference[nextReferenceRow+column]) + int(reference[nextReferenceRow+column+1]) + 2) / 4
-			cost += int64(absInt(int(current[currentRow+column]) - predicted))
-			if cost > limit {
-				return cost
-			}
-		}
-	}
-	return cost
+	return int64(cost)
 }
 
 func analyzeMPEG2ResidualBlock(current, reference []byte, stride, x, y, blockWidth, blockHeight, motionX, motionY int) mpeg2ResidualBlock {
@@ -881,9 +1291,20 @@ func reconstructMPEG2PredictiveFrame(frame, reference DecodedVideoFrame, macrobl
 	reconstructed := newMPEG2FrameLike(frame)
 	parallelMPEG2Rows(mbHeight, func(row int) {
 		for column := range mbWidth {
-			macroblock := macroblocks[row*mbWidth+column]
-			levels, codedPattern := quantizeMPEG2ResidualMacroblock(macroblock, quantizer, includeAC)
+			macroblock := &macroblocks[row*mbWidth+column]
 			baseX, baseY := column*16, row*16
+			if macroblock.intra {
+				for block := range 4 {
+					pixels := reconstructMPEG2IntraBlock(macroblock.intraBlock(block), quantizer, includeAC)
+					copyMPEG2Block(reconstructed.Y, frame.Width, baseX+(block%2)*8, baseY+(block/2)*8, pixels)
+				}
+				for block, plane := range [2][]byte{reconstructed.U, reconstructed.V} {
+					pixels := reconstructMPEG2IntraBlock(macroblock.intraBlock(4+block), quantizer, includeAC)
+					copyMPEG2Block(plane, frame.Width/2, column*8, row*8, pixels)
+				}
+				continue
+			}
+			levels, codedPattern := quantizeMPEG2ResidualMacroblock(*macroblock, quantizer, includeAC)
 			for block := range 4 {
 				x := baseX + (block%2)*8
 				y := baseY + (block/2)*8
@@ -1078,10 +1499,29 @@ func writeMPEG2PredictiveSlice(bits *mpeg2BitWriter, macroblocks []mpeg2Predicti
 	bits.write(uint64(quantizer), 5)
 	bits.write(0, 1) // extra_bit_slice
 	lastColumn := -1
+	// Prediction state of the slice (H.262 7.2.1 and 7.6.3.4). The vector
+	// predictors return to zero after every macroblock without a coded
+	// vector: intra, skipped, or coded without motion compensation. The DC
+	// predictors return to 128 after every macroblock that is not intra,
+	// skipped ones included.
 	lastMotionX, lastMotionY := 0, 0
+	lastY, lastCb, lastCr := 128, 128, 128
 	for column := range mbWidth {
-		macroblock := macroblocks[row*mbWidth+column]
-		levels, codedPattern := quantizeMPEG2ResidualMacroblock(macroblock, quantizer, includeAC)
+		macroblock := &macroblocks[row*mbWidth+column]
+		if macroblock.intra {
+			writeMPEG2MacroblockAddressIncrement(bits, column-lastColumn)
+			bits.write(0b00011, 5) // P-picture intra macroblock.
+			for block := range 4 {
+				lastY = writeMPEG2Block(bits, macroblock.intraBlock(block), lastY, quantizer, includeAC)
+			}
+			lastCb = writeMPEG2Block(bits, macroblock.intraBlock(4), lastCb, quantizer, includeAC)
+			lastCr = writeMPEG2Block(bits, macroblock.intraBlock(5), lastCr, quantizer, includeAC)
+			lastMotionX, lastMotionY = 0, 0
+			lastColumn = column
+			continue
+		}
+		lastY, lastCb, lastCr = 128, 128, 128
+		levels, codedPattern := quantizeMPEG2ResidualMacroblock(*macroblock, quantizer, includeAC)
 		hasResidual := codedPattern != 0
 		hasMotion := macroblock.motionX != 0 || macroblock.motionY != 0
 		mustCode := column == 0 || column == mbWidth-1 || hasResidual || hasMotion
@@ -1174,17 +1614,17 @@ func writeMPEG2NonIntraBlock(bits *mpeg2BitWriter, levels [64]int16) {
 	bits.write(0b10, 2) // End of block.
 }
 
+// writeMPEG2MotionVector codes one vector component against its predictor
+// (H.262 6.3.17.3): motion_code carries the difference in units of
+// 1<<r_size half samples and motion_residual the remainder.
 func writeMPEG2MotionVector(bits *mpeg2BitWriter, motion, predictor int) {
-	delta := motion - predictor
-	for delta < -16 {
-		delta += 32
-	}
-	for delta > 15 {
-		delta -= 32
-	}
-	code := mpeg2MotionCodeCodes[delta+16]
+	motionCode, residual := mpeg2MotionCode(wrapMPEG2MotionDelta(motion - predictor))
+	code := mpeg2MotionCodeCodes[motionCode+16]
 	for _, bit := range code {
 		bits.write(uint64(bit-'0'), 1)
+	}
+	if motionCode != 0 {
+		bits.write(uint64(residual), mpeg2MotionRSize)
 	}
 }
 

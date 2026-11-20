@@ -19,7 +19,9 @@ const maxCompressedAccessUnit = 64 << 20
 
 // DecodedVideoFrame is an owned, planar 8-bit YUV 4:2:0 frame. Chroma planes
 // have half the luma width and height. PTS and Duration use the MP4 media
-// timeline; edit-list offsets are not applied.
+// timeline; edit-list offsets are not applied. Color is the encoding the
+// decoders found in the container or bitstream; samples are delivered as
+// decoded, without colour conversion.
 type DecodedVideoFrame struct {
 	PTS      time.Duration
 	Duration time.Duration
@@ -28,6 +30,7 @@ type DecodedVideoFrame struct {
 	Y        []byte
 	U        []byte
 	V        []byte
+	Color    VideoColor
 }
 
 // PCMChunk contains interleaved signed 16-bit PCM in DVD's 48 kHz rate. The
@@ -96,6 +99,7 @@ func DecodeMP4Video(ctx context.Context, path string, trackIndex *int, handler f
 		if err != nil {
 			return err
 		}
+		decoded.Color = track.Color
 		return handler(decoded)
 	})
 	if err != nil {

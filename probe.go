@@ -24,6 +24,9 @@ const (
 // code or the WebM codec name. CodecConfig contains codec-specific setup data.
 // PixelAspectHorizontal and PixelAspectVertical describe the displayed pixel
 // shape; zero means square pixels or no pixel aspect metadata was present.
+// Color is the colour encoding a video track is tagged with: for MP4 the
+// H.264 VUI of the first SPS or else the colr box, for WebM the Colour
+// element. Untagged tracks report ColorMatrixUnspecified.
 type TrackInfo struct {
 	Index                 int
 	Kind                  TrackKind
@@ -39,6 +42,7 @@ type TrackInfo struct {
 	Duration              time.Duration
 	DefaultDuration       time.Duration
 	TimeScale             uint32
+	Color                 VideoColor
 
 	edit mp4EditList
 }
@@ -460,8 +464,30 @@ func parseSampleDescription(r io.ReaderAt, box mp4Box, track *TrackInfo) error {
 		if err != nil {
 			return fmt.Errorf("invalid video sample entry: %w", err)
 		}
+		var containerColor VideoColor
 		for _, child := range children {
 			switch child.kind {
+			case "colr":
+				// ISO/IEC 14496-12 ColourInformationBox, "nclx" form:
+				// primaries, transfer, matrix (16 bits each), range flag.
+				// QuickTime's "nclc" form is the same without the flag.
+				var data [11]byte
+				size := min(child.end-child.data, int64(len(data)))
+				if size < 10 {
+					continue
+				}
+				if _, err := r.ReadAt(data[:size], child.data); err != nil {
+					return err
+				}
+				switch colourType := string(data[:4]); {
+				case colourType == "nclx" && size == 11:
+					containerColor = VideoColor{
+						Matrix:    colorMatrixFromCode(int(binary.BigEndian.Uint16(data[8:10]))),
+						FullRange: data[10]&0x80 != 0,
+					}
+				case colourType == "nclc":
+					containerColor = VideoColor{Matrix: colorMatrixFromCode(int(binary.BigEndian.Uint16(data[8:10])))}
+				}
 			case "avcC":
 				if len(track.CodecConfig) != 0 {
 					return errors.New("AVC sample entry has multiple avcC boxes")
@@ -495,6 +521,17 @@ func parseSampleDescription(r io.ReaderAt, box mp4Box, track *TrackInfo) error {
 		}
 		if len(track.CodecConfig) == 0 {
 			return errors.New("AVC sample entry has no avcC configuration")
+		}
+		// Decoders trust the bitstream over the container, so the VUI wins
+		// wherever it says something.
+		track.Color = containerColor
+		if sps, _, err := AVCParameterSets(track.CodecConfig); err == nil {
+			if streamColor, ok := avcSPSColor(sps[0]); ok {
+				track.Color.FullRange = streamColor.FullRange
+				if streamColor.Matrix != ColorMatrixUnspecified {
+					track.Color.Matrix = streamColor.Matrix
+				}
+			}
 		}
 	}
 	if track.Kind == TrackKindAudio && entry.kind == "mp4a" {

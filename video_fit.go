@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 )
 
 // FitMode controls how FitVideoFrame places source pixels in the DVD raster.
@@ -20,20 +21,48 @@ const (
 // FitVideoFrame converts an owned planar YUV 4:2:0 frame to the raster and
 // display aspect ratio described by profile. sourceAspectNumerator and
 // sourceAspectDenominator describe the source's displayed aspect ratio, such
-// as 16 and 9. The output uses bilinear scaling, low-pass filtered along any
-// axis that is reduced, and even chroma-aligned edges.
+// as 16 and 9. Enlargement and reduction both use a Lanczos-3 filter whose
+// support grows with the reduction ratio. Chroma is treated as horizontally
+// co-sited with even luma columns (the MPEG-2, H.264 and VP9 default) and
+// vertically centred, and picture edges are chroma-aligned.
 //
 // For FitLetterbox, unused pixels are set to studio-range black. For FitCrop,
-// the source is center-cropped. The input frame is not modified.
+// the source is center-cropped. The input frame is not modified. Samples are
+// only resampled: no colour-matrix or range conversion is applied and Color
+// is copied from the source. FitVideoFrameForDVD adds that conversion.
 func FitVideoFrame(frame DecodedVideoFrame, profile Profile, sourceAspectNumerator, sourceAspectDenominator int, mode FitMode) (DecodedVideoFrame, error) {
+	result, _, err := fitVideoFrame(frame, profile, sourceAspectNumerator, sourceAspectDenominator, mode)
+	return result, err
+}
+
+// FitVideoFrameForDVD is FitVideoFrame followed by conversion of the picture
+// area to the colour encoding DVD players assume, BT.601 Y'CbCr in studio
+// range. frame.Color selects the conversion; see VideoColor. The preparation
+// functions and the built-in encoder use this function.
+func FitVideoFrameForDVD(frame DecodedVideoFrame, profile Profile, sourceAspectNumerator, sourceAspectDenominator int, mode FitMode) (DecodedVideoFrame, error) {
+	result, picture, err := fitVideoFrame(frame, profile, sourceAspectNumerator, sourceAspectDenominator, mode)
+	if err != nil {
+		return DecodedVideoFrame{}, err
+	}
+	convertPictureColorForDVD(&result, picture, frame.Color.resolve(frame.Width, frame.Height))
+	return result, nil
+}
+
+// pictureRect is the part of a fitted frame that carries source picture. All
+// four values are even.
+type pictureRect struct {
+	x, y, width, height int
+}
+
+func fitVideoFrame(frame DecodedVideoFrame, profile Profile, sourceAspectNumerator, sourceAspectDenominator int, mode FitMode) (DecodedVideoFrame, pictureRect, error) {
 	if frame.Width <= 0 || frame.Height <= 0 || frame.Width%2 != 0 || frame.Height%2 != 0 || frame.Width > int(^uint(0)>>1)/frame.Height {
-		return DecodedVideoFrame{}, errors.New("video2dvd: source frame dimensions must be positive even values")
+		return DecodedVideoFrame{}, pictureRect{}, errors.New("video2dvd: source frame dimensions must be positive even values")
 	}
 	if len(frame.Y) < frame.Width*frame.Height || len(frame.U) < frame.Width*frame.Height/4 || len(frame.V) < frame.Width*frame.Height/4 {
-		return DecodedVideoFrame{}, errors.New("video2dvd: source frame has incomplete YUV 4:2:0 planes")
+		return DecodedVideoFrame{}, pictureRect{}, errors.New("video2dvd: source frame has incomplete YUV 4:2:0 planes")
 	}
 	if sourceAspectNumerator <= 0 || sourceAspectDenominator <= 0 {
-		return DecodedVideoFrame{}, errors.New("video2dvd: source display aspect ratio must be positive")
+		return DecodedVideoFrame{}, pictureRect{}, errors.New("video2dvd: source display aspect ratio must be positive")
 	}
 	wantWidth, wantHeight := 0, 0
 	switch profile.Standard {
@@ -42,16 +71,16 @@ func FitVideoFrame(frame DecodedVideoFrame, profile Profile, sourceAspectNumerat
 	case VideoStandardPAL:
 		wantWidth, wantHeight = 720, 576
 	default:
-		return DecodedVideoFrame{}, ErrInvalidProfile
+		return DecodedVideoFrame{}, pictureRect{}, ErrInvalidProfile
 	}
 	if profile.FrameWidth != wantWidth || profile.FrameHeight != wantHeight {
-		return DecodedVideoFrame{}, ErrInvalidProfile
+		return DecodedVideoFrame{}, pictureRect{}, ErrInvalidProfile
 	}
 	if profile.Aspect != AspectRatio4x3 && profile.Aspect != AspectRatio16x9 {
-		return DecodedVideoFrame{}, ErrInvalidProfile
+		return DecodedVideoFrame{}, pictureRect{}, ErrInvalidProfile
 	}
 	if mode != FitLetterbox && mode != FitCrop {
-		return DecodedVideoFrame{}, fmt.Errorf("video2dvd: unknown fit mode %d", mode)
+		return DecodedVideoFrame{}, pictureRect{}, fmt.Errorf("video2dvd: unknown fit mode %d", mode)
 	}
 
 	// DVD pixels are not square. Derive the horizontal-to-vertical pixel ratio
@@ -87,7 +116,7 @@ func FitVideoFrame(frame DecodedVideoFrame, profile Profile, sourceAspectNumerat
 		}
 	}
 	if dstW < 2 || dstH < 2 || srcW < 2 || srcH < 2 {
-		return DecodedVideoFrame{}, errors.New("video2dvd: aspect ratio leaves less than one chroma sample")
+		return DecodedVideoFrame{}, pictureRect{}, errors.New("video2dvd: aspect ratio leaves less than one chroma sample")
 	}
 
 	result := DecodedVideoFrame{
@@ -95,76 +124,109 @@ func FitVideoFrame(frame DecodedVideoFrame, profile Profile, sourceAspectNumerat
 		Duration: frame.Duration,
 		Width:    profile.FrameWidth,
 		Height:   profile.FrameHeight,
+		Color:    frame.Color,
 		Y:        make([]byte, profile.FrameWidth*profile.FrameHeight),
 		U:        make([]byte, profile.FrameWidth*profile.FrameHeight/4),
 		V:        make([]byte, profile.FrameWidth*profile.FrameHeight/4),
 	}
-	for i := range result.Y {
-		result.Y[i] = 16
+	if dstW != result.Width || dstH != result.Height {
+		for i := range result.Y {
+			result.Y[i] = 16
+		}
+		for i := range result.U {
+			result.U[i], result.V[i] = 128, 128
+		}
 	}
-	for i := range result.U {
-		result.U[i], result.V[i] = 128, 128
-	}
-	scalePlane(frame.Y, frame.Width, frame.Height, result.Y, result.Width, result.Height,
-		srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH)
-	scalePlane(frame.U, frame.Width/2, frame.Height/2, result.U, result.Width/2, result.Height/2,
-		srcX/2, srcY/2, srcW/2, srcH/2, dstX/2, dstY/2, dstW/2, dstH/2)
-	scalePlane(frame.V, frame.Width/2, frame.Height/2, result.V, result.Width/2, result.Height/2,
-		srcX/2, srcY/2, srcW/2, srcH/2, dstX/2, dstY/2, dstW/2, dstH/2)
-	return result, nil
+	scalePlane(frame.Y, frame.Width, result.Y, result.Width,
+		srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH, resamplePhaseCentre)
+	scalePlane(frame.U, frame.Width/2, result.U, result.Width/2,
+		srcX/2, srcY/2, srcW/2, srcH/2, dstX/2, dstY/2, dstW/2, dstH/2, resamplePhaseLeft)
+	scalePlane(frame.V, frame.Width/2, result.V, result.Width/2,
+		srcX/2, srcY/2, srcW/2, srcH/2, dstX/2, dstY/2, dstW/2, dstH/2, resamplePhaseLeft)
+	return result, pictureRect{x: dstX, y: dstY, width: dstW, height: dstH}, nil
 }
 
-// scalePlane resamples one plane. Two-tap bilinear sampling skips source
-// samples once an axis shrinks, which folds fine detail back as moire, so
-// reductions go through a filter whose support grows with the ratio.
-func scalePlane(src []byte, srcStride, srcHeight int, dst []byte, dstStride, dstHeight int,
-	srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH int) {
-	if srcW <= dstW && srcH <= dstH {
-		scalePlaneBilinear(src, srcStride, srcHeight, dst, dstStride, dstHeight,
-			srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH)
-		return
-	}
-	scalePlaneFiltered(src, srcStride, dst, dstStride, srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH)
-}
+const (
+	resampleWeightBits = 14
+	// resampleIntermediateBits is the fraction kept between the two passes
+	// so the vertical pass does not compound the horizontal rounding.
+	resampleIntermediateBits = 6
+	// resampleLobes is the Lanczos window size.
+	resampleLobes = 3
 
-const resampleWeightBits = 14
+	// Sample positions as a fraction of the sample pitch: 0.5 for samples
+	// centred in their cell (luma, and 4:2:0 chroma vertically), 0.25 for
+	// 4:2:0 chroma co-sited with even luma columns.
+	resamplePhaseCentre = 0.5
+	resamplePhaseLeft   = 0.25
+)
 
 // resampleKernel holds, for every output sample of one axis, the first source
-// sample it reads and taps fixed-point weights that sum to 1<<resampleWeightBits.
+// sample it reads and taps signed fixed-point weights that sum to
+// 1<<resampleWeightBits.
 type resampleKernel struct {
 	taps    int
 	first   []int
 	weights []int32
 }
 
-// newResampleKernel builds a triangle (bilinear) kernel widened by the
-// reduction ratio. At a ratio of one or less it is plain bilinear
-// interpolation. Samples beyond the source edge repeat the edge sample.
-func newResampleKernel(srcSize, dstSize int) resampleKernel {
+type resampleKernelKey struct {
+	srcSize, dstSize int
+	phase            float64
+}
+
+// Kernels depend only on the two sizes and the sample siting, and a title
+// asks for the same few on every frame.
+var resampleKernels struct {
+	sync.Mutex
+	cache map[resampleKernelKey]*resampleKernel
+}
+
+const maxCachedResampleKernels = 64
+
+func cachedResampleKernel(srcSize, dstSize int, phase float64) *resampleKernel {
+	key := resampleKernelKey{srcSize: srcSize, dstSize: dstSize, phase: phase}
+	resampleKernels.Lock()
+	defer resampleKernels.Unlock()
+	if kernel := resampleKernels.cache[key]; kernel != nil {
+		return kernel
+	}
+	if resampleKernels.cache == nil || len(resampleKernels.cache) >= maxCachedResampleKernels {
+		resampleKernels.cache = make(map[resampleKernelKey]*resampleKernel)
+	}
+	kernel := newResampleKernel(srcSize, dstSize, phase)
+	resampleKernels.cache[key] = kernel
+	return kernel
+}
+
+// newResampleKernel builds a Lanczos kernel stretched by the reduction ratio,
+// so it low-passes at the output sampling rate; at a ratio of one or less it
+// interpolates. phase is the position of a sample within its pitch on both
+// the source and the output grid. Samples beyond the source edge repeat the
+// edge sample. Equal sizes give the identity for either phase.
+func newResampleKernel(srcSize, dstSize int, phase float64) *resampleKernel {
 	ratio := float64(srcSize) / float64(dstSize)
-	support := max(ratio, 1)
+	stretch := max(ratio, 1)
+	support := resampleLobes * stretch
 	taps := min(int(2*support)+2, srcSize)
-	kernel := resampleKernel{taps: taps, first: make([]int, dstSize), weights: make([]int32, dstSize*taps)}
+	kernel := &resampleKernel{taps: taps, first: make([]int, dstSize), weights: make([]int32, dstSize*taps)}
 	scratch := make([]float64, taps)
 	for index := range dstSize {
-		center := (float64(index)+0.5)*ratio - 0.5
+		center := (float64(index)+phase)*ratio - phase
 		lowest := int(math.Ceil(center - support))
 		highest := int(math.Floor(center + support))
 		first := min(max(lowest, 0), srcSize-taps)
 		clear(scratch)
 		var total float64
 		for sample := lowest; sample <= highest; sample++ {
-			weight := 1 - math.Abs(float64(sample)-center)/support
-			if weight <= 0 {
-				continue
-			}
+			weight := lanczosWeight((float64(sample)-center)/stretch, resampleLobes)
 			scratch[min(max(sample, 0), srcSize-1)-first] += weight
 			total += weight
 		}
 		weights := kernel.weights[index*taps : (index+1)*taps]
 		remainder, largest := int32(1<<resampleWeightBits), 0
 		for tap, weight := range scratch {
-			weights[tap] = int32(weight/total*(1<<resampleWeightBits) + 0.5)
+			weights[tap] = int32(math.Round(weight / total * (1 << resampleWeightBits)))
 			remainder -= weights[tap]
 			if weights[tap] > weights[largest] {
 				largest = tap
@@ -176,35 +238,80 @@ func newResampleKernel(srcSize, dstSize int) resampleKernel {
 	return kernel
 }
 
-func scalePlaneFiltered(src []byte, srcStride int, dst []byte, dstStride int,
-	srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH int) {
-	horizontal := newResampleKernel(srcW, dstW)
-	vertical := newResampleKernel(srcH, dstH)
-	// The intermediate keeps six fractional bits so the vertical pass does
-	// not compound the horizontal rounding.
-	intermediate := make([]uint16, srcH*dstW)
+func lanczosWeight(distance, lobes float64) float64 {
+	distance = math.Abs(distance)
+	if distance < 1e-9 {
+		return 1
+	}
+	if distance >= lobes {
+		return 0
+	}
+	x := math.Pi * distance
+	return lobes * math.Sin(x) * math.Sin(x/lobes) / (x * x)
+}
+
+var resampleIntermediates sync.Pool
+
+// scalePlane resamples the source rectangle of one plane into the destination
+// rectangle. Every output sample is an integer function of the source alone,
+// so the result does not depend on how rows are shared between goroutines.
+func scalePlane(src []byte, srcStride int, dst []byte, dstStride int,
+	srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH int, horizontalPhase float64) {
+	if srcW == dstW && srcH == dstH {
+		for row := range dstH {
+			copy(dst[(dstY+row)*dstStride+dstX:][:dstW], src[(srcY+row)*srcStride+srcX:])
+		}
+		return
+	}
+	horizontal := cachedResampleKernel(srcW, dstW, horizontalPhase)
+	vertical := cachedResampleKernel(srcH, dstH, resamplePhaseCentre)
+	var intermediate []int16
+	if pooled, ok := resampleIntermediates.Get().(*[]int16); ok && cap(*pooled) >= srcH*dstW {
+		intermediate = (*pooled)[:srcH*dstW]
+	} else {
+		intermediate = make([]int16, srcH*dstW)
+	}
+	defer resampleIntermediates.Put(&intermediate)
+
+	const horizontalShift = resampleWeightBits - resampleIntermediateBits
+	hTaps := horizontal.taps
 	parallelMPEG2Rows(srcH, func(row int) {
-		source := src[(srcY+row)*srcStride+srcX:]
-		target := intermediate[row*dstW : (row+1)*dstW]
+		source := src[(srcY+row)*srcStride+srcX:][:srcW]
+		target := intermediate[row*dstW:][:dstW]
 		for x := range target {
-			samples := source[horizontal.first[x]:]
+			samples := source[horizontal.first[x]:][:hTaps]
+			weights := horizontal.weights[x*hTaps:][:hTaps]
 			var sum int32
-			for tap, weight := range horizontal.weights[x*horizontal.taps : (x+1)*horizontal.taps] {
-				sum += weight * int32(samples[tap])
+			for tap, sample := range samples {
+				sum += weights[tap] * int32(sample)
 			}
-			target[x] = uint16((sum + 1<<7) >> 8)
+			// Signed weights overshoot next to edges; the sample range is
+			// restored once, after the vertical pass.
+			target[x] = int16(min(max((sum+1<<(horizontalShift-1))>>horizontalShift, math.MinInt16), math.MaxInt16))
 		}
 	})
+
+	const verticalShift = resampleWeightBits + resampleIntermediateBits
+	vTaps := vertical.taps
 	parallelMPEG2Rows(dstH, func(row int) {
-		weights := vertical.weights[row*vertical.taps : (row+1)*vertical.taps]
+		var buffer [720]int32
+		sums := buffer[:]
+		if dstW > len(sums) {
+			sums = make([]int32, dstW)
+		}
+		sums = sums[:dstW]
 		first := vertical.first[row]
-		target := dst[(dstY+row)*dstStride+dstX:]
-		for x := range dstW {
-			var sum int32
-			for tap, weight := range weights {
-				sum += weight * int32(intermediate[(first+tap)*dstW+x])
+		for tap, weight := range vertical.weights[row*vTaps:][:vTaps] {
+			if weight == 0 {
+				continue
 			}
-			target[x] = byte((sum + 1<<(2*resampleWeightBits-9)) >> (2*resampleWeightBits - 8))
+			for x, sample := range intermediate[(first+tap)*dstW:][:dstW] {
+				sums[x] += weight * int32(sample)
+			}
+		}
+		target := dst[(dstY+row)*dstStride+dstX:][:dstW]
+		for x, sum := range sums {
+			target[x] = byte(min(max((sum+1<<(verticalShift-1))>>verticalShift, 0), 255))
 		}
 	})
 }
@@ -212,47 +319,4 @@ func scalePlaneFiltered(src []byte, srcStride int, dst []byte, dstStride int,
 func evenDimension(value float64) int {
 	dimension := int(value + 0.5)
 	return dimension &^ 1
-}
-
-func scalePlaneBilinear(src []byte, srcStride, srcHeight int, dst []byte, dstStride, dstHeight int,
-	srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH int) {
-	for y := range dstH {
-		fy := float64(srcY) + (float64(y)+0.5)*float64(srcH)/float64(dstH) - 0.5
-		y0 := max(int(fy), srcY)
-		y1 := y0 + 1
-		maxY := srcY + srcH - 1
-		if y1 > maxY {
-			y1 = maxY
-		}
-		wy := fy - float64(y0)
-		if wy < 0 {
-			wy = 0
-		}
-		for x := range dstW {
-			fx := float64(srcX) + (float64(x)+0.5)*float64(srcW)/float64(dstW) - 0.5
-			x0 := max(int(fx), srcX)
-			x1 := x0 + 1
-			maxX := srcX + srcW - 1
-			if x1 > maxX {
-				x1 = maxX
-			}
-			wx := fx - float64(x0)
-			if wx < 0 {
-				wx = 0
-			}
-			a := float64(src[y0*srcStride+x0])
-			b := float64(src[y0*srcStride+x1])
-			c := float64(src[y1*srcStride+x0])
-			d := float64(src[y1*srcStride+x1])
-			top := a + (b-a)*wx
-			bottom := c + (d-c)*wx
-			value := top + (bottom-top)*wy
-			if value < 0 {
-				value = 0
-			} else if value > 255 {
-				value = 255
-			}
-			dst[(dstY+y)*dstStride+dstX+x] = byte(value + 0.5)
-		}
-	}
 }
