@@ -29,18 +29,16 @@ func decodeMP4AACFallback(ctx context.Context, path string, trackIndex *int, han
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	selectedIndex := trackIndex
-	if selectedIndex == nil {
-		info, err := ProbeMedia(path)
-		if err != nil {
-			return fmt.Errorf("video2dvd: inspect MP4 before AAC fallback: %w", err)
-		}
-		track, err := selectAudioTrack(info, nil)
-		if err != nil {
-			return err
-		}
-		selectedIndex = &track.Index
+	probed, err := ProbeMedia(path)
+	if err != nil {
+		return fmt.Errorf("video2dvd: inspect MP4 before AAC fallback: %w", err)
 	}
+	selected, err := selectAudioTrack(probed, trackIndex)
+	if err != nil {
+		return err
+	}
+	selectedIndex := &selected.Index
+	edited := newEditedPCMWriter(selected.edit, handler)
 	source, err := os.Open(path)
 	if err != nil {
 		return fmt.Errorf("video2dvd: open MP4 for AAC fallback: %w", err)
@@ -50,7 +48,7 @@ func decodeMP4AACFallback(ctx context.Context, path string, trackIndex *int, han
 	if err != nil {
 		return fmt.Errorf("video2dvd: stat MP4 for AAC fallback: %w", err)
 	}
-	reader, err := mp4audio.OpenTrack(ctx, source, stat.Size(), mp4audio.Limits{
+	reader, err := mp4audio.OpenTrack(ctx, hideMP4EditList(source, selected.edit), stat.Size(), mp4audio.Limits{
 		MaxBytes: stat.Size(), MaxDurationSeconds: 24 * 60 * 60,
 	}, *selectedIndex)
 	if err != nil {
@@ -180,7 +178,7 @@ func decodeMP4AACFallback(ctx context.Context, path string, trackIndex *int, han
 				Channels:   2,
 				Samples:    append([]int16(nil), shortPCM[:len(values)]...),
 			}
-			if err := handler(chunk); err != nil {
+			if err := edited.WriteChunk(chunk); err != nil {
 				return err
 			}
 			outputFrame += int64(frames)

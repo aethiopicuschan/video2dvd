@@ -10,6 +10,9 @@ import (
 // rate. Source display aspect ratio must be supplied by the caller because
 // some MP4 files use non-square pixels or rotation metadata not represented by
 // the decoded frame dimensions. The handler receives owned DVD-raster frames.
+// When the track has an edit list, output starts at movie time zero: frames
+// before the first media edit are skipped and a leading empty edit holds the
+// first frame.
 func PrepareMP4VideoForDVD(
 	ctx context.Context,
 	path string,
@@ -25,6 +28,14 @@ func PrepareMP4VideoForDVD(
 	rateConverter, err := NewDVDFrameRateConverter(profile, handler)
 	if err != nil {
 		return err
+	}
+	if info, probeErr := ProbeMP4(path); probeErr == nil {
+		if track, selectErr := selectVideoTrack(info, trackIndex); selectErr == nil && track.edit.present {
+			// Movie time zero is the edit's media time, delayed by any
+			// leading empty edit, which keeps video aligned with the audio
+			// track's own edit list.
+			rateConverter.setOrigin(track.edit.mediaTime - track.edit.empty)
+		}
 	}
 	err = DecodeMP4Video(ctx, path, trackIndex, func(frame DecodedVideoFrame) error {
 		fitted, err := FitVideoFrame(frame, profile, sourceAspectNumerator, sourceAspectDenominator, mode)

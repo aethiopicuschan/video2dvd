@@ -24,10 +24,11 @@ func TestTrackDisplayAspectIncludesPixelAspect(t *testing.T) {
 }
 
 func TestCheckEstimatedTitleSize(t *testing.T) {
-	if err := ExportCheckEstimatedTitleSize(time.Second, 1_192_000, ExportMPEG2VideoBitrate); err != nil {
+	// 1,000,000 video bytes and 192,000 LPCM bytes plus 1/32 multiplex overhead.
+	if err := ExportCheckEstimatedTitleSize(time.Second, 1_229_250, ExportMPEG2VideoBitrate); err != nil {
 		t.Fatalf("one-second estimate should fit exactly: %v", err)
 	}
-	if err := ExportCheckEstimatedTitleSize(time.Second, 1_191_999, ExportMPEG2VideoBitrate); !errors.Is(err, ErrDiscCapacity) {
+	if err := ExportCheckEstimatedTitleSize(time.Second, 1_229_249, ExportMPEG2VideoBitrate); !errors.Is(err, ErrDiscCapacity) {
 		t.Fatalf("one-byte undersized capacity should fail with ErrDiscCapacity, got %v", err)
 	}
 }

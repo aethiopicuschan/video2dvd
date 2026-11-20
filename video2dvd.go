@@ -112,6 +112,11 @@ type EncodedTitle struct {
 	FrameRateNumerator   int
 	FrameRateDenominator int
 	Duration             time.Duration
+	// Name is an optional label for the title in the disc menu. The
+	// Converter sets it to the base name of the input video file without
+	// its extension unless the encoder provided one; without a name the
+	// menu falls back to the base name of VideoPath.
+	Name string
 }
 
 // MediaInput identifies the video and optional audio source for one DVD title.
@@ -240,6 +245,7 @@ func (c *Converter) ConvertSources(ctx context.Context, inputs []MediaInput, out
 		return fmt.Errorf("video2dvd: create encoded directory: %w", err)
 	}
 	titles := make([]EncodedTitle, 0, len(mediaInputs))
+	var encodedBytes int64
 	for i, input := range mediaInputs {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -270,7 +276,22 @@ func (c *Converter) ConvertSources(ctx context.Context, inputs []MediaInput, out
 		if err != nil {
 			return fmt.Errorf("video2dvd: resolve encoded audio for input %d: %w", i+1, err)
 		}
+		if title.Name == "" {
+			title.Name = mediaTitleName(inputs[i].VideoPath)
+		}
 		titles = append(titles, title)
+		// Fail before encoding the remaining inputs once the streams so far
+		// can no longer fit; multiplexing only adds to their size.
+		for _, path := range []string{title.VideoPath, title.AudioPath} {
+			stat, err := os.Stat(path)
+			if err != nil {
+				return fmt.Errorf("video2dvd: measure encoded input %d: %w", i+1, err)
+			}
+			encodedBytes += stat.Size()
+		}
+		if encodedBytes > profile.DiscCapacityBytes {
+			return fmt.Errorf("%w: the first %d of %d inputs already need %d bytes, limit is %d", ErrDiscCapacity, i+1, len(inputs), encodedBytes, profile.DiscCapacityBytes)
+		}
 	}
 
 	dvdRoot := filepath.Join(stageRoot, "dvd")
@@ -366,6 +387,13 @@ func (c *Converter) ConvertSourcesISO(ctx context.Context, inputs []MediaInput, 
 		return fmt.Errorf("video2dvd: publish DVD image: %w", err)
 	}
 	return nil
+}
+
+// mediaTitleName returns the menu label of an input: the base name of its
+// video file without the extension.
+func mediaTitleName(videoPath string) string {
+	name := filepath.Base(videoPath)
+	return strings.TrimSuffix(name, filepath.Ext(name))
 }
 
 func validateMediaInputs(inputs []MediaInput) ([]MediaInput, error) {
@@ -651,6 +679,10 @@ func filesEqual(first, second string, size int64) (bool, error) {
 	return true, nil
 }
 
+// dvdVOBFileMaxBytes is the largest VOB file DVD-Video allows: 1 GiB less
+// one sector.
+const dvdVOBFileMaxBytes = 1<<30 - DVDVOBSectorSize
+
 func validateVOBs(videoTS string) error {
 	return filepath.WalkDir(videoTS, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
@@ -663,7 +695,7 @@ func validateVOBs(videoTS string) error {
 		if err != nil {
 			return err
 		}
-		if !info.Mode().IsRegular() || info.Size() == 0 || info.Size()%2048 != 0 || info.Size() > 1<<30 {
+		if !info.Mode().IsRegular() || info.Size() == 0 || info.Size()%2048 != 0 || info.Size() > dvdVOBFileMaxBytes {
 			return fmt.Errorf("video2dvd: %s has an invalid DVD VOB size", entry.Name())
 		}
 		return validateVOBPacks(path, entry.Name(), info.Size())

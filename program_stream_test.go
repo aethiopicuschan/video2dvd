@@ -35,8 +35,9 @@ func TestMPEGProgramStreamWriterUsesFixedSectors(t *testing.T) {
 		t.Fatal("first pack does not contain a video PES packet")
 	}
 	pesLength := int(binary.BigEndian.Uint16(sectors[18:20]))
-	if pesLength != 3+5+2014 {
-		t.Fatalf("first PES length = %d, want %d", pesLength, 3+5+2014)
+	// A full pack carries no padding packet: 2048 - 14 (pack) - 9 (PES) - 5 (PTS).
+	if pesLength != 3+5+2020 {
+		t.Fatalf("first PES length = %d, want %d", pesLength, 3+5+2020)
 	}
 	if got := decodeTestMPEGTimestamp(sectors[23:28]); got != 90_000 {
 		t.Fatalf("first PES PTS = %d, want 90000", got)
@@ -159,4 +160,117 @@ func decodeTestMPEG2SCR(value []byte) uint64 {
 		return result
 	}
 	return readBits(2, 3)<<30 | readBits(6, 15)<<15 | readBits(22, 15)
+}
+
+func TestMPEGProgramStreamWriterClockFollowsBytesNotTimestamps(t *testing.T) {
+	var output bytes.Buffer
+	writer, err := NewMPEGProgramStreamWriter(&output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Three packs of video stamped 100 ms, then audio stamped 150 ms. The
+	// clock must start at zero and count sectors at 1.26 MB/s; it must not
+	// jump to either timestamp.
+	if err := writer.WritePES(0xe0, 100*time.Millisecond, make([]byte, 5000)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WritePES(0xbd, 150*time.Millisecond, make([]byte, 100)); err != nil {
+		t.Fatal(err)
+	}
+	sectors := output.Bytes()
+	if len(sectors) != 4*DVDVOBSectorSize {
+		t.Fatalf("output size = %d, want four sectors", len(sectors))
+	}
+	for index := range 4 {
+		header := sectors[index*DVDVOBSectorSize+4 : index*DVDVOBSectorSize+14]
+		got := decodeTestMPEG2SCR(header)*300 + decodeTestMPEG2SCRExtension(header)
+		want := uint64(index) * DVDVOBSectorSize * 27_000_000 / 1_260_000
+		if got != want {
+			t.Fatalf("pack %d SCR = %d (27 MHz), want %d", index, got, want)
+		}
+		if header[9] != 0xf8 {
+			t.Fatalf("pack %d reserved/stuffing byte = %#x, want 0xf8", index, header[9])
+		}
+	}
+	// 2048 bytes take 43885.71 ticks: the 27 MHz extension must be in use.
+	if decodeTestMPEG2SCRExtension(sectors[DVDVOBSectorSize+4:DVDVOBSectorSize+14]) != 43_885%300 {
+		t.Fatal("second pack does not carry the SCR extension")
+	}
+}
+
+func TestMPEGProgramStreamWriterWaitsForSparseStreams(t *testing.T) {
+	var output bytes.Buffer
+	writer, err := NewMPEGProgramStreamWriter(&output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// With nothing to send the clock may idle, but only up to the point
+	// where the packet is still 0.3 s ahead of its presentation time.
+	if err := writer.WritePES(0xbd, 2*time.Second, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := decodeTestMPEG2SCR(output.Bytes()[4:14]); got != 180_000-27_000 {
+		t.Fatalf("SCR = %d, want %d (0.3 s before the PTS)", got, 180_000-27_000)
+	}
+}
+
+func TestMPEGProgramStreamWriterRoundsTimestampsToTheNearestTick(t *testing.T) {
+	var output bytes.Buffer
+	writer, err := NewMPEGProgramStreamWriter(&output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for frame := range 30 {
+		// 1001/30000 s is not a whole number of nanoseconds.
+		if err := writer.WritePES(0xe0, time.Duration(frame)*time.Second*1001/30000, []byte{1}); err != nil {
+			t.Fatal(err)
+		}
+		sector := output.Bytes()[frame*DVDVOBSectorSize:]
+		if got := decodeTestMPEGTimestamp(sector[23:28]); got != uint64(frame)*3003 {
+			t.Fatalf("frame %d PTS = %d, want %d", frame, got, frame*3003)
+		}
+	}
+}
+
+func TestMPEGProgramStreamWriterCompletesShortPacks(t *testing.T) {
+	const capacity = DVDVOBSectorSize - 14 - 9 - 5
+	for _, test := range []struct {
+		spare    int
+		stuffing int
+	}{{0, 0}, {1, 1}, {7, 7}, {8, 0}, {500, 0}} {
+		var output bytes.Buffer
+		writer, err := NewMPEGProgramStreamWriter(&output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		payload := bytes.Repeat([]byte{0x55}, capacity-test.spare)
+		if err := writer.WritePES(0xe0, 0, payload); err != nil {
+			t.Fatal(err)
+		}
+		sector := output.Bytes()
+		if len(sector) != DVDVOBSectorSize {
+			t.Fatalf("spare %d: wrote %d bytes, want one sector", test.spare, len(sector))
+		}
+		// A gap too small for a padding packet is absorbed by PES header
+		// stuffing; anything larger becomes a padding packet.
+		if got := int(sector[22]); got != 5+test.stuffing {
+			t.Fatalf("spare %d: PES header data length = %d, want %d", test.spare, got, 5+test.stuffing)
+		}
+		for _, value := range sector[28 : 28+test.stuffing] {
+			if value != 0xff {
+				t.Fatalf("spare %d: stuffing byte = %#x", test.spare, value)
+			}
+		}
+		end := 20 + int(binary.BigEndian.Uint16(sector[18:20]))
+		if !bytes.Equal(sector[23+int(sector[22]):end], payload) {
+			t.Fatalf("spare %d: payload is not intact", test.spare)
+		}
+		padding := DVDVOBSectorSize - end
+		if wantPadding := test.spare - test.stuffing; padding != wantPadding {
+			t.Fatalf("spare %d: %d bytes follow the PES packet, want %d", test.spare, padding, wantPadding)
+		}
+		if padding != 0 && (!bytes.Equal(sector[end:end+4], []byte{0, 0, 1, 0xbe}) || int(binary.BigEndian.Uint16(sector[end+4:end+6])) != padding-6) {
+			t.Fatalf("spare %d: sector is not completed by a padding packet", test.spare)
+		}
+	}
 }

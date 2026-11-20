@@ -14,6 +14,44 @@ const (
 	mpeg2VideoBitrate    = 8_000_000
 	mpeg2MinVideoBitrate = 2_000_000
 	mpeg2MaxVideoBitrate = 8_500_000
+
+	// mpeg2MuxSafeVideoBitrate is the highest rate the encoder actually codes
+	// at. The DVD program stream carries 10.08 Mbit/s; 48 kHz 16-bit stereo
+	// LPCM occupies 1.64 Mbit/s of it as packed, and NAV packs and pack/PES headers
+	// take about 0.15 Mbit/s. The remainder is headroom for rate-control
+	// overshoot and for delivering large I pictures ahead of their decode
+	// time. Requests above this value are accepted for compatibility and
+	// coded at this rate.
+	mpeg2MuxSafeVideoBitrate = 7_500_000
+
+	mpeg2GOPPictures = 15
+
+	// mpeg2VBVBufferBits is the buffer declared in the sequence header
+	// (vbv_buffer_size 112), the largest DVD-Video allows.
+	mpeg2VBVBufferBits = 112 * 16384
+	// mpeg2VBVStartBits is the occupancy rate control assumes at the first
+	// picture and steers back to before every I picture; mpeg2VBVCeilingBits
+	// is the most it ever counts on, so unspent bits carry over only up to
+	// that level. Staying below the declared size means a multiplexer only has
+	// to deliver the start occupancy ahead of the first decoding time, and
+	// keeps the largest picture well inside the buffer.
+	mpeg2VBVStartBits   = 100 * 1024 * 8
+	mpeg2VBVCeilingBits = 150 * 1024 * 8
+	// mpeg2VBVGuardBits is kept in the modelled buffer after every picture to
+	// absorb pack granularity and audio/NAV interleaving in the multiplexer.
+	mpeg2VBVGuardBits = 6 * DVDVOBSectorSize * 8
+
+	// An I picture may take at most this fraction of the bits left for its
+	// GOP, so that a scene change after it does not starve the P pictures.
+	mpeg2MaxIntraShare = 0.5
+	// Share of a GOP given to the first I picture, before any P picture has
+	// shown how the content codes.
+	mpeg2FirstIntraShare = 0.25
+	// An I picture is coded at this multiple of the previous GOP's mean P
+	// quantizer scale. The intra matrix quantizes high frequencies more
+	// coarsely than the flat non-intra one, and every P picture of the GOP
+	// predicts from the I picture, so it is given the finer scale.
+	mpeg2IntraQuantizerRatio = 0.75
 )
 
 func profileVideoBitrate(profile Profile) int {
@@ -21,6 +59,61 @@ func profileVideoBitrate(profile Profile) int {
 		return mpeg2VideoBitrate
 	}
 	return profile.VideoBitrate
+}
+
+// effectiveMPEG2VideoBitrate is the rate written to the sequence header and
+// enforced by rate control for the requested profile bitrate.
+func effectiveMPEG2VideoBitrate(profile Profile) int {
+	return min(profileVideoBitrate(profile), mpeg2MuxSafeVideoBitrate)
+}
+
+// mpeg2RateControl models the video buffering verifier (H.262 Annex C) for a
+// stream delivered at the declared bit rate and derives per-picture budgets
+// from its occupancy.
+type mpeg2RateControl struct {
+	bitsPerPicture float64
+	// fullness is the modelled occupancy in bits just before the next picture
+	// is removed.
+	fullness float64
+	// Quantizer scales of the P pictures coded since the last I picture.
+	predictiveQuantizerSum   int
+	predictiveQuantizerCount int
+}
+
+func newMPEG2RateControl(bitsPerPicture float64) mpeg2RateControl {
+	return mpeg2RateControl{bitsPerPicture: bitsPerPicture, fullness: mpeg2VBVStartBits}
+}
+
+// pictureBudget returns, in bytes, the size to aim for and the size that must
+// not be exceeded for the next picture, and the finest quantizer scale worth
+// trying. remaining counts the pictures left in the GOP including this one.
+func (rc *mpeg2RateControl) pictureBudget(isIntra bool, remaining int) (targetBytes, limitBytes, minQuantizer int) {
+	limit := max(rc.fullness-mpeg2VBVGuardBits, 0)
+	// Spend what brings the buffer back to its start level by the next
+	// I picture, which is the picture that needs the reserve.
+	gopBits := rc.fullness + float64(remaining)*rc.bitsPerPicture - mpeg2VBVStartBits
+	target := gopBits / float64(remaining)
+	minQuantizer = 1
+	if isIntra {
+		if rc.predictiveQuantizerCount > 0 {
+			mean := float64(rc.predictiveQuantizerSum) / float64(rc.predictiveQuantizerCount)
+			minQuantizer = max(1, min(31, int(mean*mpeg2IntraQuantizerRatio+0.5)))
+			target = gopBits * mpeg2MaxIntraShare
+		} else {
+			target = gopBits * mpeg2FirstIntraShare
+		}
+		rc.predictiveQuantizerSum, rc.predictiveQuantizerCount = 0, 0
+	}
+	target = min(max(target, rc.bitsPerPicture/8), limit)
+	return int(target) / 8, int(limit) / 8, minQuantizer
+}
+
+func (rc *mpeg2RateControl) pictureCoded(isIntra bool, sizeBytes, quantizer int) {
+	if !isIntra {
+		rc.predictiveQuantizerSum += quantizer
+		rc.predictiveQuantizerCount++
+	}
+	rc.fullness = min(rc.fullness-float64(sizeBytes)*8+rc.bitsPerPicture, mpeg2VBVCeilingBits)
 }
 
 var mpeg2DCTBasis = buildMPEG2DCTBasis()
@@ -68,18 +161,20 @@ func buildMPEG2DCTBasis() [8][8]float64 {
 // The writer does not close dst. Call Close after the final frame to write the
 // MPEG sequence-end code.
 type MPEG2VideoEncoder struct {
-	dst        io.Writer
-	profile    Profile
-	frameRate  int
-	frameBytes int
-	frameNo    int64
-	reference  *DecodedVideoFrame
-	closed     bool
-	writeErr   error
+	dst       io.Writer
+	profile   Profile
+	frameRate int
+	rate      mpeg2RateControl
+	frameNo   int64
+	reference *DecodedVideoFrame
+	closed    bool
+	writeErr  error
 }
 
 // NewMPEG2VideoEncoder prepares an encoder for NTSC or PAL full-raster DVD
-// frames. It writes the sequence header with the first GOP.
+// frames. It writes the sequence header with the first GOP. Bitrates above
+// 7.5 Mbit/s are coded at 7.5 Mbit/s so that the stream still fits the DVD
+// multiplex next to LPCM audio.
 func NewMPEG2VideoEncoder(dst io.Writer, profile Profile) (*MPEG2VideoEncoder, error) {
 	if dst == nil {
 		return nil, errors.New("video2dvd: MPEG-2 destination writer is required")
@@ -92,13 +187,14 @@ func NewMPEG2VideoEncoder(dst io.Writer, profile Profile) (*MPEG2VideoEncoder, e
 	if bitrate < mpeg2MinVideoBitrate || bitrate > mpeg2MaxVideoBitrate {
 		return nil, fmt.Errorf("video2dvd: video bitrate must be between %d and %d bit/s", mpeg2MinVideoBitrate, mpeg2MaxVideoBitrate)
 	}
+	bitrate = effectiveMPEG2VideoBitrate(profile)
 	switch profile.Standard {
 	case VideoStandardNTSC:
 		encoder.frameRate = 30
-		encoder.frameBytes = bitrate * 1001 / (8 * 30000)
+		encoder.rate = newMPEG2RateControl(float64(bitrate) * 1001 / 30000)
 	case VideoStandardPAL:
 		encoder.frameRate = 25
-		encoder.frameBytes = bitrate / (8 * 25)
+		encoder.rate = newMPEG2RateControl(float64(bitrate) / 25)
 	default:
 		return nil, ErrInvalidProfile
 	}
@@ -125,7 +221,8 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 	}
 	mbWidth := frame.Width / 16
 	mbHeight := frame.Height / 16
-	isIntra := e.reference == nil || e.frameNo%15 == 0
+	gopPosition := int(e.frameNo % mpeg2GOPPictures)
+	isIntra := e.reference == nil || gopPosition == 0
 	var intraBlocks []mpeg2IntraBlock
 	var predictiveMacroblocks []mpeg2PredictiveMacroblock
 	if isIntra {
@@ -133,33 +230,37 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 	} else {
 		predictiveMacroblocks = analyzeMPEG2PredictiveMacroblocks(frame, *e.reference, mbWidth, mbHeight)
 	}
-	var encoded []byte
-	selectedQuantizer := 0
-	for quantizer := 1; quantizer <= 31; quantizer++ {
-		var size int
+	measure := func(quantizer int) int {
 		if isIntra {
-			size = e.measureIntraPicture(frame, intraBlocks, mbWidth, mbHeight, quantizer, true)
-		} else {
-			size = e.measurePredictivePicture(predictiveMacroblocks, mbWidth, mbHeight, quantizer, true)
+			return e.measureIntraPicture(frame, intraBlocks, mbWidth, mbHeight, quantizer, true)
 		}
-		if size <= e.frameBytes {
-			selectedQuantizer = quantizer
-			break
-		}
+		return e.measurePredictivePicture(predictiveMacroblocks, mbWidth, mbHeight, quantizer, true)
 	}
+	targetBytes, limitBytes, minQuantizer := e.rate.pictureBudget(isIntra, mpeg2GOPPictures-gopPosition)
+	selectedQuantizer := selectMPEG2Quantizer(measure, targetBytes, minQuantizer)
 	if selectedQuantizer == 0 {
 		// Preserve low-frequency detail when even the coarsest complete picture
-		// exceeds its frame budget. Dropping every AC coefficient causes visible
+		// exceeds its budget. Dropping every AC coefficient causes visible
 		// macroblock blur, so keep the largest zig-zag prefix that fits instead.
 		selectedQuantizer = 31
+		limit := fitMPEG2ACLimit(func(limit int) int {
+			if isIntra {
+				return e.measureIntraPicture(frame, limitMPEG2IntraAC(intraBlocks, limit), mbWidth, mbHeight, 31, true)
+			}
+			return e.measurePredictivePicture(limitMPEG2PredictiveAC(predictiveMacroblocks, limit), mbWidth, mbHeight, 31, true)
+		}, targetBytes)
 		if isIntra {
-			limit := fitMPEG2IntraACLimit(e, frame, intraBlocks, mbWidth, mbHeight)
 			intraBlocks = limitMPEG2IntraAC(intraBlocks, limit)
 		} else {
-			limit := fitMPEG2PredictiveACLimit(e, predictiveMacroblocks, mbWidth, mbHeight)
 			predictiveMacroblocks = limitMPEG2PredictiveAC(predictiveMacroblocks, limit)
+			if measure(31) > limitBytes {
+				// Motion vectors alone would underflow the decoder buffer:
+				// repeat the reference picture instead.
+				predictiveMacroblocks = make([]mpeg2PredictiveMacroblock, len(predictiveMacroblocks))
+			}
 		}
 	}
+	var encoded []byte
 	if isIntra {
 		encoded = e.encodeIntraPicture(frame, intraBlocks, mbWidth, mbHeight, selectedQuantizer, true)
 	} else {
@@ -169,6 +270,7 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 		e.writeErr = fmt.Errorf("video2dvd: write MPEG-2 picture %d: %w", e.frameNo, err)
 		return e.writeErr
 	}
+	e.rate.pictureCoded(isIntra, len(encoded), selectedQuantizer)
 	var reference DecodedVideoFrame
 	if isIntra {
 		reference = reconstructMPEG2IntraFrame(frame, intraBlocks, mbWidth, mbHeight, selectedQuantizer, true)
@@ -180,27 +282,31 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 	return nil
 }
 
-func fitMPEG2IntraACLimit(e *MPEG2VideoEncoder, frame DecodedVideoFrame, blocks []mpeg2IntraBlock, mbWidth, mbHeight int) int {
-	low, high, best := 1, 64, 1
+// selectMPEG2Quantizer returns the finest quantizer scale from minQuantizer up
+// whose picture fits budgetBytes, or 0 when even the coarsest does not.
+// Picture size falls as the scale rises, so a bisection needs five
+// measurements instead of up to 31.
+func selectMPEG2Quantizer(measure func(quantizer int) int, budgetBytes, minQuantizer int) int {
+	low, high, best := minQuantizer, 31, 0
 	for low <= high {
-		limit := low + (high-low)/2
-		limited := limitMPEG2IntraAC(blocks, limit)
-		if e.measureIntraPicture(frame, limited, mbWidth, mbHeight, 31, true) <= e.frameBytes {
-			best = limit
-			low = limit + 1
+		quantizer := low + (high-low)/2
+		if measure(quantizer) <= budgetBytes {
+			best = quantizer
+			high = quantizer - 1
 		} else {
-			high = limit - 1
+			low = quantizer + 1
 		}
 	}
 	return best
 }
 
-func fitMPEG2PredictiveACLimit(e *MPEG2VideoEncoder, macroblocks []mpeg2PredictiveMacroblock, mbWidth, mbHeight int) int {
+// fitMPEG2ACLimit returns the longest zig-zag coefficient prefix whose picture
+// fits budgetBytes at the coarsest quantizer, or 1 when none does.
+func fitMPEG2ACLimit(measure func(coefficientLimit int) int, budgetBytes int) int {
 	low, high, best := 1, 64, 1
 	for low <= high {
 		limit := low + (high-low)/2
-		limited := limitMPEG2PredictiveAC(macroblocks, limit)
-		if e.measurePredictivePicture(limited, mbWidth, mbHeight, 31, true) <= e.frameBytes {
+		if measure(limit) <= budgetBytes {
 			best = limit
 			low = limit + 1
 		} else {
@@ -257,11 +363,11 @@ func (e *MPEG2VideoEncoder) measureIntraPicture(frame DecodedVideoFrame, blocks 
 }
 
 func (e *MPEG2VideoEncoder) writeIntraPictureHeader(bits *mpeg2BitWriter) {
-	if e.frameNo%15 == 0 {
+	if e.frameNo%mpeg2GOPPictures == 0 {
 		writeMPEG2SequenceHeader(bits, e.profile)
 		writeMPEG2GOPHeader(bits, e.frameNo, e.frameRate)
 	}
-	writeMPEG2PictureHeader(bits, uint16(e.frameNo%15), 1)
+	writeMPEG2PictureHeader(bits, uint16(e.frameNo%mpeg2GOPPictures), 1)
 }
 
 func (e *MPEG2VideoEncoder) encodePredictivePicture(macroblocks []mpeg2PredictiveMacroblock, mbWidth, mbHeight, quantizer int, includeAC bool) []byte {
@@ -283,7 +389,7 @@ func (e *MPEG2VideoEncoder) measurePredictivePicture(macroblocks []mpeg2Predicti
 }
 
 func (e *MPEG2VideoEncoder) writePredictivePictureHeader(bits *mpeg2BitWriter) {
-	writeMPEG2PictureHeader(bits, uint16(e.frameNo%15), 2)
+	writeMPEG2PictureHeader(bits, uint16(e.frameNo%mpeg2GOPPictures), 2)
 }
 
 func encodeMPEG2PictureRows(header *mpeg2BitWriter, rowCount int, writeRow func(*mpeg2BitWriter, int)) ([]byte, int) {
@@ -365,17 +471,17 @@ func writeMPEG2SequenceHeader(bits *mpeg2BitWriter, profile Profile) {
 		frameRateCode = 3 // 25/1
 	}
 	bits.write(frameRateCode, 4)
-	bits.write(uint64(profileVideoBitrate(profile)/400), 18) // Maximum video rate in units of 400 bit/s.
-	bits.write(1, 1)                                         // marker_bit
-	bits.write(112, 10)                                      // 224 KiB video buffering verifier.
-	bits.write(0, 1)                                         // constrained_parameters_flag
-	bits.write(0, 1)                                         // load_intra_quantiser_matrix
-	bits.write(0, 1)                                         // load_non_intra_quantiser_matrix
+	bits.write(uint64((effectiveMPEG2VideoBitrate(profile)+399)/400), 18) // Maximum video rate in units of 400 bit/s.
+	bits.write(1, 1)                                                      // marker_bit
+	bits.write(mpeg2VBVBufferBits/16384, 10)                              // 224 KiB video buffering verifier.
+	bits.write(0, 1)                                                      // constrained_parameters_flag
+	bits.write(0, 1)                                                      // load_intra_quantiser_matrix
+	bits.write(0, 1)                                                      // load_non_intra_quantiser_matrix
 
 	bits.startCode(0xb5)
 	bits.write(1, 4)    // sequence_extension_identifier
 	bits.write(0x48, 8) // Main Profile at Main Level
-	bits.write(1, 1)    // progressive_sequence
+	bits.write(0, 1)    // progressive_sequence: DVD-Video flags progressive material per picture.
 	bits.write(1, 2)    // 4:2:0 chroma_format
 	bits.write(0, 2)    // horizontal_size_extension
 	bits.write(0, 2)    // vertical_size_extension
@@ -425,7 +531,7 @@ func writeMPEG2PictureHeader(bits *mpeg2BitWriter, temporalReference uint16, pic
 	}
 	bits.write(0, 2) // intra_dc_precision
 	bits.write(3, 2) // frame picture
-	bits.write(0, 1) // top_field_first
+	bits.write(1, 1) // top_field_first
 	bits.write(1, 1) // frame_pred_frame_dct
 	bits.write(0, 1) // concealment_motion_vectors
 	bits.write(0, 1) // q_scale_type
@@ -595,7 +701,7 @@ func mpeg2HorizontalHalfMotionCost(current, reference []byte, stride, x, y, left
 		currentRow := (y+row)*stride + x
 		referenceRow := (top+row)*stride + left
 		for column := range 16 {
-			predicted := (int(reference[referenceRow+column]) + int(reference[referenceRow+column+1])) / 2
+			predicted := (int(reference[referenceRow+column]) + int(reference[referenceRow+column+1]) + 1) / 2
 			cost += int64(absInt(int(current[currentRow+column]) - predicted))
 			if cost > limit {
 				return cost
@@ -612,7 +718,7 @@ func mpeg2VerticalHalfMotionCost(current, reference []byte, stride, x, y, left, 
 		referenceRow := (top+row)*stride + left
 		nextReferenceRow := referenceRow + stride
 		for column := range 16 {
-			predicted := (int(reference[referenceRow+column]) + int(reference[nextReferenceRow+column])) / 2
+			predicted := (int(reference[referenceRow+column]) + int(reference[nextReferenceRow+column]) + 1) / 2
 			cost += int64(absInt(int(current[currentRow+column]) - predicted))
 			if cost > limit {
 				return cost
@@ -630,7 +736,7 @@ func mpeg2DiagonalHalfMotionCost(current, reference []byte, stride, x, y, left, 
 		nextReferenceRow := referenceRow + stride
 		for column := range 16 {
 			predicted := (int(reference[referenceRow+column]) + int(reference[referenceRow+column+1]) +
-				int(reference[nextReferenceRow+column]) + int(reference[nextReferenceRow+column+1])) / 4
+				int(reference[nextReferenceRow+column]) + int(reference[nextReferenceRow+column+1]) + 2) / 4
 			cost += int64(absInt(int(current[currentRow+column]) - predicted))
 			if cost > limit {
 				return cost
@@ -679,13 +785,15 @@ func mpeg2MotionSample(plane []byte, stride, x, y, motionX, motionY int) byte {
 	if fractionX == 0 && fractionY == 0 {
 		return byte(first)
 	}
+	// H.262 7.6.4 rounds half-sample averages half up; truncating here would
+	// make every decoder drift from the encoder's reference.
 	if fractionX != 0 && fractionY == 0 {
-		return byte((first + int(plane[top*stride+left+1])) / 2)
+		return byte((first + int(plane[top*stride+left+1]) + 1) / 2)
 	}
 	if fractionX == 0 && fractionY != 0 {
-		return byte((first + int(plane[(top+1)*stride+left])) / 2)
+		return byte((first + int(plane[(top+1)*stride+left]) + 1) / 2)
 	}
-	return byte((first + int(plane[top*stride+left+1]) + int(plane[(top+1)*stride+left]) + int(plane[(top+1)*stride+left+1])) / 4)
+	return byte((first + int(plane[top*stride+left+1]) + int(plane[(top+1)*stride+left]) + int(plane[(top+1)*stride+left+1]) + 2) / 4)
 }
 
 func halfMotionParts(vector int) (integer, fraction int) {
@@ -1036,7 +1144,9 @@ func quantizeMPEG2ResidualMacroblock(macroblock mpeg2PredictiveMacroblock, quant
 }
 
 func quantizeMPEG2NonIntraCoefficient(value float64, quantizer int) int {
-	level := min(int(math.Floor(math.Abs(value)/float64(2*quantizer)+0.5)), 2047)
+	// The decoder reconstructs level L at (2L+1)*qscale, the midpoint of
+	// [2L*qscale, (2L+2)*qscale), so the matching quantizer truncates.
+	level := min(int(math.Abs(value)/float64(2*quantizer)), 2047)
 	if value < 0 {
 		return -level
 	}

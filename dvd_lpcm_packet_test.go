@@ -60,7 +60,9 @@ func TestDVDLPCMPacketWriterFramesAndTimestamps(t *testing.T) {
 	if firstSector[17] != 0xbd {
 		t.Fatalf("first PES stream id = %#x, want private_stream_1", firstSector[17])
 	}
-	if firstPayload[0] != 0xa0 || firstPayload[1] != 6 || binary.BigEndian.Uint16(firstPayload[2:4]) != 0 {
+	// The first audio frame directly follows the header: pointer 4, counted
+	// from the pointer's own last byte. Zero would mean "no frame starts here".
+	if firstPayload[0] != 0xa0 || firstPayload[1] != 6 || binary.BigEndian.Uint16(firstPayload[2:4]) != 4 {
 		t.Fatalf("unexpected first LPCM packet prefix: % x", firstPayload[:4])
 	}
 	if firstPayload[4] != 0 || firstPayload[5] != 0x01 || firstPayload[6] != 0x80 {
@@ -105,5 +107,33 @@ func TestDVDLPCMPacketWriterValidatesInput(t *testing.T) {
 	}
 	if err := writer.WriteChunk(PCMChunk{Start: time.Millisecond, SampleRate: 48000, Channels: 2, Samples: []int16{3, 4}}); err == nil {
 		t.Fatal("expected a discontinuous timestamp to fail")
+	}
+}
+
+func TestDVDLPCMPacketWriterNumbersFramesWithinGroupsOfTwenty(t *testing.T) {
+	var output bytes.Buffer
+	writer, err := NewDVDLPCMPacketWriter(&output, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const packets = 8
+	if err := writer.WriteChunk(PCMChunk{SampleRate: 48000, Channels: 2, Samples: make([]int16, packets*480*2)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := output.Len(), packets*DVDVOBSectorSize; got != want {
+		t.Fatalf("output size = %d, want %d", got, want)
+	}
+	for packet := range packets {
+		sector := output.Bytes()[packet*DVDVOBSectorSize:]
+		payload := sector[23+int(sector[22]):]
+		if want := byte(packet * 6 % 20); payload[4] != want {
+			t.Fatalf("packet %d frame number = %d, want %d", packet, payload[4], want)
+		}
+		if got := decodeTestMPEGTimestamp(sector[23:28]); got != uint64(packet)*900 {
+			t.Fatalf("packet %d PTS = %d, want %d", packet, got, packet*900)
+		}
 	}
 }

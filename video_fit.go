@@ -3,6 +3,7 @@ package video2dvd
 import (
 	"errors"
 	"fmt"
+	"math"
 )
 
 // FitMode controls how FitVideoFrame places source pixels in the DVD raster.
@@ -19,7 +20,8 @@ const (
 // FitVideoFrame converts an owned planar YUV 4:2:0 frame to the raster and
 // display aspect ratio described by profile. sourceAspectNumerator and
 // sourceAspectDenominator describe the source's displayed aspect ratio, such
-// as 16 and 9. The output uses bilinear scaling and even chroma-aligned edges.
+// as 16 and 9. The output uses bilinear scaling, low-pass filtered along any
+// axis that is reduced, and even chroma-aligned edges.
 //
 // For FitLetterbox, unused pixels are set to studio-range black. For FitCrop,
 // the source is center-cropped. The input frame is not modified.
@@ -103,13 +105,108 @@ func FitVideoFrame(frame DecodedVideoFrame, profile Profile, sourceAspectNumerat
 	for i := range result.U {
 		result.U[i], result.V[i] = 128, 128
 	}
-	scalePlaneBilinear(frame.Y, frame.Width, frame.Height, result.Y, result.Width, result.Height,
+	scalePlane(frame.Y, frame.Width, frame.Height, result.Y, result.Width, result.Height,
 		srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH)
-	scalePlaneBilinear(frame.U, frame.Width/2, frame.Height/2, result.U, result.Width/2, result.Height/2,
+	scalePlane(frame.U, frame.Width/2, frame.Height/2, result.U, result.Width/2, result.Height/2,
 		srcX/2, srcY/2, srcW/2, srcH/2, dstX/2, dstY/2, dstW/2, dstH/2)
-	scalePlaneBilinear(frame.V, frame.Width/2, frame.Height/2, result.V, result.Width/2, result.Height/2,
+	scalePlane(frame.V, frame.Width/2, frame.Height/2, result.V, result.Width/2, result.Height/2,
 		srcX/2, srcY/2, srcW/2, srcH/2, dstX/2, dstY/2, dstW/2, dstH/2)
 	return result, nil
+}
+
+// scalePlane resamples one plane. Two-tap bilinear sampling skips source
+// samples once an axis shrinks, which folds fine detail back as moire, so
+// reductions go through a filter whose support grows with the ratio.
+func scalePlane(src []byte, srcStride, srcHeight int, dst []byte, dstStride, dstHeight int,
+	srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH int) {
+	if srcW <= dstW && srcH <= dstH {
+		scalePlaneBilinear(src, srcStride, srcHeight, dst, dstStride, dstHeight,
+			srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH)
+		return
+	}
+	scalePlaneFiltered(src, srcStride, dst, dstStride, srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH)
+}
+
+const resampleWeightBits = 14
+
+// resampleKernel holds, for every output sample of one axis, the first source
+// sample it reads and taps fixed-point weights that sum to 1<<resampleWeightBits.
+type resampleKernel struct {
+	taps    int
+	first   []int
+	weights []int32
+}
+
+// newResampleKernel builds a triangle (bilinear) kernel widened by the
+// reduction ratio. At a ratio of one or less it is plain bilinear
+// interpolation. Samples beyond the source edge repeat the edge sample.
+func newResampleKernel(srcSize, dstSize int) resampleKernel {
+	ratio := float64(srcSize) / float64(dstSize)
+	support := max(ratio, 1)
+	taps := min(int(2*support)+2, srcSize)
+	kernel := resampleKernel{taps: taps, first: make([]int, dstSize), weights: make([]int32, dstSize*taps)}
+	scratch := make([]float64, taps)
+	for index := range dstSize {
+		center := (float64(index)+0.5)*ratio - 0.5
+		lowest := int(math.Ceil(center - support))
+		highest := int(math.Floor(center + support))
+		first := min(max(lowest, 0), srcSize-taps)
+		clear(scratch)
+		var total float64
+		for sample := lowest; sample <= highest; sample++ {
+			weight := 1 - math.Abs(float64(sample)-center)/support
+			if weight <= 0 {
+				continue
+			}
+			scratch[min(max(sample, 0), srcSize-1)-first] += weight
+			total += weight
+		}
+		weights := kernel.weights[index*taps : (index+1)*taps]
+		remainder, largest := int32(1<<resampleWeightBits), 0
+		for tap, weight := range scratch {
+			weights[tap] = int32(weight/total*(1<<resampleWeightBits) + 0.5)
+			remainder -= weights[tap]
+			if weights[tap] > weights[largest] {
+				largest = tap
+			}
+		}
+		weights[largest] += remainder
+		kernel.first[index] = first
+	}
+	return kernel
+}
+
+func scalePlaneFiltered(src []byte, srcStride int, dst []byte, dstStride int,
+	srcX, srcY, srcW, srcH, dstX, dstY, dstW, dstH int) {
+	horizontal := newResampleKernel(srcW, dstW)
+	vertical := newResampleKernel(srcH, dstH)
+	// The intermediate keeps six fractional bits so the vertical pass does
+	// not compound the horizontal rounding.
+	intermediate := make([]uint16, srcH*dstW)
+	parallelMPEG2Rows(srcH, func(row int) {
+		source := src[(srcY+row)*srcStride+srcX:]
+		target := intermediate[row*dstW : (row+1)*dstW]
+		for x := range target {
+			samples := source[horizontal.first[x]:]
+			var sum int32
+			for tap, weight := range horizontal.weights[x*horizontal.taps : (x+1)*horizontal.taps] {
+				sum += weight * int32(samples[tap])
+			}
+			target[x] = uint16((sum + 1<<7) >> 8)
+		}
+	})
+	parallelMPEG2Rows(dstH, func(row int) {
+		weights := vertical.weights[row*vertical.taps : (row+1)*vertical.taps]
+		first := vertical.first[row]
+		target := dst[(dstY+row)*dstStride+dstX:]
+		for x := range dstW {
+			var sum int32
+			for tap, weight := range weights {
+				sum += weight * int32(intermediate[(first+tap)*dstW+x])
+			}
+			target[x] = byte((sum + 1<<(2*resampleWeightBits-9)) >> (2*resampleWeightBits - 8))
+		}
+	})
 }
 
 func evenDimension(value float64) int {

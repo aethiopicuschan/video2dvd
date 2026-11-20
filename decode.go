@@ -147,7 +147,9 @@ func DecodeMP4Video(ctx context.Context, path string, trackIndex *int, handler f
 
 // DecodeMP4Audio decodes an AAC-LC or AC-3 MP4 audio track to 48 kHz stereo
 // S16 PCM. trackIndex selects the zero-based trak; nil selects a supported
-// track. Audio payloads and edit-list timing are validated by the decoder.
+// track. Chunks are contiguous and start at movie time zero: a leading empty
+// edit becomes silence and the first media edit's start and length are applied
+// rounded to whole samples. Later edits are not applied.
 func DecodeMP4Audio(ctx context.Context, path string, trackIndex *int, handler func(PCMChunk) error) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -201,7 +203,8 @@ func decodeMP4AudioPrimary(ctx context.Context, path string, trackIndex *int, ha
 	if err != nil {
 		return err
 	}
-	decoder, err := pcmdecoder.Open(ctx, f, stat.Size(), pcmdecoder.Options{
+	edited := newEditedPCMWriter(selected.edit, handler)
+	decoder, err := pcmdecoder.Open(ctx, hideMP4EditList(f, selected.edit), stat.Size(), pcmdecoder.Options{
 		TargetRate:     48000,
 		TargetChannels: 2,
 		TrackIndex:     &selected.Index,
@@ -224,7 +227,7 @@ func decodeMP4AudioPrimary(ctx context.Context, path string, trackIndex *int, ha
 				Channels:   2,
 				Samples:    append([]int16(nil), buffer[:n]...),
 			}
-			if callbackErr := handler(chunk); callbackErr != nil {
+			if callbackErr := edited.WriteChunk(chunk); callbackErr != nil {
 				return callbackErr
 			}
 		}

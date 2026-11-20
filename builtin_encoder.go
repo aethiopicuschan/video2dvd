@@ -10,12 +10,12 @@ import (
 	"time"
 )
 
-// InProcessEncoder is a built-in Encoder that uses only Go code. Its current
-// MPEG-2 video coder uses I pictures and P-picture macroblock skips with a
-// simple intra quantizer and no motion estimation; use it as an experimental
-// backend rather than a quality transcoder. It converts MP4 AAC-LC/AC-3 and
-// WebM Opus audio to LPCM and creates silent LPCM when the input has no audio
-// track.
+// InProcessEncoder is a built-in Encoder that uses only Go code. Its MPEG-2
+// video coder emits closed GOPs of I and P pictures with half-sample motion
+// compensation and VBV rate control, without B pictures, so it needs more
+// bits than a dedicated encoder for the same quality. It converts MP4
+// AAC-LC/AC-3 and WebM Opus audio to LPCM, padded or trimmed to the encoded
+// video length, and creates silent LPCM when the input has no audio track.
 type InProcessEncoder struct{}
 
 // NewInProcessEncoder returns the built-in Encoder implementation.
@@ -55,18 +55,35 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 	if videoTrack.Width <= 0 || videoTrack.Height <= 0 {
 		return EncodedTitle{}, errors.New("video2dvd: video track has invalid dimensions")
 	}
-	duration := info.Duration
-	if duration <= 0 {
-		duration = videoTrack.Duration
-	}
-	if duration <= 0 {
-		return EncodedTitle{}, errors.New("video2dvd: input has no usable duration")
-	}
 	if err := validateEncoderProfile(profile); err != nil {
 		return EncodedTitle{}, err
 	}
-	if err := checkEstimatedTitleSize(duration, encoderOutputLimit(profile), profileVideoBitrate(profile)); err != nil {
-		return EncodedTitle{}, err
+	// The container duration only feeds the up-front capacity estimate; live
+	// WebM has none, and the title length comes from the frames encoded below.
+	estimatedDuration := info.Duration
+	if estimatedDuration <= 0 {
+		estimatedDuration = videoTrack.Duration
+	}
+	if estimatedDuration > 0 {
+		if err := checkEstimatedTitleSize(estimatedDuration, encoderOutputLimit(profile), effectiveMPEG2VideoBitrate(profile)); err != nil {
+			return EncodedTitle{}, err
+		}
+	}
+	audioInfo := info
+	if input.AudioPath != input.VideoPath {
+		audioInfo, err = ProbeMedia(input.AudioPath)
+		if err != nil {
+			return EncodedTitle{}, fmt.Errorf("video2dvd: inspect audio source: %w", err)
+		}
+	}
+	audioTrack, hasAudio := firstSupportedAudioTrack(audioInfo, input.AudioTrackIndex)
+	if !hasAudio && hasAnyAudioTrack(audioInfo) {
+		return EncodedTitle{}, errors.New("video2dvd: prepare DVD audio: input has audio tracks but none are supported by the built-in decoder (MP4 AAC-LC/AC-3, WebM Opus)")
+	}
+	if hasAudio {
+		if err := validateInputAudioChannels(audioTrack); err != nil {
+			return EncodedTitle{}, err
+		}
 	}
 	if err := os.MkdirAll(workDir, 0o700); err != nil {
 		return EncodedTitle{}, fmt.Errorf("video2dvd: create encoder work directory: %w", err)
@@ -102,10 +119,31 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		return EncodedTitle{}, err
 	}
 	var prepareErr error
+	var frameCount int64
+	writeFrame := func(frame DecodedVideoFrame) error {
+		if err := videoEncoder.WriteFrame(frame); err != nil {
+			return err
+		}
+		frameCount++
+		return nil
+	}
+	// audioOffset places the audio on the title timeline, whose zero is the
+	// first encoded video frame.
+	audioOffset := input.AudioOffset
 	if videoTrack.Codec == "vp9" || videoTrack.Codec == "vp8" || videoTrack.Codec == "av1" {
-		prepareErr = PrepareWebMVideoForDVD(ctx, input.VideoPath, &videoTrack.Index, profile, sourceAspectN, sourceAspectD, FitLetterbox, videoEncoder.WriteFrame)
+		var videoStart time.Duration
+		videoStart, prepareErr = prepareWebMVideoForDVD(ctx, input.VideoPath, &videoTrack.Index, profile, sourceAspectN, sourceAspectD, FitLetterbox, writeFrame)
+		if input.AudioPath == input.VideoPath {
+			// Both tracks share the WebM timeline, so audio moves with the
+			// video's start instead of staying on container time.
+			shifted, ok := addMediaOffsets(audioOffset, -videoStart)
+			if prepareErr == nil && !ok {
+				prepareErr = errors.New("video2dvd: audio offset overflows")
+			}
+			audioOffset = shifted
+		}
 	} else {
-		prepareErr = PrepareMP4VideoForDVD(ctx, input.VideoPath, &videoTrack.Index, profile, sourceAspectN, sourceAspectD, FitLetterbox, videoEncoder.WriteFrame)
+		prepareErr = PrepareMP4VideoForDVD(ctx, input.VideoPath, &videoTrack.Index, profile, sourceAspectN, sourceAspectD, FitLetterbox, writeFrame)
 	}
 	closeEncoderErr := videoEncoder.Close()
 	closeVideoErr := videoFile.Close()
@@ -119,22 +157,21 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		return EncodedTitle{}, fmt.Errorf("video2dvd: close MPEG-2 output: %w", closeVideoErr)
 	}
 
+	// The title is exactly as long as the encoded video; audio is padded or
+	// trimmed to the same length in whole samples.
+	fpsN, fpsD := profileFrameRate(profile.Standard)
+	duration, audioSamples, err := titleLengthFromFrames(frameCount, fpsN, fpsD)
+	if err != nil {
+		return EncodedTitle{}, err
+	}
+
 	audioFile, err := os.OpenFile(audioPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return EncodedTitle{}, fmt.Errorf("video2dvd: create LPCM output: %w", err)
 	}
 	audioCreated = true
 	audioWriter := &sizeLimitedWriter{dst: audioFile, limit: encoderOutputLimit(profile)}
-	audioInfo := info
-	if input.AudioPath != input.VideoPath {
-		audioInfo, err = ProbeMedia(input.AudioPath)
-		if err != nil {
-			_ = audioFile.Close()
-			return EncodedTitle{}, fmt.Errorf("video2dvd: inspect audio source: %w", err)
-		}
-	}
-	audioTrack, hasAudio := firstSupportedAudioTrack(audioInfo, input.AudioTrackIndex)
-	audioTimeline, err := newPCMWindowWriter(audioWriter, duration, input.AudioOffset)
+	audioTimeline, err := newPCMWindowWriterSamples(audioWriter, audioSamples, audioOffset)
 	if err != nil {
 		_ = audioFile.Close()
 		return EncodedTitle{}, err
@@ -145,8 +182,6 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		} else {
 			err = DecodeMP4Audio(ctx, input.AudioPath, &audioTrack.Index, audioTimeline.WriteChunk)
 		}
-	} else if hasAnyAudioTrack(audioInfo) {
-		err = errors.New("video2dvd: input has audio tracks but none are supported by the built-in decoder (MP4 AAC-LC/AC-3, WebM Opus)")
 	}
 	if err == nil {
 		err = audioTimeline.Finish()
@@ -162,7 +197,6 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		return EncodedTitle{}, err
 	}
 	cleanup = false
-	fpsN, fpsD := profileFrameRate(profile.Standard)
 	return EncodedTitle{
 		VideoPath:            "video.m2v",
 		AudioPath:            "audio.lpcm",
@@ -175,6 +209,39 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		FrameRateDenominator: fpsD,
 		Duration:             duration,
 	}, nil
+}
+
+func titleLengthFromFrames(frames int64, fpsN, fpsD int) (time.Duration, int64, error) {
+	if frames <= 0 {
+		return 0, 0, errors.New("video2dvd: input produced no video frames")
+	}
+	// 24 hours of frames keeps every product below far inside int64.
+	if frames > 24*60*60*60 {
+		return 0, 0, errors.New("video2dvd: title is too long")
+	}
+	scaled := frames * int64(fpsD)
+	duration := time.Duration(scaled/int64(fpsN))*time.Second + time.Duration(scaled%int64(fpsN))*time.Second/time.Duration(fpsN)
+	samples := (scaled*dvdLPCMSampleRate + int64(fpsN)/2) / int64(fpsN)
+	return duration, samples, nil
+}
+
+// validateInputAudioChannels rejects layouts the built-in decoders cannot
+// downmix before any video is encoded.
+func validateInputAudioChannels(track TrackInfo) error {
+	channels := track.Channels
+	if track.Codec == "mp4a" && len(track.CodecConfig) >= 2 {
+		// The AudioSpecificConfig is authoritative; the sample entry's
+		// channel count is often left at 2.
+		objectType := track.CodecConfig[0] >> 3
+		frequencyIndex := (track.CodecConfig[0]&0x07)<<1 | track.CodecConfig[1]>>7
+		if configured := int(track.CodecConfig[1]>>3) & 0x0f; configured != 0 && objectType != 31 && frequencyIndex != 15 {
+			channels = configured
+		}
+	}
+	if (track.Codec == "mp4a" || track.Codec == "opus") && channels > 2 {
+		return fmt.Errorf("video2dvd: prepare DVD audio: %d-channel %s audio is not supported by the built-in decoder (mono or stereo only)", channels, track.Codec)
+	}
+	return nil
 }
 
 func validateEncoderProfile(profile Profile) error {
@@ -330,6 +397,12 @@ func checkEstimatedTitleSize(duration time.Duration, capacity int64, videoBitrat
 		return err
 	}
 	if capacity < 0 || videoBytes > capacity || audioBytes > capacity-videoBytes {
+		return ErrDiscCapacity
+	}
+	// Pack and PES headers, NAV packs, and LPCM pack padding add about 3% to
+	// the elementary streams once they are multiplexed.
+	total := videoBytes + audioBytes
+	if total/32 > capacity-total {
 		return ErrDiscCapacity
 	}
 	return nil

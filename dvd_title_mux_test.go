@@ -112,7 +112,7 @@ func TestMuxDVDTitleVOBInterleavesVideoAndLPCM(t *testing.T) {
 		t.Fatalf("VOB size = %d, want nonzero DVD sectors", vob.Len())
 	}
 	var streamIDs []byte
-	var timestamps []uint64
+	timestamps := map[byte][]uint64{}
 	var navAddresses []uint32
 	var navEnds []uint32
 	var navNextVOBUs []uint32
@@ -130,7 +130,7 @@ func TestMuxDVDTitleVOBInterleavesVideoAndLPCM(t *testing.T) {
 			navNextVOBUs = append(navNextVOBUs, binary.BigEndian.Uint32(dsi[0x13a:0x13e]))
 			navPreviousVOBUs = append(navPreviousVOBUs, binary.BigEndian.Uint32(dsi[0x13e:0x142]))
 			var elapsed [4]byte
-			copy(elapsed[:], sector[65:69])
+			copy(elapsed[:], sector[69:73])
 			navCellTimes = append(navCellTimes, elapsed)
 		}
 		if !bytes.Equal(sector[14:17], []byte{0, 0, 1}) {
@@ -142,7 +142,7 @@ func TestMuxDVDTitleVOBInterleavesVideoAndLPCM(t *testing.T) {
 		}
 		streamIDs = append(streamIDs, streamID)
 		if sector[21]&0x80 != 0 {
-			timestamps = append(timestamps, decodeTestMPEGTimestamp(sector[23:28]))
+			timestamps[streamID] = append(timestamps[streamID], decodeTestMPEGTimestamp(sector[23:28]))
 		}
 	}
 	if !bytes.Contains(streamIDs, []byte{0xe0}) || !bytes.Contains(streamIDs, []byte{0xbd}) {
@@ -158,16 +158,24 @@ func TestMuxDVDTitleVOBInterleavesVideoAndLPCM(t *testing.T) {
 	if navPreviousVOBUs[0] != DVDNAVSRIEndOfCell || navPreviousVOBUs[1] != 0x80000000|nextVOBUOffset {
 		t.Fatalf("previous VOBU pointers = %#v, want first end-of-cell %#x and previous offset %#x", navPreviousVOBUs, DVDNAVSRIEndOfCell, 0x80000000|nextVOBUOffset)
 	}
-	if navCellTimes[1] != [4]byte{0x00, 0x00, 0x00, 0xcf} {
+	if navCellTimes[1] != [4]byte{0x00, 0x00, 0x00, 0xd5} {
 		t.Fatalf("second NAV cell elapsed time = % x, want NTSC frame 15", navCellTimes[1])
 	}
-	if len(timestamps) < 4 {
-		t.Fatalf("found only %d PES timestamps: %v", len(timestamps), timestamps)
-	}
-	for i := 1; i < len(timestamps); i++ {
-		if timestamps[i] < timestamps[i-1] {
-			t.Fatalf("PES timestamps regress: %v", timestamps)
+	// Video is sent further ahead of its presentation time than audio, so
+	// timestamps only increase within a stream.
+	for _, streamID := range []byte{0xe0, 0xbd} {
+		stream := timestamps[streamID]
+		if len(stream) < 2 {
+			t.Fatalf("stream %#x has only %d PES timestamps: %v", streamID, len(stream), stream)
 		}
+		for i := 1; i < len(stream); i++ {
+			if stream[i] <= stream[i-1] {
+				t.Fatalf("stream %#x PES timestamps do not increase: %v", streamID, stream)
+			}
+		}
+	}
+	if video, audio := timestamps[0xe0][0], timestamps[0xbd][0]; video != audio || video != 27_000+3003 {
+		t.Fatalf("first video/audio PTS = %d/%d, want both one frame after the 27000-tick start delay", video, audio)
 	}
 	if !bytes.Equal(vob.Bytes()[vob.Len()-4:], []byte{0, 0, 1, 0xb9}) {
 		t.Fatal("VOB does not end with program_end_code")

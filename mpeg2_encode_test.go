@@ -94,6 +94,37 @@ func TestMPEG2VideoEncoderHonorsConfiguredBitrate(t *testing.T) {
 	if want := 4_000_000 * 1001 / (8 * 30000); ExportMPEG2FrameBytes(encoder) != want {
 		t.Fatalf("frame budget = %d, want %d", ExportMPEG2FrameBytes(encoder), want)
 	}
+	// 8.5 Mbit/s plus LPCM and pack overhead exceeds the 10.08 Mbit/s DVD mux
+	// rate, so the request is accepted but coded at the mux-safe rate.
+	profile.VideoBitrate = 8_500_000
+	var clamped bytes.Buffer
+	encoder, err = NewMPEG2VideoEncoder(&clamped, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := ExportMPEG2MuxSafeVideoBitrate * 1001 / (8 * 30000); ExportMPEG2FrameBytes(encoder) != want {
+		t.Fatalf("clamped frame budget = %d, want %d", ExportMPEG2FrameBytes(encoder), want)
+	}
+	if err := encoder.WriteFrame(DecodedVideoFrame{
+		Width: 720, Height: 480,
+		Y: bytes.Repeat([]byte{16}, 720*480), U: bytes.Repeat([]byte{128}, 720*480/4), V: bytes.Repeat([]byte{128}, 720*480/4),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	header := clamped.Bytes()
+	if !bytes.Equal(header[:4], []byte{0, 0, 1, 0xb3}) {
+		t.Fatalf("stream does not start with a sequence header: % x", header[:4])
+	}
+	reader := ExportNewBitReader(header[8:])
+	bitRate, _ := ExportReadBits(reader, 18)
+	_, _ = ExportReadBits(reader, 1)
+	vbvBufferSize, _ := ExportReadBits(reader, 10)
+	if bitRate*400 != ExportMPEG2MuxSafeVideoBitrate {
+		t.Fatalf("sequence header bit_rate = %d bit/s, want %d", bitRate*400, ExportMPEG2MuxSafeVideoBitrate)
+	}
+	if vbvBufferSize*16384 != ExportMPEG2VBVBufferBits {
+		t.Fatalf("sequence header vbv_buffer_size = %d bits, want %d", vbvBufferSize*16384, ExportMPEG2VBVBufferBits)
+	}
 	profile.VideoBitrate = 9_000_000
 	if _, err := NewMPEG2VideoEncoder(&bytes.Buffer{}, profile); err == nil {
 		t.Fatal("expected rejection of bitrate above DVD-safe limit")
@@ -120,19 +151,28 @@ func TestMPEG2NonIntraQuantizationMatchesInverseScale(t *testing.T) {
 		wantDecoded int
 	}{
 		{coefficient: 20, quantizer: 5, wantLevel: 2, wantDecoded: 25},
-		{coefficient: -17, quantizer: 5, wantLevel: -2, wantDecoded: -25},
+		// The decoder reconstructs level L at (2L+1)*q, so -17 belongs to
+		// level -1 (-15, error 2), not level -2 (-25, error 8).
+		{coefficient: -17, quantizer: 5, wantLevel: -1, wantDecoded: -15},
+		{coefficient: 19.9, quantizer: 5, wantLevel: 1, wantDecoded: 15},
+		{coefficient: 9.9, quantizer: 5, wantLevel: 0, wantDecoded: 0},
+		{coefficient: -5, quantizer: 5, wantLevel: 0, wantDecoded: 0},
 	} {
 		level := ExportMPEG2QuantizeNonIntra(tc.coefficient, tc.quantizer)
 		if level != tc.wantLevel {
 			t.Errorf("quantized coefficient %.1f = %d, want %d", tc.coefficient, level, tc.wantLevel)
 		}
-		if got := ExportMPEG2InverseNonIntra(level, tc.quantizer); got != tc.wantDecoded {
-			t.Errorf("reconstructed coefficient %.1f = %d, want %d", tc.coefficient, got, tc.wantDecoded)
+		decoded := 0
+		if level != 0 {
+			decoded = ExportMPEG2InverseNonIntra(level, tc.quantizer)
+		}
+		if decoded != tc.wantDecoded {
+			t.Errorf("reconstructed coefficient %.1f = %d, want %d", tc.coefficient, decoded, tc.wantDecoded)
 		}
 	}
 }
 
-func TestMPEG2VideoEncoderCodesACAndStaysWithinFrameBudget(t *testing.T) {
+func TestMPEG2VideoEncoderCodesACAndStaysWithinVBV(t *testing.T) {
 	profile, err := ExportProfile(Options{Standard: VideoStandardNTSC, Aspect: AspectRatio16x9})
 	if err != nil {
 		t.Fatal(err)
@@ -179,8 +219,13 @@ func TestMPEG2VideoEncoderCodesACAndStaysWithinFrameBudget(t *testing.T) {
 	if err := encoder.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if output.Len() > ExportMPEG2FrameBytes(encoder)+4 {
-		t.Fatalf("output size %d exceeds one-frame budget %d plus sequence end", output.Len(), ExportMPEG2FrameBytes(encoder))
+	// An I picture may use more than one frame period of bits, but never more
+	// than the decoder buffer holds when it is removed.
+	if (output.Len()-4)*8 > ExportMPEG2VBVStartBits {
+		t.Fatalf("first picture has %d bits, more than the %d the decoder buffer holds", (output.Len()-4)*8, ExportMPEG2VBVStartBits)
+	}
+	if output.Len()-4 <= ExportMPEG2FrameBytes(encoder) {
+		t.Fatalf("textured I picture size %d did not use more than the average frame budget %d", output.Len()-4, ExportMPEG2FrameBytes(encoder))
 	}
 	if output.Len() <= len(withoutAC)+4 {
 		t.Fatalf("encoded texture size %d is no larger than its DC-only fallback size %d", output.Len(), len(withoutAC)+4)

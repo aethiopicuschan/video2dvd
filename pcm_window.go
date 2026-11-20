@@ -7,7 +7,13 @@ import (
 	"time"
 )
 
-const dvdLPCMSampleRate = int64(48_000)
+const (
+	dvdLPCMSampleRate = int64(48_000)
+	// Container timestamps are coarser than one sample (nanosecond or
+	// millisecond grids), so a chunk that starts this close to the end of the
+	// previous one continues it instead of being re-placed on the timeline.
+	pcmWindowContiguityTolerance = dvdLPCMSampleRate / 50
+)
 
 // pcmWindowWriter places decoded PCM on a fixed video timeline, inserting
 // silence for positive offsets and gaps and trimming samples outside the title.
@@ -16,16 +22,20 @@ type pcmWindowWriter struct {
 	offset    time.Duration
 	endSample int64
 	next      int64
+	// expected is the timeline position that continues the previous chunk; it
+	// differs from next while leading samples are still being trimmed.
+	expected int64
+	started  bool
 }
 
-func newPCMWindowWriter(dst io.Writer, duration, offset time.Duration) (*pcmWindowWriter, error) {
+func newPCMWindowWriterSamples(dst io.Writer, endSample int64, offset time.Duration) (*pcmWindowWriter, error) {
 	if dst == nil {
 		return nil, errors.New("video2dvd: LPCM destination writer is required")
 	}
-	if duration <= 0 {
+	if endSample <= 0 {
 		return nil, errors.New("video2dvd: audio window duration must be positive")
 	}
-	return &pcmWindowWriter{dst: dst, offset: offset, endSample: durationToSampleCount(duration)}, nil
+	return &pcmWindowWriter{dst: dst, offset: offset, endSample: endSample}, nil
 }
 
 func (w *pcmWindowWriter) WriteChunk(chunk PCMChunk) error {
@@ -44,6 +54,11 @@ func (w *pcmWindowWriter) WriteChunk(chunk PCMChunk) error {
 	}
 	startSample := durationToSampleCount(start)
 	frameCount := int64(len(chunk.Samples) / 2)
+	if w.started && startSample-w.expected <= pcmWindowContiguityTolerance && w.expected-startSample <= pcmWindowContiguityTolerance {
+		startSample = w.expected
+	}
+	w.started = true
+	w.expected = startSample + frameCount
 	if startSample < 0 {
 		trim := min(-startSample, frameCount)
 		chunk.Samples = chunk.Samples[trim*2:]
@@ -110,7 +125,11 @@ func (w *pcmWindowWriter) writeSilence(frames int64) error {
 func durationToSampleCount(duration time.Duration) int64 {
 	seconds := int64(duration / time.Second)
 	remainder := int64(duration % time.Second)
-	return seconds*dvdLPCMSampleRate + remainder*dvdLPCMSampleRate/int64(time.Second)
+	half := int64(time.Second) / 2
+	if remainder < 0 {
+		half = -half
+	}
+	return seconds*dvdLPCMSampleRate + (remainder*dvdLPCMSampleRate+half)/int64(time.Second)
 }
 
 func addMediaOffsets(left, right time.Duration) (time.Duration, bool) {

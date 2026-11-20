@@ -3,19 +3,80 @@ package video2dvd
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
 
-const dvdMenuMaxButtons = 36
+const (
+	dvdMenuMaxButtons    = 36
+	dvdMenuRowsPerColumn = 18
+
+	// Menu geometry on the 720-pixel-wide DVD raster. Text is drawn with
+	// 12-pixel character cells and 14-pixel-high glyphs; a button rectangle
+	// extends dvdMenuButtonMarginX left and right of its text column and
+	// covers the 18 lines from two above the glyphs to two below.
+	dvdMenuCharWidth     = 12
+	dvdMenuHeadingX      = 48
+	dvdMenuHeadingY      = 24
+	dvdMenuHeadingChars  = (720 - 2*dvdMenuHeadingX) / dvdMenuCharWidth
+	dvdMenuControlY      = 54
+	dvdMenuFirstRowY     = 94
+	dvdMenuRowStep       = 20
+	dvdMenuButtonMarginX = 8
+	dvdMenuButtonTop     = 2
+	dvdMenuButtonBottom  = 15
+	dvdMenuLeftColumnX   = 56
+	dvdMenuRightColumnX  = 376
+	dvdMenuWideColumnEnd = 671
+	dvdMenuLeftColumnEnd = 351
+	dvdMenuPlayAllX      = 56
+	dvdMenuPreviousX     = 440
+	dvdMenuNextX         = 560
+
+	// dvdMenuSubpictureSubstream is the private_stream_1 substream of the
+	// first DVD subpicture stream.
+	dvdMenuSubpictureSubstream = 0x20
+	// A subpicture unit plus its substream byte must fit the payload of one
+	// 2048-byte pack whose PES header carries a PTS and the P-STD buffer
+	// size.
+	dvdMenuSubpictureMaxUnit = DVDVOBSectorSize - mpegPackHeaderSize - mpegPESFixedHeaderSize - 5 - 3 - 1
+
+	// Display types of a button group and its subpicture stream.
+	dvdButtonGroupNormal    = 0 // 4:3 video.
+	dvdButtonGroupWide      = 1 // 16:9 video on a 16:9 display.
+	dvdButtonGroupLetterbox = 2 // 16:9 video letterboxed on a 4:3 display.
+)
+
+// dvdMenuEntry is one selectable item of a menu page. The label is drawn at
+// (textX, textY) and the button rectangle spans left..right horizontally.
+type dvdMenuEntry struct {
+	label        string
+	textX, textY int
+	left, right  int
+	command      [8]byte
+}
+
+// dvdMenuPage is the layout of one menu page. The picture, the button
+// rectangles and the button navigation are all derived from it so that they
+// cannot disagree.
+type dvdMenuPage struct {
+	// controls holds PLAY ALL on the first page and PREV/NEXT on every page
+	// of a multi-page menu, left to right.
+	controls []dvdMenuEntry
+	// titles is in column-major order, dvdMenuRowsPerColumn per column.
+	titles []dvdMenuEntry
+}
 
 func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Profile, workDir string) (EncodedTitle, [][]DVDNAVButton, error) {
 	maxButtons := dvdMenuMaxButtons
 	if profile.Aspect == AspectRatio16x9 {
-		maxButtons = 18
+		maxButtons = dvdMenuRowsPerColumn
 	}
 	maxButtons-- // reserve PLAY ALL on the first page
 	// Two buttons are reserved for previous/next page navigation when the
@@ -30,6 +91,10 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 	// PGCs are ordered as menu pages, PLAY ALL, then one title launcher per
 	// title and one PLAY ALL continuation per title.
 	titleLaunchBase := pages + 1
+	names := make([]string, len(titles))
+	for i, title := range titles {
+		names[i] = dvdMenuTitleName(title)
+	}
 	videoPath := filepath.Join(workDir, "menu.m2v")
 	videoFile, err := os.Create(videoPath)
 	if err != nil {
@@ -39,10 +104,11 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 	for page := range pages {
 		start := page * maxButtons
 		end := min(len(titles), start+maxButtons)
+		layout := layoutDVDMenuPage(names[start:end], start, profile.Aspect, page, pages, titleLaunchBase)
 		var encoded bytes.Buffer
 		encoder, encodeErr := NewMPEG2VideoEncoder(&encoded, profile)
 		if encodeErr == nil {
-			encodeErr = encoder.WriteFrame(newDVDMenuFrame(profile, titles[start:end], start, pages > 1))
+			encodeErr = encoder.WriteFrame(newDVDMenuFrame(profile, layout))
 		}
 		if encodeErr == nil {
 			encodeErr = encoder.Close()
@@ -55,7 +121,7 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 			_ = videoFile.Close()
 			return EncodedTitle{}, nil, err
 		}
-		buttonPages = append(buttonPages, makeDVDMenuButtons(start, end, profile, page, pages, titleLaunchBase))
+		buttonPages = append(buttonPages, layout.buttons())
 	}
 	if closeErr := videoFile.Close(); closeErr != nil {
 		return EncodedTitle{}, nil, closeErr
@@ -74,83 +140,142 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 	}, buttonPages, ctx.Err()
 }
 
-func makeDVDMenuButtons(start, end int, profile Profile, page, pageCount, titleLaunchBase int) []DVDNAVButton {
-	controls := 0
-	if pageCount > 1 {
-		controls = 2
+// dvdMenuTitleName returns the name shown for a title: its Name, or else the
+// base name of its video stream file without the extension.
+func dvdMenuTitleName(title EncodedTitle) string {
+	if title.Name != "" {
+		return title.Name
 	}
-	playAll := 0
+	name := filepath.Base(title.VideoPath)
+	return strings.TrimSuffix(name, filepath.Ext(name))
+}
+
+// layoutDVDMenuPage places the controls and the titles names[i], which are
+// titles start+i of the disc, on one page. 4:3 pages with more than one
+// column of titles use two half-width columns.
+func layoutDVDMenuPage(names []string, start int, aspect AspectRatio, page, pageCount, titleLaunchBase int) dvdMenuPage {
+	var layout dvdMenuPage
+	control := func(label string, textX int, command [8]byte) {
+		layout.controls = append(layout.controls, dvdMenuEntry{
+			label: label, textX: textX, textY: dvdMenuControlY,
+			left:    textX - dvdMenuButtonMarginX,
+			right:   textX + len(label)*dvdMenuCharWidth + dvdMenuButtonMarginX - 1,
+			command: command,
+		})
+	}
 	if page == 0 {
-		playAll = 1
+		control("PLAY ALL", dvdMenuPlayAllX, linkPGCNCommand(pageCount))
 	}
-	buttons := make([]DVDNAVButton, end-start+controls+playAll)
-	if playAll != 0 {
-		buttons[0] = DVDNAVButton{XStart: 48, YStart: 52, XEnd: 300, YEnd: 76, Command: linkPGCNCommand(pageCount)}
+	if pageCount > 1 {
+		control("PREV", dvdMenuPreviousX, linkPGCNCommand((page+pageCount-1)%pageCount))
+		control("NEXT", dvdMenuNextX, linkPGCNCommand((page+1)%pageCount))
 	}
-	if controls != 0 {
-		base := playAll
-		buttons[base] = DVDNAVButton{XStart: 48, YStart: 52, XEnd: 300, YEnd: 76, Command: linkPGCNCommand(page)}
-		buttons[base+1] = DVDNAVButton{XStart: 368, YStart: 52, XEnd: 704, YEnd: 76, Command: linkPGCNCommand((page + 1) % pageCount)}
+	twoColumns := aspect != AspectRatio16x9 && len(names) > dvdMenuRowsPerColumn
+	for i, name := range names {
+		column, row := i/dvdMenuRowsPerColumn, i%dvdMenuRowsPerColumn
+		textX, right := dvdMenuLeftColumnX, dvdMenuWideColumnEnd
+		if twoColumns {
+			right = dvdMenuLeftColumnEnd
+			if column == 1 {
+				textX, right = dvdMenuRightColumnX, dvdMenuWideColumnEnd
+			}
+		}
+		label := padMenuNumber(start + i + 1)
+		if name != "" {
+			label += " " + strings.ToUpper(name)
+		}
+		layout.titles = append(layout.titles, dvdMenuEntry{
+			label: truncateDVDMenuText(label, (right+1-dvdMenuButtonMarginX-textX)/dvdMenuCharWidth),
+			textX: textX, textY: dvdMenuFirstRowY + row*dvdMenuRowStep,
+			left: textX - dvdMenuButtonMarginX, right: right,
+			command: linkPGCNCommand(titleLaunchBase + start + i),
+		})
 	}
-	offset := controls + playAll
-	titleCount := end - start
+	return layout
+}
+
+func truncateDVDMenuText(text string, maxChars int) string {
+	runes := []rune(text)
+	if len(runes) > maxChars {
+		runes = runes[:maxChars]
+	}
+	return string(runes)
+}
+
+// buttons returns the page's highlight buttons: the controls followed by the
+// titles. Every button is reachable from button 1 with the arrow keys: the
+// control row links left and right, and each title column wraps through the
+// control row.
+func (p dvdMenuPage) buttons() []DVDNAVButton {
+	controlCount, titleCount := len(p.controls), len(p.titles)
+	columns := (titleCount + dvdMenuRowsPerColumn - 1) / dvdMenuRowsPerColumn
+	buttons := make([]DVDNAVButton, 0, controlCount+titleCount)
+	for _, entry := range slices.Concat(p.controls, p.titles) {
+		buttons = append(buttons, DVDNAVButton{
+			XStart: entry.left, XEnd: entry.right,
+			YStart: entry.textY - dvdMenuButtonTop, YEnd: entry.textY + dvdMenuButtonBottom,
+			Command: entry.command,
+		})
+	}
+	// Button numbers are one-based.
+	titleButton := func(column, row int) uint8 {
+		return uint8(controlCount + column*dvdMenuRowsPerColumn + row + 1)
+	}
+	columnRows := func(column int) int {
+		return min(dvdMenuRowsPerColumn, titleCount-column*dvdMenuRowsPerColumn)
+	}
+	for i := range controlCount {
+		button := &buttons[i]
+		self := uint8(i + 1)
+		button.Up, button.Down, button.Left, button.Right = self, self, self, self
+		if i > 0 {
+			button.Left = self - 1
+		}
+		if i < controlCount-1 {
+			button.Right = self + 1
+		}
+		if columns > 0 {
+			column := i * columns / controlCount
+			button.Up = titleButton(column, columnRows(column)-1)
+			button.Down = titleButton(column, 0)
+		}
+	}
 	for i := range titleCount {
-		index := i + offset
-		column, row := i/18, i%18
-		left, right := 48, 672
-		if column == 1 {
-			left, right = 368, 704
+		column, row := i/dvdMenuRowsPerColumn, i%dvdMenuRowsPerColumn
+		button := &buttons[controlCount+i]
+		self := titleButton(column, row)
+		// The leftmost column wraps through the first control and the
+		// rightmost through the last one.
+		controlButton := self
+		if controlCount > 0 {
+			controlButton = 1
+			if column > 0 && column == columns-1 {
+				controlButton = uint8(controlCount)
+			}
 		}
-		if profile.Aspect == AspectRatio16x9 {
-			left, right = 48, 672
+		button.Up, button.Down, button.Left, button.Right = controlButton, controlButton, self, self
+		if row > 0 {
+			button.Up = self - 1
 		}
-		top := 94 + row*20
-		buttons[index] = DVDNAVButton{
-			XStart: left, YStart: top, XEnd: right, YEnd: top + 16,
-			Command: linkPGCNCommand(titleLaunchBase + start + i),
+		if row < columnRows(column)-1 {
+			button.Down = self + 1
 		}
-	}
-	if playAll != 0 {
-		target := offset + 1
-		buttons[0].Up, buttons[0].Down = 1, uint8(target)
-		buttons[0].Left, buttons[0].Right = 1, 1
-	}
-	if controls != 0 {
-		prev, next := playAll, playAll+1
-		target := offset + 1
-		buttons[prev].Up, buttons[prev].Down = uint8(prev+1), uint8(target)
-		buttons[prev].Left, buttons[prev].Right = uint8(prev+1), uint8(next+1)
-		buttons[next].Up, buttons[next].Down = uint8(next+1), uint8(target)
-		buttons[next].Left, buttons[next].Right = uint8(prev+1), uint8(next+1)
-	}
-	for i := range titleCount {
-		column, row := i/18, i%18
-		columnStart := column * 18
-		columnCount := min(18, titleCount-columnStart)
-		index := offset + i
-		upRow, downRow := (row+columnCount-1)%columnCount, (row+1)%columnCount
-		buttons[index].Up = uint8(offset + columnStart + upRow + 1)
-		buttons[index].Down = uint8(offset + columnStart + downRow + 1)
-		buttons[index].Left = uint8(index + 1)
-		buttons[index].Right = uint8(index + 1)
 		if column > 0 {
-			leftCount := min(18, titleCount-(column-1)*18)
-			buttons[index].Left = uint8(offset + (column-1)*18 + min(row, leftCount-1) + 1)
+			button.Left = titleButton(column-1, min(row, columnRows(column-1)-1))
 		}
-		if rightStart := (column + 1) * 18; rightStart < titleCount {
-			rightCount := min(18, titleCount-rightStart)
-			buttons[index].Right = uint8(offset + rightStart + min(row, rightCount-1) + 1)
+		if column < columns-1 {
+			button.Right = titleButton(column+1, min(row, columnRows(column+1)-1))
 		}
 	}
 	return buttons
 }
 
-func dvdJumpTitleCommand(titleNumber int) [8]byte {
-	return [8]byte{0x30, 0x02, 0, 0, 0, byte(titleNumber)}
+func makeDVDMenuButtons(start, end int, profile Profile, page, pageCount, titleLaunchBase int) []DVDNAVButton {
+	return layoutDVDMenuPage(make([]string, end-start), start, profile.Aspect, page, pageCount, titleLaunchBase).buttons()
 }
 
-func dvdJumpVTSTitleCommand(titleNumber int) [8]byte {
-	return [8]byte{0x30, 0x03, 0, 0, 0, byte(titleNumber)}
+func dvdJumpTitleCommand(titleNumber int) [8]byte {
+	return [8]byte{0x30, 0x02, 0, 0, 0, byte(titleNumber)}
 }
 
 func dvdCallMenuCommand() [8]byte {
@@ -190,7 +315,7 @@ func menuFrameRateDenominator(standard VideoStandard) int {
 	return 1001
 }
 
-func newDVDMenuFrame(profile Profile, titles []EncodedTitle, start int, pageControls bool) DecodedVideoFrame {
+func newDVDMenuFrame(profile Profile, page dvdMenuPage) DecodedVideoFrame {
 	frame := DecodedVideoFrame{Width: profile.FrameWidth, Height: profile.FrameHeight, Duration: time.Second,
 		Y: make([]byte, profile.FrameWidth*profile.FrameHeight), U: make([]byte, profile.FrameWidth*profile.FrameHeight/4), V: make([]byte, profile.FrameWidth*profile.FrameHeight/4)}
 	background := profile.MenuBackgroundLuma
@@ -211,23 +336,12 @@ func newDVDMenuFrame(profile Profile, titles []EncodedTitle, start int, pageCont
 	if textLuma == 0 {
 		textLuma = 220
 	}
-	drawDVDMenuText(&frame, 48, 24, strings.ToUpper(title), textLuma)
-	if pageControls {
-		drawDVDMenuText(&frame, 56, 54, "PREV", textLuma)
-		drawDVDMenuText(&frame, 376, 54, "NEXT", textLuma)
+	drawDVDMenuText(&frame, dvdMenuHeadingX, dvdMenuHeadingY, truncateDVDMenuText(strings.ToUpper(title), dvdMenuHeadingChars), textLuma)
+	for _, entry := range page.controls {
+		drawDVDMenuText(&frame, entry.textX, entry.textY, entry.label, textLuma)
 	}
-	if start == 0 {
-		drawDVDMenuText(&frame, 56, 54, "PLAY ALL", textLuma)
-	}
-	for i, title := range titles {
-		name := strings.ToUpper(filepath.Base(title.VideoPath))
-		name = strings.TrimSuffix(name, strings.ToUpper(filepath.Ext(name)))
-		column, row := i/18, i%18
-		x := 56
-		if column == 1 {
-			x = 376
-		}
-		drawDVDMenuText(&frame, x, 94+row*20, padMenuNumber(start+i+1)+" "+name, textLuma)
+	for _, entry := range page.titles {
+		drawDVDMenuText(&frame, entry.textX, entry.textY, entry.label, textLuma)
 	}
 	return frame
 }
@@ -239,25 +353,37 @@ func padMenuNumber(number int) string {
 	return string(rune('0'+number/10)) + string(rune('0'+number%10))
 }
 
-var dvdMenuFont = map[byte][7]byte{
+// dvdMenuFont holds 5x7 glyphs, one byte per row with bit 4 leftmost.
+// Characters without a glyph are drawn as '?'.
+var dvdMenuFont = map[rune][7]byte{
 	'?': {0x0e, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04}, ' ': {0, 0, 0, 0, 0, 0, 0},
+	'-': {0x00, 0x00, 0x00, 0x1f, 0x00, 0x00, 0x00}, '_': {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f},
+	'.': {0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c},
 	'0': {0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e}, '1': {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e},
 	'2': {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f}, '3': {0x1e, 0x01, 0x01, 0x0e, 0x01, 0x01, 0x1e},
 	'4': {0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02}, '5': {0x1f, 0x10, 0x10, 0x1e, 0x01, 0x01, 0x1e},
 	'6': {0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e}, '7': {0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
 	'8': {0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e}, '9': {0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c},
-	'A': {0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11}, 'D': {0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e},
-	'I': {0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e},
-	'V': {0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04}, 'E': {0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f},
-	'O': {0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}, 'T': {0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
-	'B': {0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e}, 'F': {0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10},
-	'M': {0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11}, 'P': {0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10},
+	'A': {0x0e, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11}, 'B': {0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e},
+	'C': {0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e}, 'D': {0x1e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1e},
+	'E': {0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x1f}, 'F': {0x1f, 0x10, 0x10, 0x1e, 0x10, 0x10, 0x10},
+	'G': {0x0e, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0f}, 'H': {0x11, 0x11, 0x11, 0x1f, 0x11, 0x11, 0x11},
+	'I': {0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e}, 'J': {0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0c},
+	'K': {0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11}, 'L': {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f},
+	'M': {0x11, 0x1b, 0x15, 0x15, 0x11, 0x11, 0x11}, 'N': {0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11},
+	'O': {0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}, 'P': {0x1e, 0x11, 0x11, 0x1e, 0x10, 0x10, 0x10},
+	'Q': {0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d}, 'R': {0x1e, 0x11, 0x11, 0x1e, 0x14, 0x12, 0x11},
+	'S': {0x0f, 0x10, 0x10, 0x0e, 0x01, 0x01, 0x1e}, 'T': {0x1f, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04},
+	'U': {0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}, 'V': {0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04},
+	'W': {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0a}, 'X': {0x11, 0x11, 0x0a, 0x04, 0x0a, 0x11, 0x11},
+	'Y': {0x11, 0x11, 0x11, 0x0a, 0x04, 0x04, 0x04}, 'Z': {0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f},
 }
 
+// drawDVDMenuText draws one character cell per rune of text.
 func drawDVDMenuText(frame *DecodedVideoFrame, x, y int, text string, value byte) {
-	for _, char := range []byte(text) {
+	for _, char := range text {
 		glyph, ok := dvdMenuFont[char]
-		if !ok && char != ' ' {
+		if !ok {
 			glyph = dvdMenuFont['?']
 		}
 		for row, bits := range glyph {
@@ -271,6 +397,193 @@ func drawDVDMenuText(frame *DecodedVideoFrame, x, y int, text string, value byte
 				}
 			}
 		}
-		x += 12
+		x += dvdMenuCharWidth
 	}
+}
+
+// The menu highlight is a DVD subpicture with "pattern" pixels over every
+// button and zero contrast, so it is invisible by itself. A player applies
+// the highlight colours of the NAV pack (dvdNAVSelectionColor and
+// dvdNAVActionColor) to the subpicture pixels inside the selected button's
+// rectangle, which tints that button.
+var (
+	// dvdMenuSubpicturePalette is the menu PGC colour table. Each entry is
+	// a reserved byte followed by Y, Cr and Cb.
+	dvdMenuSubpicturePalette = [16][4]byte{
+		0: {0, 16, 128, 128},
+		1: {0, 110, 110, 200}, // selected button: blue.
+		2: {0, 170, 160, 50},  // activated button: amber.
+	}
+)
+
+const (
+	dvdSubpictureBackground = 0
+	dvdSubpicturePattern    = 1
+)
+
+// dvdSubpictureLine accumulates the 4-bit units of one run-length coded
+// subpicture line.
+type dvdSubpictureLine struct {
+	data    []byte
+	nibbles int
+}
+
+func (l *dvdSubpictureLine) put(value uint32, nibbles int) {
+	for shift := (nibbles - 1) * 4; shift >= 0; shift -= 4 {
+		nibble := byte(value>>shift) & 0x0f
+		if l.nibbles%2 == 0 {
+			l.data = append(l.data, nibble<<4)
+		} else {
+			l.data[len(l.data)-1] |= nibble
+		}
+		l.nibbles++
+	}
+}
+
+// run appends count pixels of one colour. A code is the count followed by
+// the two-bit colour, in the fewest of one to four nibbles that hold it.
+func (l *dvdSubpictureLine) run(count int, color uint32) {
+	for count > 0 {
+		n := min(count, 255)
+		code := uint32(n)<<2 | color
+		switch {
+		case n < 4:
+			l.put(code, 1)
+		case n < 16:
+			l.put(code, 2)
+		case n < 64:
+			l.put(code, 3)
+		default:
+			l.put(code, 4)
+		}
+		count -= n
+	}
+}
+
+// fill appends one colour up to the end of the line: a four-nibble code with
+// a zero count.
+func (l *dvdSubpictureLine) fill(color uint32) { l.put(color, 4) }
+
+// encodeDVDMenuSubpicture returns the subpicture unit for a menu page of the
+// given frame size. On every line that crosses a button, the pixels from the
+// leftmost such button to the end of the line are pattern pixels; pixels
+// outside the selected button's rectangle never become visible, so runs do
+// not have to stop at button edges.
+func encodeDVDMenuSubpicture(buttons []DVDNAVButton, width, height int) ([]byte, error) {
+	if width <= 0 || width > 720 || height <= 0 || height > 576 || height%2 != 0 {
+		return nil, errors.New("video2dvd: menu subpicture size is outside the DVD raster")
+	}
+	const headerSize = 4
+	unit := make([]byte, headerSize, dvdMenuSubpictureMaxUnit)
+	var fieldOffsets [2]int
+	// Lines are stored per field: all even lines, then all odd lines. Each
+	// line ends on a byte boundary.
+	for field := range 2 {
+		fieldOffsets[field] = len(unit)
+		for y := field; y < height; y += 2 {
+			left := width
+			for _, button := range buttons {
+				if button.YStart <= y && y <= button.YEnd && button.XStart < left {
+					left = max(button.XStart, 0)
+				}
+			}
+			var line dvdSubpictureLine
+			if left < width {
+				line.run(left, dvdSubpictureBackground)
+				line.fill(dvdSubpicturePattern)
+			} else {
+				line.fill(dvdSubpictureBackground)
+			}
+			unit = append(unit, line.data...)
+		}
+	}
+	controlOffset := len(unit)
+	right, bottom := width-1, height-1
+	unit = append(unit,
+		0, 0, // this sequence runs at the unit's presentation time,
+		byte(controlOffset>>8), byte(controlOffset), // and is the last one: it points at itself.
+		0x00,             // FSTA_DSP: show even when the user turned subpictures off.
+		0x03, 0x00, 0x10, // SET_COLOR: pattern pixels use palette entry 1.
+		0x04, 0x00, 0x00, // SET_CONTR: everything transparent outside a highlight.
+		0x05, 0, byte(right>>8), byte(right), 0, byte(bottom>>8), byte(bottom), // SET_DAREA from (0,0).
+		0x06, byte(fieldOffsets[0]>>8), byte(fieldOffsets[0]), byte(fieldOffsets[1]>>8), byte(fieldOffsets[1]), // SET_DSPXA.
+		0xff, // end of the command sequence.
+	)
+	if len(unit)%2 != 0 {
+		unit = append(unit, 0xff)
+	}
+	if len(unit) > dvdMenuSubpictureMaxUnit {
+		return nil, errors.New("video2dvd: menu subpicture does not fit one pack")
+	}
+	binary.BigEndian.PutUint16(unit[0:2], uint16(len(unit)))
+	binary.BigEndian.PutUint16(unit[2:4], uint16(controlOffset))
+	return unit, nil
+}
+
+// dvdMenuHighlight is what the VOBU of one menu page carries besides its
+// picture: the button groups for its NAV pack and one subpicture unit per
+// group. Group i belongs to subpicture stream i.
+type dvdMenuHighlight struct {
+	groups []DVDNAVButtonGroup
+	// subpictures holds one private_stream_1 payload per stream: the
+	// substream ID followed by a complete subpicture unit.
+	subpictures [][]byte
+}
+
+// dvdMenuSubpictureStreamControl returns the PGC subpicture stream control
+// entry for the menu highlight: the stream is available, and its remaining
+// bytes name the substreams decoded for 16:9 video on a widescreen display,
+// letterboxed and in pan-and-scan. A 16:9 menu has no highlight for
+// pan-and-scan, which its video attributes therefore rule out.
+func dvdMenuSubpictureStreamControl(aspect AspectRatio) [4]byte {
+	if aspect == AspectRatio16x9 {
+		return [4]byte{0x80, 0, 1, 0}
+	}
+	return [4]byte{0x80, 0, 0, 0}
+}
+
+// letterboxDVDMenuButtons returns the buttons as they appear when a 4:3
+// display shows the 16:9 menu letterboxed: the picture is squeezed into the
+// middle three quarters of the frame height. Rectangles keep starting on an
+// even line and ending on an odd one, so each covers whole frame lines of
+// both fields.
+func letterboxDVDMenuButtons(buttons []DVDNAVButton, height int) []DVDNAVButton {
+	letterboxed := slices.Clone(buttons)
+	for i := range letterboxed {
+		button := &letterboxed[i]
+		button.YStart = (height/8 + button.YStart*3/4) &^ 1
+		button.YEnd = min((height/8+button.YEnd*3/4)|1, height-1)
+	}
+	return letterboxed
+}
+
+// buildDVDMenuHighlights prepares the highlight of every menu page. A 4:3
+// menu has one button group. A 16:9 menu has two, because a player does not
+// scale subpictures with the video: the first group and subpicture stream
+// are for a widescreen display, the second ones for the letterboxed picture
+// on a 4:3 display.
+func buildDVDMenuHighlights(buttonPages [][]DVDNAVButton, aspect AspectRatio, width, height int) ([]dvdMenuHighlight, error) {
+	highlights := make([]dvdMenuHighlight, len(buttonPages))
+	for page, buttons := range buttonPages {
+		groups := []DVDNAVButtonGroup{{DisplayType: dvdButtonGroupNormal, Buttons: buttons}}
+		if aspect == AspectRatio16x9 {
+			groups = []DVDNAVButtonGroup{
+				{DisplayType: dvdButtonGroupWide, Buttons: buttons},
+				{DisplayType: dvdButtonGroupLetterbox, Buttons: letterboxDVDMenuButtons(buttons, height)},
+			}
+		}
+		if len(buttons) > dvdNAVMaxButtons/len(groups) {
+			return nil, fmt.Errorf("video2dvd: menu page %d has more than %d buttons", page+1, dvdNAVMaxButtons/len(groups))
+		}
+		highlights[page].groups = groups
+		for stream, group := range groups {
+			unit, err := encodeDVDMenuSubpicture(group.Buttons, width, height)
+			if err != nil {
+				return nil, err
+			}
+			payload := append([]byte{dvdMenuSubpictureSubstream + byte(stream)}, unit...)
+			highlights[page].subpictures = append(highlights[page].subpictures, payload)
+		}
+	}
+	return highlights, nil
 }

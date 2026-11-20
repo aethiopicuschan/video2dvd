@@ -13,6 +13,9 @@ const (
 	dvdLPCMSamplesPerFrame  = 80
 	dvdLPCMFramesPerPacket  = 6
 	dvdLPCMPrivateHeaderLen = 7
+	dvdLPCMFrameBytes       = dvdLPCMSamplesPerFrame * 2 * 2
+	// The header's frame number counts audio frames within a group of 20.
+	dvdLPCMFramesPerGroup = 20
 )
 
 // DVDLPCMPacketWriter packetizes 48 kHz, 16-bit stereo PCM into DVD LPCM
@@ -143,12 +146,7 @@ func (w *DVDLPCMPacketWriter) writePacket(frameCount int) error {
 	}
 	pts := w.start + offset
 	payload := make([]byte, dvdLPCMPrivateHeaderLen+len(w.pending)*2)
-	payload[0] = w.substream
-	payload[1] = byte(frameCount)
-	binary.BigEndian.PutUint16(payload[2:4], 0) // first audio frame starts after this header.
-	payload[4] = byte((w.emitted / dvdLPCMSamplesPerFrame) % 32)
-	payload[5] = 0x01 // 16-bit, 48 kHz, two channels.
-	payload[6] = 0x80 // neutral dynamic range control.
+	putDVDLPCMPrivateHeader(payload, w.substream, frameCount, w.emitted/dvdLPCMSamplesPerFrame)
 	for i, sample := range w.pending {
 		binary.BigEndian.PutUint16(payload[dvdLPCMPrivateHeaderLen+i*2:], uint16(sample))
 	}
@@ -161,6 +159,21 @@ func (w *DVDLPCMPacketWriter) writePacket(frameCount int) error {
 	w.emitted += int64(frameCount * dvdLPCMSamplesPerFrame)
 	w.pending = w.pending[:0]
 	return nil
+}
+
+// putDVDLPCMPrivateHeader writes the private_stream_1 header of a packet
+// whose audio data begins with a whole audio frame. firstFrame is the index
+// of that frame in the stream.
+func putDVDLPCMPrivateHeader(dst []byte, substream byte, frameCount int, firstFrame int64) {
+	dst[0] = substream
+	dst[1] = byte(frameCount)
+	// first_access_unit_pointer counts from its own last byte, so the frame
+	// that follows the three remaining header bytes is at offset 4. Zero
+	// would mean that no frame starts in the packet.
+	binary.BigEndian.PutUint16(dst[2:4], dvdLPCMPrivateHeaderLen-3)
+	dst[4] = byte(firstFrame % dvdLPCMFramesPerGroup)
+	dst[5] = 0x01 // 16-bit, 48 kHz, two channels.
+	dst[6] = 0x80 // neutral dynamic range control.
 }
 
 func dvdLPCMSamplesDuration(samples int64) (time.Duration, error) {

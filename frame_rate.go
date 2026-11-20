@@ -21,6 +21,7 @@ type DVDFrameRateConverter struct {
 	width           int
 	height          int
 	haveInput       bool
+	fixedOrigin     bool
 	finished        bool
 }
 
@@ -45,6 +46,14 @@ func NewDVDFrameRateConverter(profile Profile, handler func(DecodedVideoFrame) e
 		return nil, ErrInvalidProfile
 	}
 	return converter, nil
+}
+
+// setOrigin makes source time origin the first output timestamp instead of
+// the first frame's PTS. Frames that end before it are dropped, and a first
+// frame that starts after it is shown from the origin.
+func (c *DVDFrameRateConverter) setOrigin(origin time.Duration) {
+	c.origin = origin
+	c.fixedOrigin = true
 }
 
 // Push adds one decoded frame. Output is emitted as soon as the next input
@@ -92,7 +101,9 @@ func (c *DVDFrameRateConverter) push(frame DecodedVideoFrame, cloneFrame bool) e
 			return err
 		}
 	} else {
-		c.origin = frame.PTS
+		if !c.fixedOrigin {
+			c.origin = frame.PTS
+		}
 		c.width, c.height = frame.Width, frame.Height
 		c.haveInput = true
 	}
@@ -143,7 +154,10 @@ func (c *DVDFrameRateConverter) emitBefore(limit time.Duration) error {
 		if err != nil {
 			return err
 		}
-		if pts >= limit {
+		// Source timestamps are rounded to container ticks, so a frame that
+		// starts within a quarter of an output period after pts is the one
+		// meant for it; otherwise equal cadences would repeat and drop frames.
+		if pts >= limit-c.tolerance() {
 			return nil
 		}
 		nextPTS, err := c.outputTimestamp(c.nextIndex + 1)
@@ -159,6 +173,10 @@ func (c *DVDFrameRateConverter) emitBefore(limit time.Duration) error {
 		c.nextIndex++
 	}
 	return nil
+}
+
+func (c *DVDFrameRateConverter) tolerance() time.Duration {
+	return time.Duration(c.rateDenominator) * time.Second / time.Duration(c.rateNumerator) / 4
 }
 
 func (c *DVDFrameRateConverter) outputTimestamp(index int64) (time.Duration, error) {

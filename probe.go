@@ -39,6 +39,23 @@ type TrackInfo struct {
 	Duration              time.Duration
 	DefaultDuration       time.Duration
 	TimeScale             uint32
+
+	edit mp4EditList
+}
+
+// mp4EditList is the part of a track's edit list the converter honours: an
+// optional leading empty edit followed by the first media edit.
+type mp4EditList struct {
+	present bool
+	// typeOffset is the file offset of the "edts" box type.
+	typeOffset int64
+	// empty and segment are in movie time; mediaTime is in media time.
+	empty     time.Duration
+	segment   time.Duration
+	mediaTime time.Duration
+
+	emptyTicks, segmentTicks uint64
+	mediaTicks               int64
 }
 
 // MP4Info contains basic movie and track metadata read from the MP4 box tables.
@@ -48,9 +65,10 @@ type MP4Info struct {
 }
 
 type mp4Box struct {
-	kind string
-	data int64
-	end  int64
+	kind  string
+	start int64
+	data  int64
+	end   int64
 }
 
 // ProbeMP4 reads container metadata without decoding the media. It supports
@@ -102,10 +120,11 @@ func ProbeMP4Reader(r io.ReaderAt, size int64) (MP4Info, error) {
 		return MP4Info{}, fmt.Errorf("%w: invalid moov box: %v", ErrInvalidMP4, err)
 	}
 	info := MP4Info{}
+	var movieTimeScale uint32
 	for _, child := range children {
 		switch child.kind {
 		case "mvhd":
-			info.Duration, err = parseMovieDuration(r, child)
+			info.Duration, movieTimeScale, err = parseMovieDuration(r, child)
 			if err != nil {
 				return MP4Info{}, fmt.Errorf("%w: invalid mvhd box: %v", ErrInvalidMP4, err)
 			}
@@ -121,7 +140,82 @@ func ProbeMP4Reader(r io.ReaderAt, size int64) (MP4Info, error) {
 	if len(info.Tracks) == 0 {
 		return MP4Info{}, fmt.Errorf("%w: movie has no tracks", ErrInvalidMP4)
 	}
+	for i := range info.Tracks {
+		info.Tracks[i].edit.resolve(movieTimeScale, info.Tracks[i].TimeScale)
+	}
 	return info, nil
+}
+
+func (e *mp4EditList) resolve(movieTimeScale, mediaTimeScale uint32) {
+	if !e.present {
+		return
+	}
+	empty, emptyErr := toDuration(e.emptyTicks, movieTimeScale)
+	segment, segmentErr := toDuration(e.segmentTicks, movieTimeScale)
+	mediaTime, mediaErr := ticksToDuration(e.mediaTicks, mediaTimeScale)
+	if emptyErr != nil || segmentErr != nil || mediaErr != nil {
+		*e = mp4EditList{typeOffset: e.typeOffset}
+		return
+	}
+	e.empty, e.segment, e.mediaTime = empty, segment, mediaTime
+}
+
+// parseEditList reads the leading empty edits and the first media edit of an
+// edts box. Later edits and non-unit rates are not applied.
+func parseEditList(r io.ReaderAt, edts mp4Box) (mp4EditList, error) {
+	children, err := readMP4Boxes(r, edts.data, edts.end)
+	if err != nil {
+		return mp4EditList{}, err
+	}
+	for _, child := range children {
+		if child.kind != "elst" {
+			continue
+		}
+		data, err := readBoxPayload(r, child, 1<<20)
+		if err != nil {
+			return mp4EditList{}, err
+		}
+		if len(data) < 8 {
+			return mp4EditList{}, io.ErrUnexpectedEOF
+		}
+		entrySize := 12
+		if data[0] == 1 {
+			entrySize = 20
+		} else if data[0] != 0 {
+			return mp4EditList{}, fmt.Errorf("unsupported elst version %d", data[0])
+		}
+		count := binary.BigEndian.Uint32(data[4:8])
+		entries := data[8:]
+		if uint64(count)*uint64(entrySize) > uint64(len(entries)) {
+			return mp4EditList{}, errors.New("truncated elst box")
+		}
+		var edit mp4EditList
+		for i := 0; i < int(count); i++ {
+			entry := entries[i*entrySize:]
+			var segment uint64
+			var mediaTime int64
+			if entrySize == 20 {
+				segment = binary.BigEndian.Uint64(entry[:8])
+				mediaTime = int64(binary.BigEndian.Uint64(entry[8:16]))
+			} else {
+				segment = uint64(binary.BigEndian.Uint32(entry[:4]))
+				mediaTime = int64(int32(binary.BigEndian.Uint32(entry[4:8])))
+			}
+			if mediaTime < 0 {
+				if segment > ^uint64(0)-edit.emptyTicks {
+					return mp4EditList{}, errors.New("elst empty edits overflow")
+				}
+				edit.emptyTicks += segment
+				continue
+			}
+			edit.present = true
+			edit.mediaTicks = mediaTime
+			edit.segmentTicks = segment
+			return edit, nil
+		}
+		return mp4EditList{}, nil
+	}
+	return mp4EditList{}, nil
 }
 
 func readMP4Boxes(r io.ReaderAt, start, end int64) ([]mp4Box, error) {
@@ -156,19 +250,25 @@ func readMP4Boxes(r io.ReaderAt, start, end int64) ([]mp4Box, error) {
 		}
 		boxEnd := pos + int64(boxSize)
 		boxes = append(boxes, mp4Box{
-			kind: string(header[4:8]),
-			data: pos + boxHeaderSize,
-			end:  boxEnd,
+			kind:  string(header[4:8]),
+			start: pos,
+			data:  pos + boxHeaderSize,
+			end:   boxEnd,
 		})
 		pos = boxEnd
 	}
 	return boxes, nil
 }
 
-func parseMovieDuration(r io.ReaderAt, box mp4Box) (time.Duration, error) {
-	data, err := readBoxPrefix(r, box, 32)
+func parseMovieDuration(r io.ReaderAt, box mp4Box) (time.Duration, uint32, error) {
+	data, err := readBoxPrefix(r, box, 20)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
+	}
+	if data[0] == 1 {
+		if data, err = readBoxPrefix(r, box, 32); err != nil {
+			return 0, 0, err
+		}
 	}
 	version := data[0]
 	var timeScale uint32
@@ -178,15 +278,13 @@ func parseMovieDuration(r io.ReaderAt, box mp4Box) (time.Duration, error) {
 		timeScale = binary.BigEndian.Uint32(data[12:16])
 		duration = uint64(binary.BigEndian.Uint32(data[16:20]))
 	case 1:
-		if len(data) < 32 {
-			return 0, io.ErrUnexpectedEOF
-		}
 		timeScale = binary.BigEndian.Uint32(data[20:24])
 		duration = binary.BigEndian.Uint64(data[24:32])
 	default:
-		return 0, fmt.Errorf("unsupported mvhd version %d", version)
+		return 0, 0, fmt.Errorf("unsupported mvhd version %d", version)
 	}
-	return toDuration(duration, timeScale)
+	value, err := toDuration(duration, timeScale)
+	return value, timeScale, err
 }
 
 func parseTrack(r io.ReaderAt, box mp4Box) (TrackInfo, error) {
@@ -195,10 +293,17 @@ func parseTrack(r io.ReaderAt, box mp4Box) (TrackInfo, error) {
 		return TrackInfo{}, err
 	}
 	var mdia *mp4Box
+	var edit mp4EditList
 	for i := range children {
-		if children[i].kind == "mdia" {
-			mdia = &children[i]
-			break
+		switch children[i].kind {
+		case "mdia":
+			if mdia == nil {
+				mdia = &children[i]
+			}
+		case "edts":
+			// A malformed edit list is ignored rather than failing the probe.
+			edit, _ = parseEditList(r, children[i])
+			edit.typeOffset = children[i].start + 4
 		}
 	}
 	if mdia == nil {
@@ -232,7 +337,7 @@ func parseTrack(r io.ReaderAt, box mp4Box) (TrackInfo, error) {
 	if handler == "" {
 		return TrackInfo{}, errors.New("track has no handler type")
 	}
-	track := TrackInfo{Duration: duration, TimeScale: timeScale}
+	track := TrackInfo{Duration: duration, TimeScale: timeScale, edit: edit}
 	switch handler {
 	case "vide":
 		track.Kind = TrackKindVideo
@@ -407,6 +512,12 @@ func parseSampleDescription(r io.ReaderAt, box mp4Box, track *TrackInfo) error {
 			esds, err := readBoxPayload(r, child, 1<<20)
 			if err != nil {
 				return err
+			}
+			if objectType, ok := esdsObjectTypeIndication(esds); ok && !isAACObjectTypeIndication(objectType) {
+				// mp4a also carries MP3 and other MPEG audio; report the track
+				// as unsupported audio instead of rejecting the whole file.
+				track.Codec = fmt.Sprintf("mp4a.%02x", objectType)
+				return nil
 			}
 			config, err := extractAACAudioSpecificConfig(esds)
 			if err != nil {

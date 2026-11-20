@@ -5,6 +5,7 @@ package video2dvd
 import (
 	"io"
 	"os"
+	"time"
 
 	"github.com/rcarmo/go-264/audio/pcm"
 )
@@ -19,7 +20,6 @@ var (
 	TestMakeAACADTSHeader                   = makeAACADTSHeader
 	ExportTrackDisplayAspect                = trackDisplayAspect
 	ExportCheckEstimatedTitleSize           = checkEstimatedTitleSize
-	ExportBuildDVDVMGMenuPGCI               = buildDVDVMGMenuPGCI
 	ExportDVDCellElapsedTime                = dvdCellElapsedTime
 	ExportSelectAudioTrack                  = selectAudioTrack
 	ExportSelectWebMVideoTrack              = selectWebMVideoTrack
@@ -51,7 +51,7 @@ func ExportNewSizeLimitedWriter(dst io.Writer, limit int64) *sizeLimitedWriter {
 func ExportNewBitReader(data []byte) *bitReader              { return &bitReader{data: data} }
 func ExportReadBits(r *bitReader, count int) (uint32, error) { return r.read(count) }
 func ExportMP4Box(data, end int64) mp4Box                    { return mp4Box{data: data, end: end} }
-func ExportMPEG2FrameBytes(e *MPEG2VideoEncoder) int         { return e.frameBytes }
+func ExportMPEG2FrameBytes(e *MPEG2VideoEncoder) int         { return int(e.rate.bitsPerPicture / 8) }
 func ExportMPEG2InverseIntraAC(level, weight, quantizer int) int {
 	return inverseMPEG2IntraACCoefficient(level, weight, quantizer)
 }
@@ -78,4 +78,45 @@ func ExportMPEG2DCTRunLevel(run, level int, firstNonIntra bool) []byte {
 	writeMPEG2DCTRunLevel(&bits, run, level, firstNonIntra)
 	return bits.bytes()
 }
+func ExportMPEG2MotionSample(plane []byte, stride, x, y, motionX, motionY int) byte {
+	return mpeg2MotionSample(plane, stride, x, y, motionX, motionY)
+}
+func ExportMPEG2EncoderReference(e *MPEG2VideoEncoder) DecodedVideoFrame { return *e.reference }
+func ExportSetMPEG2VBVFullness(e *MPEG2VideoEncoder, bits float64)       { e.rate.fullness = bits }
+func ExportMPEG2MacroblockMotion(m mpeg2PredictiveMacroblock) (int, int) { return m.motionX, m.motionY }
+
+const (
+	ExportMPEG2MuxSafeVideoBitrate = mpeg2MuxSafeVideoBitrate
+	ExportMPEG2VBVStartBits        = mpeg2VBVStartBits
+	ExportMPEG2VBVBufferBits       = mpeg2VBVBufferBits
+	ExportMPEG2VBVGuardBits        = mpeg2VBVGuardBits
+)
+
 func ExportProgramStreamClosedError(w *MPEGProgramStreamWriter) error { return w.closedErr }
+
+type ExportPCMWindowWriter = pcmWindowWriter
+
+func ExportNewPCMWindowWriter(dst io.Writer, endSample int64, offset time.Duration) (*pcmWindowWriter, error) {
+	return newPCMWindowWriterSamples(dst, endSample, offset)
+}
+
+// ExportEditPCM runs chunks through the MP4 edit-list mapper.
+func ExportEditPCM(empty, mediaTime, segment time.Duration, handler func(PCMChunk) error) func(PCMChunk) error {
+	edit := mp4EditList{present: true, empty: empty, mediaTime: mediaTime, segment: segment}
+	return newEditedPCMWriter(edit, handler).WriteChunk
+}
+
+func ExportHideMP4EditList(src io.ReaderAt, typeOffset int64) io.ReaderAt {
+	return hideMP4EditList(src, mp4EditList{typeOffset: typeOffset})
+}
+
+func ExportTrackEdit(track TrackInfo) (present bool, typeOffset int64, empty, mediaTime, segment time.Duration) {
+	return track.edit.present, track.edit.typeOffset, track.edit.empty, track.edit.mediaTime, track.edit.segment
+}
+
+func ExportSetFrameRateOrigin(c *DVDFrameRateConverter, origin time.Duration) { c.setOrigin(origin) }
+
+var (
+	ExportTitleLengthFromFrames      = titleLengthFromFrames
+	ExportValidateInputAudioChannels = validateInputAudioChannels
+)

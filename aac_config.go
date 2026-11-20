@@ -103,3 +103,48 @@ func readDescriptor(data []byte) ([]byte, []byte, error) {
 	}
 	return nil, nil, errors.New("video2dvd: descriptor length uses more than four bytes")
 }
+
+// esdsObjectTypeIndication returns the DecoderConfigDescriptor's
+// objectTypeIndication from an esds full box.
+func esdsObjectTypeIndication(esds []byte) (byte, bool) {
+	if len(esds) < 5 {
+		return 0, false
+	}
+	return findObjectTypeIndication(esds[4:], 0)
+}
+
+func findObjectTypeIndication(data []byte, depth int) (byte, bool) {
+	if depth > 4 {
+		return 0, false
+	}
+	for len(data) > 0 {
+		tag := data[0]
+		payload, rest, err := readDescriptor(data[1:])
+		if err != nil {
+			return 0, false
+		}
+		data = rest
+		switch tag {
+		case 0x03:
+			children, err := esDescriptorChildren(payload)
+			if err != nil {
+				return 0, false
+			}
+			if value, ok := findObjectTypeIndication(children, depth+1); ok {
+				return value, true
+			}
+		case 0x04:
+			if len(payload) < 1 {
+				return 0, false
+			}
+			return payload[0], true
+		}
+	}
+	return 0, false
+}
+
+// isAACObjectTypeIndication reports MPEG-4 AAC (0x40) and MPEG-2 AAC
+// Main/LC/SSR (0x66-0x68).
+func isAACObjectTypeIndication(value byte) bool {
+	return value == 0x40 || value >= 0x66 && value <= 0x68
+}

@@ -159,12 +159,27 @@ func PrepareWebMVideoForDVD(
 	mode FitMode,
 	handler func(DecodedVideoFrame) error,
 ) error {
+	_, err := prepareWebMVideoForDVD(ctx, path, trackIndex, profile, sourceAspectNumerator, sourceAspectDenominator, mode, handler)
+	return err
+}
+
+// prepareWebMVideoForDVD also returns the container timestamp of the first
+// frame, which is output time zero.
+func prepareWebMVideoForDVD(
+	ctx context.Context,
+	path string,
+	trackIndex *int,
+	profile Profile,
+	sourceAspectNumerator, sourceAspectDenominator int,
+	mode FitMode,
+	handler func(DecodedVideoFrame) error,
+) (time.Duration, error) {
 	if handler == nil {
-		return errors.New("video2dvd: DVD video frame handler is required")
+		return 0, errors.New("video2dvd: DVD video frame handler is required")
 	}
 	rateConverter, err := NewDVDFrameRateConverter(profile, handler)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	err = DecodeWebMVideo(ctx, path, trackIndex, func(frame DecodedVideoFrame) error {
 		fitted, err := FitVideoFrame(frame, profile, sourceAspectNumerator, sourceAspectDenominator, mode)
@@ -174,9 +189,9 @@ func PrepareWebMVideoForDVD(
 		return rateConverter.pushOwned(fitted)
 	})
 	if err != nil {
-		return err
+		return 0, err
 	}
-	return rateConverter.Finish()
+	return rateConverter.origin, rateConverter.Finish()
 }
 
 // PrepareWebMAudioForDVD decodes an Opus track to 48 kHz stereo and writes DVD
