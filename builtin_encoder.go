@@ -19,6 +19,10 @@ import (
 // converts MP4 AAC-LC/AC-3 and WebM Opus audio to LPCM, padded or trimmed to
 // the encoded video length, and creates silent LPCM when the input has no
 // audio track.
+//
+// An NTSC title whose video track runs at 24000/1001 or 24 frames per second
+// throughout is coded as film with 3:2 pulldown flags (soft telecine, see
+// NewMPEG2SoftTelecineEncoder) unless Profile.DisableSoftTelecine is set.
 type InProcessEncoder struct{}
 
 // NewInProcessEncoder returns the built-in Encoder implementation.
@@ -111,31 +115,48 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		return EncodedTitle{}, fmt.Errorf("video2dvd: create MPEG-2 output: %w", err)
 	}
 	videoCreated = true
-	videoEncoder, err := NewMPEG2VideoEncoder(&sizeLimitedWriter{dst: videoFile, limit: encoderOutputLimit(profile)}, profile)
-	if err != nil {
-		_ = videoFile.Close()
-		return EncodedTitle{}, err
-	}
 	sourceAspectN, sourceAspectD, err := trackDisplayAspect(videoTrack)
 	if err != nil {
 		_ = videoFile.Close()
 		return EncodedTitle{}, err
 	}
-	var prepareErr error
-	var frameCount int64
-	writeFrame := func(frame DecodedVideoFrame) error {
-		if err := videoEncoder.WriteFrame(frame); err != nil {
-			return err
+	webMVideo := videoTrack.Codec == "vp9" || videoTrack.Codec == "vp8" || videoTrack.Codec == "av1"
+	// Whether the title is film is settled before the first frame is coded,
+	// from the timestamps of the whole video track. If they cannot be read
+	// the title is not film, and decoding reports what is wrong.
+	var frameTimes []time.Duration
+	if profile.Standard == VideoStandardNTSC && !profile.DisableSoftTelecine {
+		if webMVideo {
+			frameTimes, _ = webMVideoFrameTimes(input.VideoPath, &videoTrack.Index)
+		} else {
+			frameTimes, _ = mp4VideoFrameTimes(input.VideoPath, &videoTrack.Index)
 		}
-		frameCount++
-		return nil
 	}
+	var videoEncoder *MPEG2VideoEncoder
+	rateConverter, film, err := newDVDTitleFrameRateConverter(profile, frameTimes, func(frame DecodedVideoFrame) error {
+		return videoEncoder.WriteFrame(frame)
+	})
+	if err != nil {
+		_ = videoFile.Close()
+		return EncodedTitle{}, err
+	}
+	videoWriter := &sizeLimitedWriter{dst: videoFile, limit: encoderOutputLimit(profile)}
+	if film {
+		videoEncoder, err = NewMPEG2SoftTelecineEncoder(videoWriter, profile)
+	} else {
+		videoEncoder, err = NewMPEG2VideoEncoder(videoWriter, profile)
+	}
+	if err != nil {
+		_ = videoFile.Close()
+		return EncodedTitle{}, err
+	}
+	var prepareErr error
 	// audioOffset places the audio on the title timeline, whose zero is the
 	// first encoded video frame.
 	audioOffset := input.AudioOffset
-	if videoTrack.Codec == "vp9" || videoTrack.Codec == "vp8" || videoTrack.Codec == "av1" {
+	if webMVideo {
 		var videoStart time.Duration
-		videoStart, prepareErr = prepareWebMVideoForDVD(ctx, input.VideoPath, &videoTrack.Index, profile, sourceAspectN, sourceAspectD, FitLetterbox, writeFrame)
+		videoStart, prepareErr = prepareWebMVideoForDVD(ctx, input.VideoPath, &videoTrack.Index, profile, sourceAspectN, sourceAspectD, FitLetterbox, rateConverter)
 		if input.AudioPath == input.VideoPath {
 			// Both tracks share the WebM timeline, so audio moves with the
 			// video's start instead of staying on container time.
@@ -146,7 +167,7 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 			audioOffset = shifted
 		}
 	} else {
-		prepareErr = PrepareMP4VideoForDVD(ctx, input.VideoPath, &videoTrack.Index, profile, sourceAspectN, sourceAspectD, FitLetterbox, writeFrame)
+		prepareErr = prepareMP4VideoForDVD(ctx, input.VideoPath, &videoTrack.Index, profile, sourceAspectN, sourceAspectD, FitLetterbox, rateConverter)
 	}
 	closeEncoderErr := videoEncoder.Close()
 	closeVideoErr := videoFile.Close()
@@ -160,10 +181,12 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		return EncodedTitle{}, fmt.Errorf("video2dvd: close MPEG-2 output: %w", closeVideoErr)
 	}
 
-	// The title is exactly as long as the encoded video; audio is padded or
-	// trimmed to the same length in whole samples.
+	// The title is exactly as long as the encoded video is displayed, which
+	// for film is not a whole number of frames; audio is padded or trimmed
+	// to the same length in whole samples. The frame rate stays the display
+	// rate of the standard: the pictures themselves say how long each lasts.
 	fpsN, fpsD := profileFrameRate(profile.Standard)
-	duration, audioSamples, err := titleLengthFromFrames(frameCount, fpsN, fpsD)
+	duration, audioSamples, err := titleLengthFromFields(videoEncoder.DisplayFields(), fpsN, fpsD)
 	if err != nil {
 		return EncodedTitle{}, err
 	}
@@ -214,17 +237,19 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 	}, nil
 }
 
-func titleLengthFromFrames(frames int64, fpsN, fpsD int) (time.Duration, int64, error) {
-	if frames <= 0 {
+// titleLengthFromFields returns the display time of a number of fields at
+// the frame rate fpsN/fpsD, two fields to the frame, and the number of audio
+// samples nearest to it.
+func titleLengthFromFields(fields int64, fpsN, fpsD int) (time.Duration, int64, error) {
+	if fields <= 0 {
 		return 0, 0, errors.New("video2dvd: input produced no video frames")
 	}
-	// 24 hours of frames keeps every product below far inside int64.
-	if frames > 24*60*60*60 {
+	if fields > 2*24*60*60*60 {
 		return 0, 0, errors.New("video2dvd: title is too long")
 	}
-	scaled := frames * int64(fpsD)
-	duration := time.Duration(scaled/int64(fpsN))*time.Second + time.Duration(scaled%int64(fpsN))*time.Second/time.Duration(fpsN)
-	samples := (scaled*dvdLPCMSampleRate + int64(fpsN)/2) / int64(fpsN)
+	scaled, rate := fields*int64(fpsD), 2*int64(fpsN)
+	duration := time.Duration(scaled/rate)*time.Second + time.Duration(scaled%rate)*time.Second/time.Duration(rate)
+	samples := (scaled*dvdLPCMSampleRate + rate/2) / rate
 	return duration, samples, nil
 }
 

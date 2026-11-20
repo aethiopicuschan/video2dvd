@@ -57,6 +57,8 @@ type Profile struct {
 	// MenuFont, if not nil, draws the menu text; see Options.MenuFont.
 	MenuFont     *MenuFont
 	VideoBitrate int
+	// DisableSoftTelecine is Options.DisableSoftTelecine.
+	DisableSoftTelecine bool
 }
 
 // Options controls conversion and DVD authoring. The zero value selects NTSC,
@@ -84,6 +86,15 @@ type Options struct {
 	// and spaces; letters are stored in upper case. Empty selects VIDEO2DVD.
 	// It has no effect on directory output.
 	VolumeID string
+	// DisableSoftTelecine turns off the film mode of NTSC titles. By default
+	// the built-in encoder codes a source whose whole video track runs at
+	// 24000/1001 or 24 frames per second as film: only the source frames are coded, and
+	// flags in the stream have the player show them for three and two fields
+	// in turn (3:2 pulldown) or, on a progressive-scan player, as they are.
+	// With this set such a source is converted like any other, by showing
+	// every fourth frame twice. It has no effect on PAL titles and on
+	// sources at other frame rates.
+	DisableSoftTelecine bool
 }
 
 func (o Options) profile() (Profile, error) {
@@ -105,9 +116,9 @@ func (o Options) profile() (Profile, error) {
 
 	switch o.Standard {
 	case VideoStandardNTSC:
-		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 480, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma, MenuFont: o.MenuFont, VideoBitrate: o.VideoBitrate}, nil
+		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 480, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma, MenuFont: o.MenuFont, VideoBitrate: o.VideoBitrate, DisableSoftTelecine: o.DisableSoftTelecine}, nil
 	case VideoStandardPAL:
-		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 576, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma, MenuFont: o.MenuFont, VideoBitrate: o.VideoBitrate}, nil
+		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 576, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma, MenuFont: o.MenuFont, VideoBitrate: o.VideoBitrate, DisableSoftTelecine: o.DisableSoftTelecine}, nil
 	default:
 		return Profile{}, ErrInvalidProfile
 	}
@@ -118,6 +129,12 @@ func (o Options) profile() (Profile, error) {
 // Encoder.Encode. Both streams must be non-empty files inside that directory.
 // Video is MPEG-2; audio must be AC-3, LPCM, or MPEG-1 Layer II. The authorer
 // may use the duration and frame rate to build navigation data.
+//
+// The frame rate is that of the MPEG-2 sequence header, which on a DVD is the
+// display rate of the standard: 30000/1001 or 25. Film on an NTSC disc is
+// such a 30000/1001 stream as well, with repeat_first_field set on the
+// pictures that are shown for three fields (soft telecine); the multiplexer
+// times every picture by its own flags. 24000/1001 is not accepted.
 type EncodedTitle struct {
 	VideoPath            string
 	AudioPath            string
@@ -503,6 +520,10 @@ func validateTitle(title EncodedTitle, workDir string, profile Profile) error {
 		return fmt.Errorf("raster %dx%d is not valid for the selected DVD standard", title.Width, title.Height)
 	}
 	if title.FrameRateNumerator <= 0 || title.FrameRateDenominator <= 0 || !validFrameRate(profile.Standard, title.FrameRateNumerator, title.FrameRateDenominator) {
+		if profile.Standard == VideoStandardNTSC && title.FrameRateNumerator == 24000 && title.FrameRateDenominator == 1001 {
+			// Accepted once, although it never made a DVD-Video stream.
+			return checkDVDFrameRate(title.FrameRateNumerator, title.FrameRateDenominator)
+		}
 		return fmt.Errorf("frame rate %d/%d is not valid for the selected DVD standard", title.FrameRateNumerator, title.FrameRateDenominator)
 	}
 	if title.Duration <= 0 {
@@ -550,7 +571,7 @@ func validFrameRate(standard VideoStandard, numerator, denominator int) bool {
 		return numerator == 25 && denominator == 1
 	}
 	if standard == VideoStandardNTSC {
-		return (numerator == 30000 && denominator == 1001) || (numerator == 24000 && denominator == 1001)
+		return numerator == 30000 && denominator == 1001
 	}
 	return false
 }

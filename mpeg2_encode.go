@@ -25,6 +25,16 @@ const (
 	mpeg2MuxSafeVideoBitrate = 7_500_000
 
 	mpeg2GOPPictures = 15
+	// mpeg2FilmGOPPictures is the GOP length of a soft-telecined stream: 12
+	// film pictures are shown for 30 fields, half a second like 15 video
+	// pictures, and inside the 36 fields DVD-Video allows an NTSC GOP. A GOP
+	// that a scene change has moved off the start of the pulldown cycle
+	// holds 13, 32 fields, to return to it.
+	mpeg2FilmGOPPictures = 12
+	// mpeg2FilmMinGOPPictures is the shortest film GOP a scene change may
+	// leave behind: eleven consecutive pictures last 27 or 28 fields, at
+	// least 0.45 s. See MPEG2VideoEncoder.sceneChangeMayStartGOP.
+	mpeg2FilmMinGOPPictures = 11
 
 	// mpeg2VBVBufferBits is the buffer declared in the sequence header
 	// (vbv_buffer_size 112), the largest DVD-Video allows.
@@ -84,7 +94,13 @@ func effectiveMPEG2VideoBitrate(profile Profile) int {
 // stream delivered at the declared bit rate and derives per-picture budgets
 // from its occupancy.
 type mpeg2RateControl struct {
+	// bitsPerPicture is what arrives during one frame period, or during the
+	// average picture of a soft-telecined stream.
 	bitsPerPicture float64
+	// bitsPerField is what arrives during one field period of a
+	// soft-telecined stream, whose pictures stay in the buffer for two or
+	// three of them. It is zero for any other stream.
+	bitsPerField float64
 	// fullness is the modelled occupancy in bits just before the next picture
 	// is removed.
 	fullness float64
@@ -139,13 +155,15 @@ func (b mpeg2PictureBudget) budgetBytes(quantizer int) int {
 // pictureBudget returns the budget of the next picture: an I picture, the
 // P picture of a scene change, or an ordinary P picture. The pictures after
 // either of the first two depend on it alone. remaining counts the pictures
-// left in the GOP including this one.
+// left in the GOP including this one. For a soft-telecined stream gopFields
+// is the time, in field periods, from this picture's decoding to that of the
+// picture after the GOP, and nextFields the time to the next picture's.
 //
 // The budget aims at one picture quality for the rest of the GOP: the scale
 // at which this picture, measured, and the others, estimated from the
 // complexity of earlier P pictures, together spend what brings the buffer
 // back to its start level by the next I picture.
-func (rc *mpeg2RateControl) pictureBudget(intra, sceneChange bool, remaining int) mpeg2PictureBudget {
+func (rc *mpeg2RateControl) pictureBudget(intra, sceneChange bool, remaining, gopFields, nextFields int) mpeg2PictureBudget {
 	unpredicted := intra || sceneChange
 	if intra {
 		rc.sceneChanges = 0
@@ -153,6 +171,9 @@ func (rc *mpeg2RateControl) pictureBudget(intra, sceneChange bool, remaining int
 		rc.sceneChanges++
 	}
 	gopBits := rc.fullness + float64(remaining)*rc.bitsPerPicture - mpeg2VBVStartBits
+	if rc.bitsPerField != 0 {
+		gopBits = rc.fullness + float64(gopFields)*rc.bitsPerField - mpeg2VBVStartBits
+	}
 	others := float64(remaining - 1)
 	equalShare := 1 / float64(remaining)
 	budget := mpeg2PictureBudget{
@@ -192,6 +213,9 @@ func (rc *mpeg2RateControl) pictureBudget(intra, sceneChange bool, remaining int
 		// than the rest, up to what the buffer is counted on to hold.
 		budget.floorQuantizer = rc.predictiveFloor
 		budget.spareBytes = int(max(rc.fullness+rc.bitsPerPicture-mpeg2VBVCeilingBits, 0)) / 8
+		if rc.bitsPerField != 0 {
+			budget.spareBytes = int(max(rc.fullness+float64(nextFields)*rc.bitsPerField-mpeg2VBVCeilingBits, 0)) / 8
+		}
 	}
 	budget.minBits = max(gopBits*minShare, rc.bitsPerPicture/8)
 	budget.maxBits = max(gopBits*maxShare, budget.minBits)
@@ -200,8 +224,9 @@ func (rc *mpeg2RateControl) pictureBudget(intra, sceneChange bool, remaining int
 
 // pictureCoded accounts for a coded picture. For an unpredicted picture,
 // floor is the quantizer scale its budget left for the pictures predicted
-// from it.
-func (rc *mpeg2RateControl) pictureCoded(unpredicted bool, sizeBytes, quantizer, floor int) {
+// from it. nextFields is, for a soft-telecined stream, the number of field
+// periods until the next picture is decoded.
+func (rc *mpeg2RateControl) pictureCoded(unpredicted bool, sizeBytes, quantizer, floor, nextFields int) {
 	if unpredicted {
 		rc.predictiveFloor = floor
 	}
@@ -215,6 +240,10 @@ func (rc *mpeg2RateControl) pictureCoded(unpredicted bool, sizeBytes, quantizer,
 		} else {
 			rc.complexity += (complexity - rc.complexity) * mpeg2ComplexityAdaptation
 		}
+	}
+	if rc.bitsPerField != 0 {
+		rc.fullness = min(rc.fullness-float64(sizeBytes)*8+float64(nextFields)*rc.bitsPerField, mpeg2VBVCeilingBits)
+		return
 	}
 	rc.fullness = min(rc.fullness-float64(sizeBytes)*8+rc.bitsPerPicture, mpeg2VBVCeilingBits)
 }
@@ -264,6 +293,8 @@ func buildMPEG2DCTBasis() [8][8]float64 {
 // prediction as intra macroblocks. A GOP holds at most 15 pictures; a scene
 // change may end it earlier, but not before it lasts 0.4 s.
 //
+// An encoder made by NewMPEG2SoftTelecineEncoder codes film: see there.
+//
 // The writer does not close dst. Call Close after the final frame to write the
 // MPEG sequence-end code.
 type MPEG2VideoEncoder struct {
@@ -274,9 +305,19 @@ type MPEG2VideoEncoder struct {
 	frameNo   int64
 	// gopStart is the number of the I picture that opened the current GOP.
 	gopStart int64
-	// minGOPPictures is the shortest GOP a scene change may leave behind.
+	// gopPictures is the longest GOP and minGOPPictures the shortest one a
+	// scene change may leave behind.
+	gopPictures    int
 	minGOPPictures int
-	reference      *DecodedVideoFrame
+	// film marks a soft-telecined stream; fieldNo then counts the fields
+	// displayed before the current picture.
+	film    bool
+	fieldNo int64
+	// held is the latest coded picture of a soft-telecined stream, kept back
+	// until the next one or Close, which may have to change its
+	// repeat_first_field.
+	held      []byte
+	reference *DecodedVideoFrame
 	// motion is the vector field of the latest P picture with motion in it,
 	// used to seed the next search; motionLambda is the vector-bit weight
 	// derived from the latest P picture's quantizer scale.
@@ -291,13 +332,42 @@ type MPEG2VideoEncoder struct {
 // 7.5 Mbit/s are coded at 7.5 Mbit/s so that the stream still fits the DVD
 // multiplex next to LPCM audio.
 func NewMPEG2VideoEncoder(dst io.Writer, profile Profile) (*MPEG2VideoEncoder, error) {
+	return newMPEG2VideoEncoder(dst, profile, false)
+}
+
+// NewMPEG2SoftTelecineEncoder prepares an encoder for film on an NTSC DVD.
+// Every frame written is one film frame, 24000/1001 of them per second. The
+// stream is still a 30000/1001 one of frame pictures, as DVD-Video requires;
+// top_field_first and repeat_first_field of each picture tell the player to
+// show the frames for three and two fields in turn (3:2 pulldown), which a
+// progressive-scan player undoes to show the film frames themselves. The
+// field parity runs on across GOPs. A GOP holds 12 pictures, which are shown
+// for 30 fields; a scene change may end it after 11, and the GOPs after that
+// hold 13 until one ends on a scene change after 12. Every GOP starts with a
+// top field on a frame of the display raster.
+//
+// The stream always ends on a whole frame, with a bottom field: where the
+// pulldown cycle would end on a top field, Close gives the last picture one
+// field more or less. Each picture is therefore written to dst when the next
+// one arrives or the encoder is closed.
+//
+// The profile must be an NTSC one. Use DisplayFields for the length of the
+// stream.
+func NewMPEG2SoftTelecineEncoder(dst io.Writer, profile Profile) (*MPEG2VideoEncoder, error) {
+	if profile.Standard != VideoStandardNTSC {
+		return nil, fmt.Errorf("%w: soft telecine applies to NTSC only", ErrInvalidProfile)
+	}
+	return newMPEG2VideoEncoder(dst, profile, true)
+}
+
+func newMPEG2VideoEncoder(dst io.Writer, profile Profile, film bool) (*MPEG2VideoEncoder, error) {
 	if dst == nil {
 		return nil, errors.New("video2dvd: MPEG-2 destination writer is required")
 	}
 	if err := validateEncoderProfile(profile); err != nil {
 		return nil, err
 	}
-	encoder := &MPEG2VideoEncoder{dst: dst, profile: profile, motionLambda: mpeg2DefaultMotionLambda}
+	encoder := &MPEG2VideoEncoder{dst: dst, profile: profile, motionLambda: mpeg2DefaultMotionLambda, gopPictures: mpeg2GOPPictures, film: film}
 	bitrate := profileVideoBitrate(profile)
 	if bitrate < mpeg2MinVideoBitrate || bitrate > mpeg2MaxVideoBitrate {
 		return nil, fmt.Errorf("video2dvd: video bitrate must be between %d and %d bit/s", mpeg2MinVideoBitrate, mpeg2MaxVideoBitrate)
@@ -308,6 +378,11 @@ func NewMPEG2VideoEncoder(dst io.Writer, profile Profile) (*MPEG2VideoEncoder, e
 		encoder.frameRate = 30
 		encoder.minGOPPictures = 12
 		encoder.rate = newMPEG2RateControl(float64(bitrate) * 1001 / 30000)
+		if film {
+			encoder.gopPictures, encoder.minGOPPictures = mpeg2FilmGOPPictures, mpeg2FilmMinGOPPictures
+			encoder.rate = newMPEG2RateControl(float64(bitrate) * 1001 / 24000)
+			encoder.rate.bitsPerField = float64(bitrate) * 1001 / 60000
+		}
 	case VideoStandardPAL:
 		encoder.frameRate = 25
 		encoder.minGOPPictures = 10
@@ -339,7 +414,7 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 	mbWidth := frame.Width / 16
 	mbHeight := frame.Height / 16
 	gopPosition := int(e.frameNo - e.gopStart)
-	isIntra := e.reference == nil || gopPosition >= mpeg2GOPPictures
+	isIntra := e.reference == nil || gopPosition >= e.gopPictures
 	var intraBlocks []mpeg2IntraBlock
 	var predictiveMacroblocks []mpeg2PredictiveMacroblock
 	sceneChange := false
@@ -356,12 +431,21 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 		// the new scene is not coded intra twice within a few pictures.
 		// Earlier ones stay P pictures made of intra macroblocks: a DVD
 		// VOBU, which is one GOP here, has to last at least 0.4 s.
-		if sceneChange && gopPosition >= e.minGOPPictures {
+		if sceneChange && e.sceneChangeMayStartGOP(gopPosition) {
 			isIntra, predictiveMacroblocks = true, nil
 		}
 	}
 	if isIntra {
 		e.gopStart, gopPosition = e.frameNo, 0
+		if e.film {
+			e.gopPictures = mpeg2FilmGOPPictures
+			if e.frameNo%4 != 0 {
+				// The GOP starts on the last picture of a pulldown cycle,
+				// after a scene change; one more picture takes the next GOP
+				// back to the start of one.
+				e.gopPictures++
+			}
+		}
 		intraBlocks = collectMPEG2IntraBlocks(frame, mbWidth, mbHeight)
 	}
 	measure := func(quantizer int) int {
@@ -371,7 +455,18 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 		return e.measurePredictivePicture(predictiveMacroblocks, mbWidth, mbHeight, quantizer, true)
 	}
 	unpredicted := isIntra || sceneChange
-	budget := e.rate.pictureBudget(isIntra, sceneChange, mpeg2GOPPictures-gopPosition)
+	remaining := e.gopPictures - gopPosition
+	gopFields, nextFields := 0, 0
+	if e.film {
+		// A picture is decoded when the one before it is displayed, so the
+		// time to the next decoding is the display time of the previous
+		// picture.
+		nextFields = mpeg2FilmDecodeFields(e.frameNo)
+		for picture := e.frameNo; picture < e.frameNo+int64(remaining); picture++ {
+			gopFields += mpeg2FilmDecodeFields(picture)
+		}
+	}
+	budget := e.rate.pictureBudget(isIntra, sceneChange, remaining, gopFields, nextFields)
 	selectedQuantizer, predictiveFloor := 0, 1
 	if unpredicted {
 		// The pictures predicted from this one keep to the scale that
@@ -420,11 +515,17 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 	} else {
 		encoded = e.encodePredictivePicture(predictiveMacroblocks, mbWidth, mbHeight, selectedQuantizer, true)
 	}
-	if err := writeAll(e.dst, encoded); err != nil {
+	if e.film {
+		// The last picture of the stream may need another flag: see Close.
+		if err := e.writeHeld(); err != nil {
+			return err
+		}
+		e.held = encoded
+	} else if err := writeAll(e.dst, encoded); err != nil {
 		e.writeErr = fmt.Errorf("video2dvd: write MPEG-2 picture %d: %w", e.frameNo, err)
 		return e.writeErr
 	}
-	e.rate.pictureCoded(unpredicted, len(encoded), selectedQuantizer, predictiveFloor)
+	e.rate.pictureCoded(unpredicted, len(encoded), selectedQuantizer, predictiveFloor, nextFields)
 	var reference DecodedVideoFrame
 	if isIntra {
 		reference = reconstructMPEG2IntraFrame(frame, intraBlocks, mbWidth, mbHeight, selectedQuantizer, true)
@@ -434,8 +535,93 @@ func (e *MPEG2VideoEncoder) WriteFrame(frame DecodedVideoFrame) error {
 		e.rememberMotion(predictiveMacroblocks)
 	}
 	e.reference = &reference
+	e.fieldNo += int64(e.pictureFields())
 	e.frameNo++
 	return nil
+}
+
+// sceneChangeMayStartGOP reports whether a scene change at the given position
+// of the current GOP may start the next one early. The GOP it ends has to
+// last at least 0.4 s. In a soft-telecined stream it also has to end with a
+// whole frame, that is after an even number of fields: every GOP, and with it
+// every VOBU and its time code, then starts with a top field on a frame of
+// the 30000/1001 display raster, as it does without scene changes. Of the
+// four pictures of a pulldown cycle that leaves the first and the last to
+// start a GOP, so a scene change can do it after 11 pictures of a GOP that
+// began with the cycle and after 12 of one that did not.
+func (e *MPEG2VideoEncoder) sceneChangeMayStartGOP(gopPosition int) bool {
+	if gopPosition < e.minGOPPictures {
+		return false
+	}
+	return !e.film || e.fieldNo%2 == 0
+}
+
+// writeHeld writes the picture of a soft-telecined stream that was kept back.
+func (e *MPEG2VideoEncoder) writeHeld() error {
+	if e.held == nil {
+		return nil
+	}
+	if err := writeAll(e.dst, e.held); err != nil {
+		e.writeErr = fmt.Errorf("video2dvd: write MPEG-2 picture %d: %w", e.frameNo-1, err)
+		return e.writeErr
+	}
+	e.held = nil
+	return nil
+}
+
+// mpeg2FilmCadence is the 3:2 pulldown cycle of a soft-telecined stream in
+// display order: top_field_first and repeat_first_field of four consecutive
+// film pictures, which are shown for 3, 2, 3 and 2 fields, ten fields or five
+// video frames together. Each picture starts with the field parity the one
+// before it did not end on.
+var mpeg2FilmCadence = [4]struct{ topFieldFirst, repeatFirstField uint64 }{{1, 1}, {0, 0}, {0, 1}, {1, 0}}
+
+// mpeg2FilmPictureFields is the number of fields film picture number picture
+// is displayed for.
+func mpeg2FilmPictureFields(picture int64) int {
+	return 2 + int(mpeg2FilmCadence[picture%4].repeatFirstField)
+}
+
+// mpeg2FilmDecodeFields is the time in field periods between the decoding of
+// film picture number picture and that of the next one. Without B pictures a
+// picture is decoded while its predecessor is displayed (H.262 C.9), so this
+// is the predecessor's display time; the first picture is given one frame
+// period.
+func mpeg2FilmDecodeFields(picture int64) int {
+	if picture == 0 {
+		return 2
+	}
+	return mpeg2FilmPictureFields(picture - 1)
+}
+
+// pictureFields is the number of fields the current picture is displayed for.
+func (e *MPEG2VideoEncoder) pictureFields() int {
+	if e.film {
+		return mpeg2FilmPictureFields(e.frameNo)
+	}
+	return 2
+}
+
+// pictureFlags returns top_field_first and repeat_first_field of the current
+// picture.
+func (e *MPEG2VideoEncoder) pictureFlags() (uint64, uint64) {
+	if e.film {
+		cadence := mpeg2FilmCadence[e.frameNo%4]
+		return cadence.topFieldFirst, cadence.repeatFirstField
+	}
+	return 1, 0
+}
+
+// DisplayFields returns the number of fields the frames written so far are
+// displayed for: two per frame, or five per two frames of a soft-telecined
+// stream. A field lasts 1001/60000 s on an NTSC disc and 1/50 s on a PAL one.
+// Closing a soft-telecined stream may add a field to the last picture or
+// take one from it, so the length of the stream is to be read after Close.
+func (e *MPEG2VideoEncoder) DisplayFields() int64 {
+	if e == nil {
+		return 0
+	}
+	return e.fieldNo
 }
 
 // selectMPEG2Quantizer returns the finest quantizer scale from minQuantizer up
@@ -522,8 +708,10 @@ func (e *MPEG2VideoEncoder) measureIntraPicture(frame DecodedVideoFrame, blocks 
 // repeated sequence header, which is what makes it a DVD VOBU entry point.
 func (e *MPEG2VideoEncoder) writeIntraPictureHeader(bits *mpeg2BitWriter) {
 	writeMPEG2SequenceHeader(bits, e.profile)
-	writeMPEG2GOPHeader(bits, e.frameNo, e.frameRate)
-	writeMPEG2PictureHeader(bits, 0, 1)
+	// The time code counts displayed frames, which are two fields each.
+	writeMPEG2GOPHeader(bits, e.fieldNo/2, e.frameRate)
+	topFieldFirst, repeatFirstField := e.pictureFlags()
+	writeMPEG2PictureHeader(bits, 0, 1, topFieldFirst, repeatFirstField)
 }
 
 // rememberMotion keeps a P picture's vector field as search seeds for the
@@ -566,7 +754,8 @@ func (e *MPEG2VideoEncoder) measurePredictivePicture(macroblocks []mpeg2Predicti
 }
 
 func (e *MPEG2VideoEncoder) writePredictivePictureHeader(bits *mpeg2BitWriter) {
-	writeMPEG2PictureHeader(bits, uint16(e.frameNo-e.gopStart), 2)
+	topFieldFirst, repeatFirstField := e.pictureFlags()
+	writeMPEG2PictureHeader(bits, uint16(e.frameNo-e.gopStart), 2, topFieldFirst, repeatFirstField)
 }
 
 func encodeMPEG2PictureRows(header *mpeg2BitWriter, rowCount int, writeRow func(*mpeg2BitWriter, int)) ([]byte, int) {
@@ -625,6 +814,29 @@ func (e *MPEG2VideoEncoder) Close() error {
 	if e.frameNo == 0 {
 		e.writeErr = errors.New("video2dvd: MPEG-2 stream contains no video frames")
 		return e.writeErr
+	}
+	if e.held != nil {
+		if e.fieldNo%2 != 0 {
+			// The pulldown cycle would stop halfway through a frame of the
+			// display raster, on a top field. The last picture is the first
+			// or the second of a cycle then: the first does without its
+			// repeated field (top, bottom), and the second gets one (bottom,
+			// top, bottom), so that the stream ends with a bottom field and
+			// lasts a whole number of frames.
+			repeat := (e.frameNo-1)%4 == 1
+			if err := setMPEG2RepeatFirstField(e.held, repeat); err != nil {
+				e.writeErr = err
+				return e.writeErr
+			}
+			if repeat {
+				e.fieldNo++
+			} else {
+				e.fieldNo--
+			}
+		}
+		if err := e.writeHeld(); err != nil {
+			return err
+		}
 	}
 	var bits mpeg2BitWriter
 	bits.startCode(0xb7)
@@ -705,7 +917,11 @@ func writeMPEG2GOPHeader(bits *mpeg2BitWriter, frameNo int64, nominalRate int) {
 	bits.write(0, 1) // broken_link
 }
 
-func writeMPEG2PictureHeader(bits *mpeg2BitWriter, temporalReference uint16, pictureType uint8) {
+// writeMPEG2PictureHeader writes the picture header and coding extension of
+// a progressive frame picture. In a sequence that is not progressive,
+// repeatFirstField makes the frame last three fields instead of two, starting
+// and ending with the field topFieldFirst selects.
+func writeMPEG2PictureHeader(bits *mpeg2BitWriter, temporalReference uint16, pictureType uint8, topFieldFirst, repeatFirstField uint64) {
 	bits.startCode(0x00)
 	bits.write(uint64(temporalReference), 10)
 	bits.write(uint64(pictureType), 3)
@@ -734,16 +950,16 @@ func writeMPEG2PictureHeader(bits *mpeg2BitWriter, temporalReference uint16, pic
 	bits.write(15, 4)           // f_code[1][1], backward vertical
 	bits.write(0, 2)            // intra_dc_precision
 	bits.write(3, 2)            // frame picture
-	bits.write(1, 1)            // top_field_first
-	bits.write(1, 1)            // frame_pred_frame_dct
-	bits.write(0, 1)            // concealment_motion_vectors
-	bits.write(0, 1)            // q_scale_type
-	bits.write(0, 1)            // intra_vlc_format
-	bits.write(0, 1)            // alternate_scan
-	bits.write(0, 1)            // repeat_first_field
-	bits.write(1, 1)            // chroma_420_type
-	bits.write(1, 1)            // progressive_frame
-	bits.write(0, 1)            // composite_display_flag
+	bits.write(topFieldFirst, 1)
+	bits.write(1, 1) // frame_pred_frame_dct
+	bits.write(0, 1) // concealment_motion_vectors
+	bits.write(0, 1) // q_scale_type
+	bits.write(0, 1) // intra_vlc_format
+	bits.write(0, 1) // alternate_scan
+	bits.write(repeatFirstField, 1)
+	bits.write(1, 1) // chroma_420_type
+	bits.write(1, 1) // progressive_frame
+	bits.write(0, 1) // composite_display_flag
 }
 
 type mpeg2IntraBlock struct {

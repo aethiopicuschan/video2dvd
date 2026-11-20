@@ -520,15 +520,16 @@ func TestMuxDVDTitleVOBUsesExactPALFramePeriod(t *testing.T) {
 
 func TestDVDVideoFrameTicksAreExact(t *testing.T) {
 	for frame := range int64(200_000) {
-		if got := ExportDVDVideoFrameTicks(frame, 30000, 1001); got != uint64(frame)*3003 {
+		if got := ExportDVDVideoFieldTicks(2*frame, 30000, 1001); got != uint64(frame)*3003 {
 			t.Fatalf("NTSC frame %d starts at %d ticks, want %d", frame, got, frame*3003)
 		}
-		if got := ExportDVDVideoFrameTicks(frame, 25, 1); got != uint64(frame)*3600 {
+		if got := ExportDVDVideoFieldTicks(2*frame, 25, 1); got != uint64(frame)*3600 {
 			t.Fatalf("PAL frame %d starts at %d ticks, want %d", frame, got, frame*3600)
 		}
-		// 24000/1001 has a period of 3753.75 ticks: whole every fourth frame.
-		if got := ExportDVDVideoFrameTicks(frame, 24000, 1001); got != uint64(frame)*15015/4 {
-			t.Fatalf("film frame %d starts at %d ticks, want %d", frame, got, frame*15015/4)
+		// An NTSC field is 1501.5 ticks: the second field of a frame starts
+		// on a half tick, which is rounded down.
+		if got := ExportDVDVideoFieldTicks(2*frame+1, 30000, 1001); got != uint64(frame)*3003+1501 {
+			t.Fatalf("NTSC field %d starts at %d ticks, want %d", 2*frame+1, got, frame*3003+1501)
 		}
 	}
 }

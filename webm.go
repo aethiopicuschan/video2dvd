@@ -176,12 +176,20 @@ func PrepareWebMVideoForDVD(
 	mode FitMode,
 	handler func(DecodedVideoFrame) error,
 ) error {
-	_, err := prepareWebMVideoForDVD(ctx, path, trackIndex, profile, sourceAspectNumerator, sourceAspectDenominator, mode, handler)
+	if handler == nil {
+		return errors.New("video2dvd: DVD video frame handler is required")
+	}
+	rateConverter, err := NewDVDFrameRateConverter(profile, handler)
+	if err != nil {
+		return err
+	}
+	_, err = prepareWebMVideoForDVD(ctx, path, trackIndex, profile, sourceAspectNumerator, sourceAspectDenominator, mode, rateConverter)
 	return err
 }
 
-// prepareWebMVideoForDVD also returns the container timestamp of the first
-// frame, which is output time zero.
+// prepareWebMVideoForDVD feeds the fitted frames of a WebM track to
+// rateConverter and finishes it. It returns the container timestamp of the
+// first frame, which is output time zero.
 func prepareWebMVideoForDVD(
 	ctx context.Context,
 	path string,
@@ -189,22 +197,15 @@ func prepareWebMVideoForDVD(
 	profile Profile,
 	sourceAspectNumerator, sourceAspectDenominator int,
 	mode FitMode,
-	handler func(DecodedVideoFrame) error,
+	rateConverter *DVDFrameRateConverter,
 ) (time.Duration, error) {
-	if handler == nil {
-		return 0, errors.New("video2dvd: DVD video frame handler is required")
-	}
-	rateConverter, err := NewDVDFrameRateConverter(profile, handler)
-	if err != nil {
-		return 0, err
-	}
 	cadence := webMCadence{}
 	if info, probeErr := ProbeWebM(path); probeErr == nil {
 		if track, selectErr := selectWebMVideoTrack(info, trackIndex); selectErr == nil {
 			cadence.hint = track.DefaultDuration
 		}
 	}
-	err = DecodeWebMVideo(ctx, path, trackIndex, func(frame DecodedVideoFrame) error {
+	err := DecodeWebMVideo(ctx, path, trackIndex, func(frame DecodedVideoFrame) error {
 		frame.PTS, frame.Duration = cadence.regularize(frame.PTS, frame.Duration)
 		fitted, err := FitVideoFrameForDVD(frame, profile, sourceAspectNumerator, sourceAspectDenominator, mode)
 		if err != nil {

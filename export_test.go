@@ -116,7 +116,12 @@ func ExportTrackEdit(track TrackInfo) (present bool, typeOffset int64, empty, me
 
 func ExportSetFrameRateOrigin(c *DVDFrameRateConverter, origin time.Duration) { c.setOrigin(origin) }
 
+// ExportTitleLengthFromFrames is the title and audio length of a number of
+// whole frames.
+func ExportTitleLengthFromFrames(frames int64, fpsN, fpsD int) (time.Duration, int64, error) {
+	return titleLengthFromFields(2*frames, fpsN, fpsD)
+}
+
 var (
-	ExportTitleLengthFromFrames      = titleLengthFromFrames
 	ExportValidateInputAudioChannels = validateInputAudioChannels
 )

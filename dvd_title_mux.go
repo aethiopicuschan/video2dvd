@@ -15,6 +15,13 @@ import (
 // system clock starts at zero and advances with the bytes written. The first
 // picture is decoded dvdMuxStartDelay later and presented one frame period
 // after that, which is also where the audio timeline starts.
+//
+// Video time is counted in display fields. A frame picture lasts two of
+// them, or three with repeat_first_field set, as the pictures of
+// soft-telecined film have in turn; an NTSC field is 1501.5 ticks. Every
+// timestamp is the exact time of its field rounded down to a whole tick, as
+// mplex does, so that nothing accumulates: a film picture's PTS is 4504 or
+// 4505 ticks after that of a three-field predecessor.
 const (
 	dvdVOBUMaxTicks  = 90_000
 	dvdMuxStartDelay = 27_000
@@ -73,8 +80,8 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 	if title.VideoCodec != VideoCodecMPEG2 || title.AudioCodec != AudioCodecLPCM {
 		return errors.New("video2dvd: VOB muxer requires MPEG-2 video and LPCM audio")
 	}
-	if !validDVDFrameRate(title.FrameRateNumerator, title.FrameRateDenominator) {
-		return fmt.Errorf("video2dvd: unsupported DVD frame rate %d/%d", title.FrameRateNumerator, title.FrameRateDenominator)
+	if err := checkDVDFrameRate(title.FrameRateNumerator, title.FrameRateDenominator); err != nil {
+		return fmt.Errorf("video2dvd: %w", err)
 	}
 	videoPath, err := validateGeneratedFile(title.VideoPath, workDir, "video")
 	if err != nil {
@@ -152,6 +159,9 @@ type dvdMuxPicture struct {
 	offset     int // bytes already sent.
 	frame      int64
 	startsVOBU bool
+	// dts and pts are the picture's timestamps and end the time its display
+	// ends, which is the next picture's pts.
+	dts, pts, end uint64
 }
 
 // dvdMuxBufferedPicture is the part of a picture that has been sent and still
@@ -193,6 +203,10 @@ type dvdVOBMuxer struct {
 	current    *dvdMuxPicture // next picture data to send.
 	following  *dvdMuxPicture
 	framesRead int64
+	// fieldsRead counts the display fields of the pictures read so far and
+	// lastFields those of the latest one.
+	fieldsRead int64
+	lastFields int64
 	payload    []byte
 	// videoBuffer models the decoder's video input buffer.
 	videoBuffer   []dvdMuxBufferedPicture
@@ -309,25 +323,41 @@ func (m *dvdVOBMuxer) writePack(build func(scr uint64) ([]byte, error)) error {
 	return nil
 }
 
-func (m *dvdVOBMuxer) frameTicks(frame int64) uint64 {
-	return dvdVideoFrameTicks(frame, m.title.FrameRateNumerator, m.title.FrameRateDenominator)
+// fieldTime is the time at which display field number field of the VOB
+// starts. The first picture is decoded at field zero and, one frame period
+// later, displayed from field two on.
+func (m *dvdVOBMuxer) fieldTime(field int64) uint64 {
+	return dvdMuxStartDelay + dvdVideoFieldTicks(field, m.title.FrameRateNumerator, m.title.FrameRateDenominator)
 }
 
-// decodeTime and presentationTime give a frame's DTS and PTS. The stream has
-// no B pictures, so every picture is presented one frame period after it is
-// decoded.
-func (m *dvdVOBMuxer) decodeTime(frame int64) uint64 {
-	return dvdMuxStartDelay + m.frameTicks(frame)
+// startTime is the presentation time of the first picture.
+func (m *dvdVOBMuxer) startTime() uint64 {
+	return m.fieldTime(2)
 }
 
-func (m *dvdVOBMuxer) presentationTime(frame int64) uint64 {
-	return dvdMuxStartDelay + m.frameTicks(frame+1)
+// timePicture sets a picture's timestamps from the number of fields it is
+// displayed for. The stream has no B pictures, so a picture is decoded when
+// its predecessor is presented and stays undisplayed for as long as that one
+// is shown: PTS minus DTS is one frame period, or a period and a half behind
+// a picture with repeat_first_field. The first picture waits one frame
+// period.
+func (m *dvdVOBMuxer) timePicture(picture *dvdMuxPicture, fields int64) {
+	const firstField = 2
+	previous := m.lastFields
+	if m.framesRead == 0 {
+		previous = firstField
+	}
+	picture.dts = m.fieldTime(firstField + m.fieldsRead - previous)
+	picture.pts = m.fieldTime(firstField + m.fieldsRead)
+	picture.end = m.fieldTime(firstField + m.fieldsRead + fields)
+	m.fieldsRead += fields
+	m.lastFields = fields
 }
 
 // audioPTS is the presentation time of the next audio packet. An LPCM frame
 // of 80 samples lasts exactly 150 ticks.
 func (m *dvdVOBMuxer) audioPTS() uint64 {
-	return m.presentationTime(0) + uint64(m.audioFrames)*dvdLPCMFrameTicks
+	return m.startTime() + uint64(m.audioFrames)*dvdLPCMFrameTicks
 }
 
 func (m *dvdVOBMuxer) readPicture() (*dvdMuxPicture, error) {
@@ -354,7 +384,12 @@ func (m *dvdVOBMuxer) readPicture() (*dvdMuxPicture, error) {
 	if pictureType == 1 && !mpeg2PictureHasSequenceHeader(data) {
 		return nil, errors.New("video2dvd: each VOBU I picture must include a sequence header")
 	}
+	display, err := mpeg2PictureDisplayOf(data)
+	if err != nil {
+		return nil, fmt.Errorf("video2dvd: MPEG-2 picture %d: %w", m.framesRead, err)
+	}
 	picture := &dvdMuxPicture{data: data, frame: m.framesRead, startsVOBU: pictureType == 1}
+	m.timePicture(picture, int64(display.fields))
 	m.framesRead++
 	return picture, nil
 }
@@ -393,7 +428,7 @@ func (m *dvdVOBMuxer) releaseVideo(now uint64) {
 // videoReadyAt returns the earliest clock value at which the next video pack
 // may be sent: now if it may go immediately.
 func (m *dvdVOBMuxer) videoReadyAt(now uint64) (uint64, error) {
-	dts := m.decodeTime(m.current.frame)
+	dts := m.current.dts
 	if earliest := (dts - min(dts, dvdMuxVideoLead)) * mpegSCRExtensionRange; earliest > now {
 		return earliest, nil
 	}
@@ -420,7 +455,7 @@ func (m *dvdVOBMuxer) writeVideoPack() error {
 	}
 	// Every byte of a picture has to reach the decoder before the picture is
 	// decoded. The first picture in the pack is the earliest one.
-	if m.clock.after(DVDVOBSectorSize) > m.decodeTime(picture.frame)*mpegSCRExtensionRange {
+	if m.clock.after(DVDVOBSectorSize) > picture.dts*mpegSCRExtensionRange {
 		return fmt.Errorf("video2dvd: MPEG-2 video near frame %d exceeds the DVD multiplex rate: it cannot reach the decoder before its decode time (beside LPCM audio the video must stay below about 8.2 Mbit/s)", picture.frame)
 	}
 	header := mpegPESHeader{streamID: dvdVideoStreamID}
@@ -443,8 +478,8 @@ func (m *dvdVOBMuxer) writeVideoPack() error {
 	}
 	if starting != nil {
 		header.hasPTS, header.hasDTS = true, true
-		header.pts = m.presentationTime(starting.frame)
-		header.dts = m.decodeTime(starting.frame)
+		header.pts = starting.pts
+		header.dts = starting.dts
 	}
 	capacity := header.capacity()
 	payload := m.payload[:0]
@@ -452,7 +487,7 @@ func (m *dvdVOBMuxer) writeVideoPack() error {
 		count := min(capacity-len(payload), len(picture.data)-picture.offset)
 		payload = append(payload, picture.data[picture.offset:picture.offset+count]...)
 		picture.offset += count
-		m.bufferVideo(picture.frame, count)
+		m.bufferVideo(picture, count)
 		if picture.offset < len(picture.data) {
 			break
 		}
@@ -483,15 +518,15 @@ func (m *dvdVOBMuxer) writeVideoPack() error {
 	})
 }
 
-func (m *dvdVOBMuxer) bufferVideo(frame int64, count int) {
+func (m *dvdVOBMuxer) bufferVideo(picture *dvdMuxPicture, count int) {
 	m.videoBuffered += count
-	if last := len(m.videoBuffer) - 1; last >= 0 && m.videoBuffer[last].frame == frame {
+	if last := len(m.videoBuffer) - 1; last >= 0 && m.videoBuffer[last].frame == picture.frame {
 		m.videoBuffer[last].bytes += count
 		return
 	}
 	m.videoBuffer = append(m.videoBuffer, dvdMuxBufferedPicture{
-		frame: frame,
-		dts:   m.decodeTime(frame) * mpegSCRExtensionRange,
+		frame: picture.frame,
+		dts:   picture.dts * mpegSCRExtensionRange,
 		bytes: count,
 	})
 }
@@ -504,7 +539,7 @@ func (m *dvdVOBMuxer) finishPicture(picture *dvdMuxPicture) {
 		vobu.ReferenceEnds[vobu.ReferenceCount] = uint32(m.sector) - vobu.StartSector
 		vobu.ReferenceCount++
 	}
-	vobu.EndPTM = uint32(m.presentationTime(picture.frame + 1))
+	vobu.EndPTM = uint32(picture.end)
 	if findMPEGStartCode(picture.data, 0xb7, max(0, len(picture.data)-4)) >= 0 {
 		vobu.SequenceEndPTM = vobu.EndPTM
 	}
@@ -573,7 +608,7 @@ func (m *dvdVOBMuxer) startVOBU(picture *dvdMuxPicture) error {
 		}
 	}
 	index := len(m.vobus)
-	start := m.presentationTime(picture.frame)
+	start := picture.pts
 	if start+dvdVOBUMaxTicks > math.MaxUint32 {
 		return errors.New("video2dvd: title exceeds the DVD navigation timestamp range")
 	}
@@ -586,7 +621,7 @@ func (m *dvdVOBMuxer) startVOBU(picture *dvdMuxPicture) error {
 		ReferenceEnds: [3]uint32{math.MaxUint32, math.MaxUint32, math.MaxUint32},
 		AudioSync:     DVDNAVAudioSyncNone,
 	}
-	elapsed := start - m.presentationTime(0)
+	elapsed := start - m.startTime()
 	if index < len(m.highlights) {
 		if index >= math.MaxUint8 {
 			return errors.New("video2dvd: menu contains more cells than a DVD VOB can address")
@@ -708,15 +743,31 @@ func (m *dvdVOBMuxer) buildNAVPack(index int) ([]byte, error) {
 	return BuildDVDNAVPack(info)
 }
 
+// validDVDFrameRate reports whether a rate is one of the two sequence frame
+// rates of DVD-Video.
 func validDVDFrameRate(numerator, denominator int) bool {
-	return denominator == 1 && numerator == 25 || denominator == 1001 && (numerator == 24000 || numerator == 30000)
+	return denominator == 1 && numerator == 25 || denominator == 1001 && numerator == 30000
 }
 
-// dvdVideoFrameTicks returns the start of a frame in 90 kHz ticks, computed
-// directly from the frame number so that frame periods stay exact (3003 ticks
-// at 30000/1001 and 3600 at 25 frames per second).
-func dvdVideoFrameTicks(frame int64, numerator, denominator int) uint64 {
-	return uint64(frame) * 90_000 * uint64(denominator) / uint64(numerator)
+// checkDVDFrameRate explains why a title's frame rate cannot go on a DVD.
+// Film is no exception: a 24000/1001 sequence (frame_rate_code 1) is not
+// DVD-Video, and its pictures would be timed as if they were.
+func checkDVDFrameRate(numerator, denominator int) error {
+	if validDVDFrameRate(numerator, denominator) {
+		return nil
+	}
+	if numerator == 24000 && denominator == 1001 {
+		return errors.New("frame rate 24000/1001 is not a DVD-Video sequence rate: film is coded as a 30000/1001 stream whose pictures carry repeat_first_field (soft telecine), as NewMPEG2SoftTelecineEncoder writes it")
+	}
+	return fmt.Errorf("unsupported DVD frame rate %d/%d", numerator, denominator)
+}
+
+// dvdVideoFieldTicks returns the start of a display field in 90 kHz ticks,
+// computed directly from the field number and rounded down, so that nothing
+// accumulates: a frame of two fields is exactly 3003 ticks at 30000/1001 and
+// 3600 at 25 frames per second, and a field 1501.5 or 1800.
+func dvdVideoFieldTicks(field int64, numerator, denominator int) uint64 {
+	return uint64(field) * 90_000 * uint64(denominator) / (2 * uint64(numerator))
 }
 
 func dvdCellElapsedTime(elapsed time.Duration, numerator, denominator int) ([4]byte, error) {

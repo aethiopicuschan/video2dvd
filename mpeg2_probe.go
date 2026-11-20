@@ -141,6 +141,73 @@ func parseMPEG2VideoHeaders(data []byte) (MPEG2VideoInfo, error) {
 	}, nil
 }
 
+// mpeg2PictureDisplay is what a picture's coding extension says about its
+// display: the number of fields it is shown for, and the flags behind that.
+type mpeg2PictureDisplay struct {
+	fields           int
+	topFieldFirst    bool
+	repeatFirstField bool
+	progressiveFrame bool
+}
+
+// mpeg2PictureDisplayOf reads the picture_coding_extension of the first
+// picture in data, which may start with sequence and GOP headers. A picture
+// is shown for two fields, and a frame picture with repeat_first_field for
+// three: DVD-Video sequences are never progressive, so the flag repeats a
+// field, not the frame, and is allowed on progressive frames only
+// (H.262 6.3.10). A picture without the extension counts as two fields.
+func mpeg2PictureDisplayOf(data []byte) (mpeg2PictureDisplay, error) {
+	display := mpeg2PictureDisplay{fields: 2}
+	position := findMPEGStartCode(data, 0x00, 0)
+	if position < 0 {
+		return display, errors.New("video2dvd: MPEG-2 picture start code not found")
+	}
+	for position += 4; position+4 <= len(data); position++ {
+		if data[position] != 0 || data[position+1] != 0 || data[position+2] != 1 {
+			continue
+		}
+		code := data[position+3]
+		if code >= 0x01 && code <= 0xaf {
+			break // The first slice: no extension follows it.
+		}
+		if code != 0xb5 || position+4 >= len(data) || data[position+4]>>4 != 8 {
+			continue
+		}
+		bits := bitReader{data: data[position+4:]}
+		// extension id, four f_codes and intra_dc_precision.
+		if _, err := bits.read(4 + 16 + 2); err != nil {
+			return display, err
+		}
+		var flags [9]uint32
+		for i, width := range [...]int{2, 1, 1, 1, 1, 1, 1, 1, 1} {
+			value, err := bits.read(width)
+			if err != nil {
+				return display, err
+			}
+			flags[i] = value
+		}
+		// picture_structure, top_field_first, frame_pred_frame_dct,
+		// concealment_motion_vectors, q_scale_type, intra_vlc_format,
+		// alternate_scan, repeat_first_field, chroma_420_type.
+		progressive, err := bits.read(1)
+		if err != nil {
+			return display, err
+		}
+		const framePicture = 3
+		display.topFieldFirst = flags[1] == 1
+		display.repeatFirstField = flags[7] == 1
+		display.progressiveFrame = progressive == 1
+		if display.repeatFirstField {
+			if flags[0] != framePicture || !display.progressiveFrame {
+				return display, errors.New("video2dvd: repeat_first_field is set on a picture that is not a progressive frame")
+			}
+			display.fields = 3
+		}
+		return display, nil
+	}
+	return display, nil
+}
+
 func findMPEGStartCode(data []byte, code byte, start int) int {
 	for i := start; i+4 <= len(data); i++ {
 		if data[i] == 0 && data[i+1] == 0 && data[i+2] == 1 && data[i+3] == code {
@@ -200,4 +267,36 @@ func reduceRatio(numerator, denominator int) (int, int) {
 		return numerator, denominator
 	}
 	return numerator / a, denominator / a
+}
+
+// setMPEG2RepeatFirstField rewrites repeat_first_field in the
+// picture_coding_extension of the first picture in data.
+func setMPEG2RepeatFirstField(data []byte, repeat bool) error {
+	position := findMPEGStartCode(data, 0x00, 0)
+	if position < 0 {
+		return errors.New("video2dvd: MPEG-2 picture start code not found")
+	}
+	for position += 4; position+8 <= len(data); position++ {
+		if data[position] != 0 || data[position+1] != 0 || data[position+2] != 1 {
+			continue
+		}
+		code := data[position+3]
+		if code >= 0x01 && code <= 0xaf {
+			break
+		}
+		if code != 0xb5 || data[position+4]>>4 != 8 {
+			continue
+		}
+		// The flags follow the extension id, four f_codes,
+		// intra_dc_precision and picture_structure, 24 bits: top_field_first
+		// first, repeat_first_field seventh.
+		const repeatFirstField = 0x02
+		if repeat {
+			data[position+7] |= repeatFirstField
+		} else {
+			data[position+7] &^= repeatFirstField
+		}
+		return nil
+	}
+	return errors.New("video2dvd: MPEG-2 picture has no coding extension")
 }

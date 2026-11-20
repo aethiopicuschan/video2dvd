@@ -30,6 +30,20 @@ func PrepareMP4VideoForDVD(
 	if err != nil {
 		return err
 	}
+	return prepareMP4VideoForDVD(ctx, path, trackIndex, profile, sourceAspectNumerator, sourceAspectDenominator, mode, rateConverter)
+}
+
+// prepareMP4VideoForDVD feeds the fitted frames of an MP4 track to
+// rateConverter and finishes it.
+func prepareMP4VideoForDVD(
+	ctx context.Context,
+	path string,
+	trackIndex *int,
+	profile Profile,
+	sourceAspectNumerator, sourceAspectDenominator int,
+	mode FitMode,
+	rateConverter *DVDFrameRateConverter,
+) error {
 	if info, probeErr := ProbeMP4(path); probeErr == nil {
 		if track, selectErr := selectVideoTrack(info, trackIndex); selectErr == nil && track.edit.present {
 			// Movie time zero is the edit's media time, delayed by any
@@ -38,7 +52,7 @@ func PrepareMP4VideoForDVD(
 			rateConverter.setOrigin(track.edit.mediaTime - track.edit.empty)
 		}
 	}
-	err = DecodeMP4Video(ctx, path, trackIndex, func(frame DecodedVideoFrame) error {
+	err := DecodeMP4Video(ctx, path, trackIndex, func(frame DecodedVideoFrame) error {
 		fitted, err := FitVideoFrameForDVD(frame, profile, sourceAspectNumerator, sourceAspectDenominator, mode)
 		if err != nil {
 			return err

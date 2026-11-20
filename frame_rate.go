@@ -2,6 +2,7 @@ package video2dvd
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"time"
 )
@@ -10,6 +11,9 @@ import (
 // output rate: 30000/1001 fps for NTSC and 25 fps for PAL. It holds the most
 // recent source frame and repeats or drops frames as needed. Input PTS values
 // must be in presentation order and each frame must carry a positive Duration.
+//
+// A converter made by NewDVDFilmFrameRateConverter has the film rate of
+// 24000/1001 fps as its output rate instead.
 type DVDFrameRateConverter struct {
 	rateNumerator   int64
 	rateDenominator int64
@@ -27,6 +31,20 @@ type DVDFrameRateConverter struct {
 	fixedOrigin bool
 	finished    bool
 }
+
+const (
+	// dvdFilmMinFrames is the least number of frames a track must have to
+	// be taken for film.
+	dvdFilmMinFrames = 8
+	// dvdFilmIntervalSlack is how far the distance between two frames may
+	// be from a film period, 41.667 to 41.708 ms, and still count as one.
+	// Timestamps rounded to milliseconds give 41 and 42 ms; 25 frames per
+	// second, the nearest other rate, gives 40.
+	dvdFilmIntervalSlack = 1050 * time.Microsecond
+	// dvdFilmMeanSlack is how far the mean of those distances may be from a
+	// film period, on top of what timestamp rounding accounts for.
+	dvdFilmMeanSlack = 50 * time.Microsecond
+)
 
 // NewDVDFrameRateConverter creates a streaming DVD frame-rate converter.
 func NewDVDFrameRateConverter(profile Profile, handler func(DecodedVideoFrame) error) (*DVDFrameRateConverter, error) {
@@ -49,6 +67,95 @@ func NewDVDFrameRateConverter(profile Profile, handler func(DecodedVideoFrame) e
 		return nil, ErrInvalidProfile
 	}
 	return converter, nil
+}
+
+// NewDVDFilmFrameRateConverter creates a streaming converter to the film rate
+// of an NTSC DVD, 24000/1001 fps, whose output NewMPEG2SoftTelecineEncoder
+// codes. A source at that rate passes through frame for frame. One at exactly
+// 24 fps keeps its timing too, so that audio stays in sync without being
+// resampled: about every 1001st frame (41.7 s) is dropped instead, the first
+// after 21 s, which keeps the picture within half a film period (21 ms) of
+// its time. Any other cadence is followed by showing, at each output
+// timestamp, the source frame nearest to it.
+func NewDVDFilmFrameRateConverter(profile Profile, handler func(DecodedVideoFrame) error) (*DVDFrameRateConverter, error) {
+	if profile.Standard != VideoStandardNTSC {
+		return nil, fmt.Errorf("%w: the film frame rate applies to NTSC only", ErrInvalidProfile)
+	}
+	converter, err := NewDVDFrameRateConverter(profile, handler)
+	if err != nil {
+		return nil, err
+	}
+	converter.rateNumerator, converter.rateDenominator = 24000, 1001
+	return converter, nil
+}
+
+// newDVDTitleFrameRateConverter creates the converter of a title, whose
+// video track shows its frames at the container times given, in presentation
+// order: the film-rate converter for an NTSC title with soft telecine allowed
+// and a film track (see isFilmCadence), and the video-rate converter
+// otherwise. It reports whether it chose film.
+func newDVDTitleFrameRateConverter(profile Profile, times []time.Duration, handler func(DecodedVideoFrame) error) (*DVDFrameRateConverter, bool, error) {
+	if profile.Standard == VideoStandardNTSC && !profile.DisableSoftTelecine && isFilmCadence(times) {
+		converter, err := NewDVDFilmFrameRateConverter(profile, handler)
+		return converter, err == nil, err
+	}
+	converter, err := NewDVDFrameRateConverter(profile, handler)
+	return converter, false, err
+}
+
+// isFilmCadence reports whether a track whose frames start at the given
+// times, in presentation order, runs at 24000/1001 or 24 frames per second.
+// The whole track decides, not its beginning: a film title codes at most
+// 23.976 pictures per second, so a part of the track at a higher rate would
+// lose frames that the video rate shows. A track is therefore film when
+//
+//   - its frames never come faster than 24 a second, by more than a quarter
+//     of a period that a frame may be early, and
+//   - at least nine in ten follow the one before after one film period, and
+//     those run at a film rate on average.
+//
+// A frame that stays longer, such as a held first frame, a gap, or a passage
+// at a lower rate, does not stand in the way: it is shown for as long on the
+// film grid as on the video one. Which of the two film rates it is does not
+// matter either, since the converter follows the timestamps.
+func isFilmCadence(times []time.Duration) bool {
+	if len(times) < dvdFilmMinFrames {
+		return false
+	}
+	const shortest, longest = time.Second / 24, time.Second * 1001 / 24000
+	var film, runs int64
+	var filmTime, ahead time.Duration
+	inRun := false
+	for index := 1; index < len(times); index++ {
+		interval, err := subtractDurations(times[index], times[index-1])
+		if err != nil {
+			return false
+		}
+		// ahead is how much sooner this frame comes than 24 a second from
+		// the latest of the frames before it would have it.
+		if interval >= shortest+ahead {
+			ahead = 0
+		} else if ahead += shortest - interval; ahead > shortest/4 {
+			return false
+		}
+		if interval < shortest-dvdFilmIntervalSlack || interval > longest+dvdFilmIntervalSlack {
+			inRun = false
+			continue
+		}
+		if !inRun {
+			inRun = true
+			runs++
+		}
+		film++
+		filmTime += interval
+	}
+	if film*10 < int64(len(times)-1)*9 {
+		return false
+	}
+	// Each run of film intervals is the distance between two timestamps,
+	// which container ticks of a millisecond may have moved by one in all.
+	slack := time.Duration(film)*dvdFilmMeanSlack + time.Duration(runs)*time.Millisecond
+	return filmTime >= time.Duration(film)*shortest-slack && filmTime <= time.Duration(film)*longest+slack
 }
 
 // setOrigin makes source time origin the first output timestamp instead of
@@ -159,8 +266,8 @@ func subtractDurations(left, right time.Duration) (time.Duration, error) {
 // threshold. Callers pass the next frame's start (or the last frame's end)
 // less tolerance: source timestamps are rounded to container ticks, so a
 // frame that starts within a quarter of an output period after an output
-// timestamp is the one meant for it; otherwise equal cadences would repeat
-// and drop frames.
+// timestamp (see tolerance for the film rate) is the one meant for it;
+// otherwise equal cadences would repeat and drop frames.
 func (c *DVDFrameRateConverter) emitBefore(threshold time.Duration) error {
 	for c.pending != nil {
 		pts, err := c.outputTimestamp(c.nextIndex)
@@ -189,8 +296,26 @@ func (c *DVDFrameRateConverter) period() time.Duration {
 	return time.Duration(c.rateDenominator) * time.Second / time.Duration(c.rateNumerator)
 }
 
+// tolerance is how long after an output timestamp a frame may start and
+// still be the one shown at it.
 func (c *DVDFrameRateConverter) tolerance() time.Duration {
+	if c.film() {
+		// Film shows, at each timestamp, the source frame nearest to it: half
+		// a period, and the margin of steadyThreshold on top, which makes it
+		// let go of a frame that late. A source at exactly 24 frames per
+		// second falls behind the film grid by a period every 41.7 s; this
+		// way the frame left out then is the one at which the picture is half
+		// a period late, so that the picture is never further from its time
+		// than that, early or late. The quarter period of the video rate
+		// would only drop a frame once the picture is 34 ms late.
+		return c.period()*9/16 + 1
+	}
 	return c.period() / 4
+}
+
+// film reports whether the output rate is the film rate.
+func (c *DVDFrameRateConverter) film() bool {
+	return c.rateNumerator == 24000 && c.rateDenominator == 1001
 }
 
 // steadyThreshold adds hysteresis to the decision whether an input frame

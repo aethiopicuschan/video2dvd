@@ -12,7 +12,7 @@ type TestDVDVOBUSearchInfo = dvdVOBUSearchInfo
 
 var (
 	ExportDVDVOBUSearchInfo  = buildDVDVOBUSearchInfo
-	ExportDVDVideoFrameTicks = dvdVideoFrameTicks
+	ExportDVDVideoFieldTicks = dvdVideoFieldTicks
 )
 
 func ExportMuxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.Writer, record func(TestDVDVOBURecord) error, buttonPages [][]DVDNAVButton) error {
