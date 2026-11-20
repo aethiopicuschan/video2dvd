@@ -67,6 +67,11 @@ type Options struct {
 	MenuBackgroundLuma uint8
 	MenuTextLuma       uint8
 	VideoBitrate       int
+	// VolumeID is the volume name of an ISO image, as shown when the disc is
+	// mounted. It may contain up to 32 ASCII letters, digits, underscores,
+	// and spaces; letters are stored in upper case. Empty selects VIDEO2DVD.
+	// It has no effect on directory output.
+	VolumeID string
 }
 
 func (o Options) profile() (Profile, error) {
@@ -349,6 +354,10 @@ func (c *Converter) ConvertSourcesISO(ctx context.Context, inputs []MediaInput, 
 	if err != nil {
 		return err
 	}
+	// Reject a bad volume name now rather than after every input is encoded.
+	if _, _, err := normalizeDVDImageOptions(DVDImageOptions{VolumeID: options.VolumeID, DiscCapacityBytes: profile.DiscCapacityBytes}); err != nil {
+		return err
+	}
 	outputISO, err = filepath.Abs(outputISO)
 	if err != nil {
 		return fmt.Errorf("video2dvd: resolve image path: %w", err)
@@ -377,7 +386,7 @@ func (c *Converter) ConvertSourcesISO(ctx context.Context, inputs []MediaInput, 
 		return err
 	}
 	stagedISO := filepath.Join(stageRoot, "disc.iso")
-	if err := WriteDVDISOWithOptions(ctx, filepath.Join(discDir, "VIDEO_TS"), stagedISO, DVDImageOptions{DiscCapacityBytes: profile.DiscCapacityBytes}); err != nil {
+	if err := WriteDVDISOWithOptions(ctx, filepath.Join(discDir, "VIDEO_TS"), stagedISO, DVDImageOptions{VolumeID: options.VolumeID, DiscCapacityBytes: profile.DiscCapacityBytes}); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -371,5 +372,36 @@ func TestTitleVOBWriterSplitsAtFileLimit(t *testing.T) {
 	}
 	if _, err := ExportWriteSplitTitleVOB(t.TempDir(), "VTS_01", DVDVOBSectorSize, append(full, 0), len(full)+1); err == nil {
 		t.Fatal("expected a title that needs a tenth VOB file to fail")
+	}
+}
+
+type unusedEncoder struct{ called bool }
+
+func (e *unusedEncoder) Encode(context.Context, string, string, Profile) (EncodedTitle, error) {
+	e.called = true
+	return EncodedTitle{}, errors.New("encoder must not run")
+}
+
+type unusedAuthorer struct{}
+
+func (unusedAuthorer) Author(context.Context, []EncodedTitle, string, Profile) error {
+	return errors.New("authorer must not run")
+}
+
+func TestConvertISORejectsInvalidVolumeIDBeforeEncoding(t *testing.T) {
+	encoder := &unusedEncoder{}
+	converter, err := New(encoder, unusedAuthorer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	output := filepath.Join(t.TempDir(), "disc.iso")
+	for _, volumeID := range []string{"日本語", "BAD/NAME", strings.Repeat("A", 33)} {
+		err := converter.ConvertISO(context.Background(), []string{"input.mp4"}, output, Options{VolumeID: volumeID})
+		if err == nil || !strings.Contains(err.Error(), "volume identifier") {
+			t.Fatalf("VolumeID %q: error = %v, want a volume identifier error", volumeID, err)
+		}
+	}
+	if encoder.called {
+		t.Fatal("encoder ran before the volume identifier was validated")
 	}
 }
