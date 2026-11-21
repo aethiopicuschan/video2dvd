@@ -125,3 +125,16 @@ func ExportTitleLengthFromFrames(frames int64, fpsN, fpsD int) (time.Duration, i
 var (
 	ExportValidateInputAudioChannels = validateInputAudioChannels
 )
+
+// ExportDecodePCMWithFallback is DecodeMP4Audio's decoder switch with both
+// decoders supplied by the test.
+func ExportDecodePCMWithFallback(primary, fallback func(func(PCMChunk) error) error, handler func(PCMChunk) error) error {
+	return decodePCMWithFallback(primary, fallback, handler)
+}
+
+// ExportDecodeMP4AudioPrimary and ExportDecodeMP4AACFallback run one of
+// DecodeMP4Audio's two decoders alone.
+var (
+	ExportDecodeMP4AudioPrimary = decodeMP4AudioPrimary
+	ExportDecodeMP4AACFallback  = decodeMP4AACFallback
+)

@@ -154,6 +154,13 @@ func DecodeMP4Video(ctx context.Context, path string, trackIndex *int, handler f
 // track. Chunks are contiguous and start at movie time zero: a leading empty
 // edit becomes silence and the first media edit's start and length are applied
 // rounded to whole samples. Later edits are not applied.
+//
+// If the primary decoder rejects an AAC access unit because of non-zero
+// byte-alignment padding, the AAC-LC fallback decoder finishes the track. When
+// that happens after chunks were already delivered, the fallback's output is
+// placed on the same timeline and only the part after the last delivered frame
+// is passed on, so the handler sees one contiguous stream without repeated or
+// missing audio and never has to discard what it received.
 func DecodeMP4Audio(ctx context.Context, path string, trackIndex *int, handler func(PCMChunk) error) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -172,15 +179,91 @@ func DecodeMP4Audio(ctx context.Context, path string, trackIndex *int, handler f
 			return err
 		}
 	}
-	var delivered bool
-	err = decodeMP4AudioPrimary(ctx, path, trackIndex, func(chunk PCMChunk) error {
-		delivered = true
-		return handler(chunk)
-	})
-	if err == nil || delivered || !strings.Contains(err.Error(), "non-zero alignment padding") {
-		return err
+	return decodePCMWithFallback(
+		func(handler func(PCMChunk) error) error {
+			return decodeMP4AudioPrimary(ctx, path, trackIndex, handler)
+		},
+		func(handler func(PCMChunk) error) error {
+			return decodeMP4AACFallback(ctx, path, trackIndex, handler)
+		},
+		handler,
+	)
+}
+
+// pcmDecodeFunc decodes one whole track, from movie time zero, into contiguous
+// 48 kHz stereo chunks.
+type pcmDecodeFunc func(handler func(PCMChunk) error) error
+
+// decodePCMWithFallback runs primary and, only if it fails with the
+// alignment-padding rejection, completes the stream with fallback. Both
+// decoders must place audio identically on the output timeline: fallback
+// decodes from the start again and the frames primary already delivered are
+// dropped from its output, so nothing reaches handler twice. An error returned
+// by handler is returned unchanged and never starts the fallback.
+func decodePCMWithFallback(primary, fallback pcmDecodeFunc, handler func(PCMChunk) error) error {
+	var delivered int64
+	var handlerErr error
+	forward := func(chunk PCMChunk) error {
+		if err := handler(chunk); err != nil {
+			handlerErr = err
+			return err
+		}
+		delivered += int64(len(chunk.Samples) / 2)
+		return nil
 	}
-	return decodeMP4AACFallback(ctx, path, trackIndex, handler)
+	primaryErr := primary(forward)
+	if handlerErr != nil {
+		return handlerErr
+	}
+	if !isAACAlignmentPaddingError(primaryErr) {
+		return primaryErr
+	}
+	resumed := &resumedPCMWriter{handler: forward, skip: delivered, position: delivered}
+	fallbackErr := fallback(resumed.WriteChunk)
+	if handlerErr != nil {
+		return handlerErr
+	}
+	if fallbackErr == nil && resumed.skip > 0 {
+		fallbackErr = fmt.Errorf("video2dvd: AAC fallback ended %d frames before the %d frames the primary decoder had delivered", resumed.skip, resumed.position)
+	}
+	switch {
+	case fallbackErr == nil:
+		return nil
+	case errors.Is(fallbackErr, context.Canceled), errors.Is(fallbackErr, context.DeadlineExceeded):
+		return fallbackErr
+	}
+	return fmt.Errorf("video2dvd: AAC fallback decoder failed: %w (it was started because the primary decoder failed: %w)", fallbackErr, primaryErr)
+}
+
+// isAACAlignmentPaddingError reports whether err is the primary decoder's
+// rejection of non-zero byte-alignment padding at the end of an AAC access
+// unit. go-264 has no dedicated sentinel for it, so its malformed-stream
+// sentinel and the message are both required.
+func isAACAlignmentPaddingError(err error) bool {
+	return err != nil && errors.Is(err, pcm.ErrMalformed) && strings.Contains(err.Error(), "non-zero alignment padding")
+}
+
+// resumedPCMWriter forwards a stream that restarts from frame zero, minus the
+// leading frames an earlier decoder already delivered. The remaining chunks
+// continue the earlier decoder's 48 kHz timeline.
+type resumedPCMWriter struct {
+	handler  func(PCMChunk) error
+	skip     int64 // already delivered frames still to drop
+	position int64 // timeline frame of the next forwarded sample
+}
+
+func (w *resumedPCMWriter) WriteChunk(chunk PCMChunk) error {
+	if w.skip > 0 {
+		drop := min(w.skip, int64(len(chunk.Samples)/2))
+		chunk.Samples = chunk.Samples[drop*2:]
+		w.skip -= drop
+	}
+	if len(chunk.Samples) == 0 {
+		return nil
+	}
+	chunk.Start = time.Duration(w.position) * time.Second / time.Duration(dvdLPCMSampleRate)
+	w.position += int64(len(chunk.Samples) / 2)
+	return w.handler(chunk)
 }
 
 func decodeMP4AudioPrimary(ctx context.Context, path string, trackIndex *int, handler func(PCMChunk) error) error {
