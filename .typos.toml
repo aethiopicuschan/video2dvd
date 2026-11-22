@@ -1,6 +1,10 @@
 [default.extend-words]
 trak = "trak"
+# The MP4 timed-text style box, and the ISO 639-2/B code of French.
+styl = "styl"
+fre = "fre"
 
 [files]
-# Generated binary font table (see gen/menufont).
-extend-exclude = ["dvd_menu_font_shinonome16.bin"]
+# Generated binary font table (see gen/menufont), and the table of
+# ISO 639 language codes.
+extend-exclude = ["dvd_menu_font_shinonome16.bin", "language_code.go"]

@@ -67,7 +67,7 @@ func webMVideoFrameTimes(path string, trackIndex *int) ([]time.Duration, error) 
 		return nil, fmt.Errorf("video2dvd: open WebM: %w", err)
 	}
 	defer f.Close()
-	demuxer, err := webm.NewDemuxer(f, webm.DemuxerOptions{MaxLacePayload: maxWebMPacketBytes})
+	demuxer, err := openWebMDemuxer(f)
 	if err != nil {
 		return nil, fmt.Errorf("video2dvd: parse WebM: %w", err)
 	}

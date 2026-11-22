@@ -1,23 +1,31 @@
 package video2dvd
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 var ErrInvalidMP4 = errors.New("video2dvd: invalid or unsupported MP4 container")
 
-// TrackKind identifies the media carried by an MP4 track.
+// TrackKind identifies the media carried by an MP4 or WebM track.
 type TrackKind string
 
 const (
 	TrackKindVideo TrackKind = "video"
 	TrackKindAudio TrackKind = "audio"
-	TrackKindOther TrackKind = "other"
+	// TrackKindSubtitle is a subtitle track: an MP4 track with a subtitle or
+	// timed-text handler ("sbtl", "subt", "text") that no other track uses
+	// for its chapter names, or a WebM subtitle track. Codec tells whether
+	// the converter can read it; see SupportedSubtitleCodec.
+	TrackKindSubtitle TrackKind = "subtitle"
+	TrackKindOther    TrackKind = "other"
 )
 
 // TrackInfo contains container-level metadata. Codec is the MP4 sample-entry
@@ -27,6 +35,12 @@ const (
 // Color is the colour encoding a video track is tagged with: for MP4 the
 // H.264 VUI of the first SPS or else the colr box, for WebM the Colour
 // element. Untagged tracks report ColorMatrixUnspecified.
+//
+// Language is the language the container states for the track: the BCP 47
+// tag of an MP4 elng box or of a WebM LanguageBCP47 element if there is one,
+// else the ISO 639-2 code of the MP4 media header or of the WebM Language
+// element ("und" when it is undetermined). Name is the MP4 handler name or
+// the WebM track name; it may be empty.
 type TrackInfo struct {
 	Index                 int
 	Kind                  TrackKind
@@ -43,8 +57,12 @@ type TrackInfo struct {
 	DefaultDuration       time.Duration
 	TimeScale             uint32
 	Color                 VideoColor
+	Language              string
+	Name                  string
 
 	edit mp4EditList
+	// trackID is the track_ID of an MP4 track header.
+	trackID uint32
 }
 
 // mp4EditList is the part of a track's edit list the converter honours: an
@@ -147,7 +165,57 @@ func ProbeMP4Reader(r io.ReaderAt, size int64) (MP4Info, error) {
 	for i := range info.Tracks {
 		info.Tracks[i].edit.resolve(movieTimeScale, info.Tracks[i].TimeScale)
 	}
+	// A text track that another track names in a "chap" reference holds
+	// chapter titles, as QuickTime writes them, not subtitles.
+	for _, child := range children {
+		if child.kind != "trak" {
+			continue
+		}
+		chapters, err := mp4ChapterReferences(r, child)
+		if err != nil {
+			return MP4Info{}, fmt.Errorf("%w: invalid tref box: %v", ErrInvalidMP4, err)
+		}
+		for _, id := range chapters {
+			for i := range info.Tracks {
+				if info.Tracks[i].trackID == id && info.Tracks[i].Kind == TrackKindSubtitle {
+					info.Tracks[i].Kind = TrackKindOther
+				}
+			}
+		}
+	}
 	return info, nil
+}
+
+// mp4ChapterReferences returns the track IDs of the "chap" references of a
+// trak box.
+func mp4ChapterReferences(r io.ReaderAt, trak mp4Box) ([]uint32, error) {
+	children, err := readMP4Boxes(r, trak.data, trak.end)
+	if err != nil {
+		return nil, err
+	}
+	var ids []uint32
+	for _, child := range children {
+		if child.kind != "tref" {
+			continue
+		}
+		references, err := readMP4Boxes(r, child.data, child.end)
+		if err != nil {
+			return nil, err
+		}
+		for _, reference := range references {
+			if reference.kind != "chap" {
+				continue
+			}
+			data, err := readBoxPayload(r, reference, 1<<16)
+			if err != nil {
+				return nil, err
+			}
+			for offset := 0; offset+4 <= len(data); offset += 4 {
+				ids = append(ids, binary.BigEndian.Uint32(data[offset:]))
+			}
+		}
+	}
+	return ids, nil
 }
 
 func (e *mp4EditList) resolve(movieTimeScale, mediaTimeScale uint32) {
@@ -298,8 +366,19 @@ func parseTrack(r io.ReaderAt, box mp4Box) (TrackInfo, error) {
 	}
 	var mdia *mp4Box
 	var edit mp4EditList
+	var trackID uint32
 	for i := range children {
 		switch children[i].kind {
+		case "tkhd":
+			// A track ID is only needed to recognise chapter tracks, so a
+			// short header is not an error.
+			if data, err := readBoxPrefix(r, children[i], 24); err == nil {
+				offset := 12
+				if data[0] == 1 {
+					offset = 20
+				}
+				trackID = binary.BigEndian.Uint32(data[offset : offset+4])
+			}
 		case "mdia":
 			if mdia == nil {
 				mdia = &children[i]
@@ -317,7 +396,7 @@ func parseTrack(r io.ReaderAt, box mp4Box) (TrackInfo, error) {
 	if err != nil {
 		return TrackInfo{}, err
 	}
-	var handler string
+	var handler, handlerName, language, languageTag string
 	var duration time.Duration
 	var timeScale uint32
 	var minf *mp4Box
@@ -325,7 +404,7 @@ func parseTrack(r io.ReaderAt, box mp4Box) (TrackInfo, error) {
 		child := mdiaChildren[i]
 		switch child.kind {
 		case "hdlr":
-			handler, err = parseHandler(r, child)
+			handler, handlerName, err = parseHandler(r, child)
 			if err != nil {
 				return TrackInfo{}, err
 			}
@@ -334,6 +413,9 @@ func parseTrack(r io.ReaderAt, box mp4Box) (TrackInfo, error) {
 			if err != nil {
 				return TrackInfo{}, err
 			}
+			language = parseMediaLanguage(r, child)
+		case "elng":
+			languageTag = parseExtendedLanguage(r, child)
 		case "minf":
 			minf = &mdiaChildren[i]
 		}
@@ -341,12 +423,17 @@ func parseTrack(r io.ReaderAt, box mp4Box) (TrackInfo, error) {
 	if handler == "" {
 		return TrackInfo{}, errors.New("track has no handler type")
 	}
-	track := TrackInfo{Duration: duration, TimeScale: timeScale, edit: edit}
+	track := TrackInfo{Duration: duration, TimeScale: timeScale, edit: edit, trackID: trackID, Language: language, Name: handlerName}
+	if languageTag != "" {
+		track.Language = languageTag
+	}
 	switch handler {
 	case "vide":
 		track.Kind = TrackKindVideo
 	case "soun":
 		track.Kind = TrackKindAudio
+	case "sbtl", "subt", "text":
+		track.Kind = TrackKindSubtitle
 	default:
 		track.Kind = TrackKindOther
 	}
@@ -377,12 +464,76 @@ func parseTrack(r io.ReaderAt, box mp4Box) (TrackInfo, error) {
 	return track, nil
 }
 
-func parseHandler(r io.ReaderAt, box mp4Box) (string, error) {
+// parseHandler returns the handler type of an hdlr box and its name. The
+// name is a null-terminated UTF-8 string in ISO files and a counted string
+// in QuickTime files.
+func parseHandler(r io.ReaderAt, box mp4Box) (string, string, error) {
 	data, err := readBoxPrefix(r, box, 12)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return string(data[8:12]), nil
+	handler := string(data[8:12])
+	const nameOffset = 24
+	if box.end-box.data <= nameOffset || box.end-box.data > 1<<12 {
+		return handler, "", nil
+	}
+	full, err := readBoxPayload(r, box, 1<<12)
+	if err != nil {
+		return handler, "", nil
+	}
+	name := full[nameOffset:]
+	if len(name) > 0 && int(name[0]) == len(name)-1 && bytes.IndexByte(name[1:], 0) < 0 {
+		name = name[1:]
+	}
+	if end := bytes.IndexByte(name, 0); end >= 0 {
+		name = name[:end]
+	}
+	if !utf8.Valid(name) {
+		return handler, "", nil
+	}
+	return handler, strings.TrimSpace(string(name)), nil
+}
+
+// parseMediaLanguage returns the ISO 639-2/T code of an mdhd box, which
+// packs three letters into five bits each. QuickTime language codes, which
+// are numbers below 0x400, are not returned.
+func parseMediaLanguage(r io.ReaderAt, box mp4Box) string {
+	versionData, err := readBoxPrefix(r, box, 4)
+	if err != nil {
+		return ""
+	}
+	offset := 20
+	if versionData[0] == 1 {
+		offset = 32
+	}
+	data, err := readBoxPrefix(r, box, offset+2)
+	if err != nil {
+		return ""
+	}
+	packed := binary.BigEndian.Uint16(data[offset:])
+	if packed < 0x400 {
+		return ""
+	}
+	code := []byte{byte(packed>>10&0x1f) + 0x60, byte(packed>>5&0x1f) + 0x60, byte(packed&0x1f) + 0x60}
+	for _, letter := range code {
+		if letter < 'a' || letter > 'z' {
+			return ""
+		}
+	}
+	return string(code)
+}
+
+// parseExtendedLanguage returns the BCP 47 tag of an elng box.
+func parseExtendedLanguage(r io.ReaderAt, box mp4Box) string {
+	data, err := readBoxPayload(r, box, 256)
+	if err != nil || len(data) < 5 {
+		return ""
+	}
+	tag := data[4:]
+	if end := bytes.IndexByte(tag, 0); end >= 0 {
+		tag = tag[:end]
+	}
+	return strings.TrimSpace(string(tag))
 }
 
 func parseMediaDuration(r io.ReaderAt, box mp4Box) (time.Duration, uint32, error) {

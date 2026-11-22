@@ -23,6 +23,11 @@ import (
 // An NTSC title whose video track runs at 24000/1001 or 24 frames per second
 // throughout is coded as film with 3:2 pulldown flags (soft telecine, see
 // NewMPEG2SoftTelecineEncoder) unless Profile.DisableSoftTelecine is set.
+//
+// The text subtitle tracks that MediaInput.SubtitleTracks selects are read
+// before any video is encoded and written as subtitle streams with
+// WriteDVDSubtitleStream, on the title timeline: a cue keeps its distance
+// from the first video frame of its file.
 type InProcessEncoder struct{}
 
 // NewInProcessEncoder returns the built-in Encoder implementation.
@@ -65,6 +70,17 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 	if err := validateEncoderProfile(profile); err != nil {
 		return EncodedTitle{}, err
 	}
+	// Subtitles are read and drawn before any video is encoded, so that a
+	// track that cannot be read fails the title early and their size counts
+	// towards the estimate below.
+	subtitleTracks, err := selectInputSubtitleTracks(info, input.SubtitleTracks, false)
+	if err != nil {
+		return EncodedTitle{}, fmt.Errorf("video2dvd: prepare DVD subtitles: %w", err)
+	}
+	subtitles, subtitleSectors, err := readInputSubtitles(input.VideoPath, info, subtitleTracks, profile)
+	if err != nil {
+		return EncodedTitle{}, fmt.Errorf("video2dvd: prepare DVD subtitles: %w", err)
+	}
 	// The container duration only feeds the up-front capacity estimate; live
 	// WebM has none, and the title length comes from the frames encoded below.
 	estimatedDuration := info.Duration
@@ -72,7 +88,7 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		estimatedDuration = videoTrack.Duration
 	}
 	if estimatedDuration > 0 {
-		if err := checkEstimatedTitleSize(estimatedDuration, encoderOutputLimit(profile), effectiveMPEG2VideoBitrate(profile)); err != nil {
+		if err := checkEstimatedTitleSize(estimatedDuration, encoderOutputLimit(profile)-subtitleSectors*DVDVOBSectorSize, effectiveMPEG2VideoBitrate(profile)); err != nil {
 			return EncodedTitle{}, err
 		}
 	}
@@ -98,6 +114,7 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 	videoPath := filepath.Join(workDir, "video.m2v")
 	audioPath := filepath.Join(workDir, "audio.lpcm")
 	videoCreated, audioCreated := false, false
+	var subtitlePaths []string
 	cleanup := true
 	defer func() {
 		if cleanup {
@@ -106,6 +123,9 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 			}
 			if audioCreated {
 				_ = os.Remove(audioPath)
+			}
+			for _, path := range subtitlePaths {
+				_ = os.Remove(path)
 			}
 		}
 	}()
@@ -152,8 +172,10 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 	}
 	var prepareErr error
 	// audioOffset places the audio on the title timeline, whose zero is the
-	// first encoded video frame.
+	// first encoded video frame. subtitleOffset does the same for the
+	// subtitles, which share the timeline of the video file.
 	audioOffset := input.AudioOffset
+	var subtitleOffset time.Duration
 	if webMVideo {
 		var videoStart time.Duration
 		videoStart, prepareErr = prepareWebMVideoForDVD(ctx, input.VideoPath, &videoTrack.Index, profile, sourceAspectN, sourceAspectD, FitLetterbox, rateConverter)
@@ -166,8 +188,16 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 			}
 			audioOffset = shifted
 		}
+		subtitleOffset = -videoStart
 	} else {
 		prepareErr = prepareMP4VideoForDVD(ctx, input.VideoPath, &videoTrack.Index, profile, sourceAspectN, sourceAspectD, FitLetterbox, rateConverter)
+		// The subtitle cues are on the movie timeline, to which an edit
+		// list maps the video's media time; title time zero is the media
+		// time of the converter's origin.
+		subtitleOffset = -rateConverter.origin
+		if videoTrack.edit.present {
+			subtitleOffset += videoTrack.edit.mediaTime - videoTrack.edit.empty
+		}
 	}
 	closeEncoderErr := videoEncoder.Close()
 	closeVideoErr := videoFile.Close()
@@ -222,6 +252,27 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 	if err := ctx.Err(); err != nil {
 		return EncodedTitle{}, err
 	}
+	encodedSubtitles := make([]EncodedSubtitle, 0, len(subtitles))
+	for i, subtitle := range subtitles {
+		name := fmt.Sprintf("subtitle-%02d.sub", i+1)
+		path := filepath.Join(workDir, name)
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return EncodedTitle{}, fmt.Errorf("video2dvd: create subtitle stream: %w", err)
+		}
+		subtitlePaths = append(subtitlePaths, path)
+		err = writeDVDSubtitleStream(file, shiftDVDSubtitleEvents(subtitle.events, subtitleOffset), duration, subtitle.renderer)
+		if closeErr := file.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return EncodedTitle{}, fmt.Errorf("video2dvd: write subtitle stream %d: %w", i+1, err)
+		}
+		encodedSubtitles = append(encodedSubtitles, EncodedSubtitle{Path: name, Language: subtitle.language})
+	}
+	if len(encodedSubtitles) == 0 {
+		encodedSubtitles = nil
+	}
 	cleanup = false
 	return EncodedTitle{
 		VideoPath:            "video.m2v",
@@ -234,7 +285,62 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		FrameRateNumerator:   fpsN,
 		FrameRateDenominator: fpsD,
 		Duration:             duration,
+		Subtitles:            encodedSubtitles,
 	}, nil
+}
+
+// inputSubtitle is a subtitle track read for a title: its events on the
+// timeline of the source file and its DVD language code.
+type inputSubtitle struct {
+	events   []dvdSubtitleEvent
+	language string
+	renderer *dvdSubtitleRenderer
+}
+
+// readInputSubtitles reads the subtitle tracks of a title and draws every
+// text once. It returns the tracks and the sectors that their units will
+// take at most, when every subtitle is shown within the title.
+func readInputSubtitles(path string, info MP4Info, tracks []int, profile Profile) ([]inputSubtitle, int64, error) {
+	if len(tracks) == 0 {
+		return nil, 0, nil
+	}
+	renderer := newDVDSubtitleRenderer(profile)
+	subtitles := make([]inputSubtitle, 0, len(tracks))
+	var sectors int64
+	for _, index := range tracks {
+		cues, err := ReadSubtitleCues(path, index)
+		if err != nil {
+			return nil, 0, err
+		}
+		events := flattenSubtitleCues(cues)
+		for _, event := range events {
+			picture, err := renderer.image(event.text)
+			if err != nil {
+				return nil, 0, err
+			}
+			if picture == nil {
+				continue
+			}
+			// The largest delay a unit holds; a longer event is split.
+			units := int64((dvdSubtitleTicks(event.end-event.start) + dvdSubtitleMaxDelay*dvdSubtitleDelayTicks - 1) / (dvdSubtitleMaxDelay * dvdSubtitleDelayTicks))
+			unit, err := encodeDVDSubtitleUnit(picture, 1)
+			if err != nil {
+				return nil, 0, err
+			}
+			sectors += max(units, 1) * dvdSubtitleUnitSectors(len(unit))
+		}
+		subtitles = append(subtitles, inputSubtitle{events: events, language: DVDLanguageCode(info.Tracks[index].Language), renderer: renderer})
+	}
+	return subtitles, sectors, nil
+}
+
+// shiftDVDSubtitleEvents moves events by offset.
+func shiftDVDSubtitleEvents(events []dvdSubtitleEvent, offset time.Duration) []dvdSubtitleEvent {
+	shifted := make([]dvdSubtitleEvent, len(events))
+	for i, event := range events {
+		shifted[i] = dvdSubtitleEvent{start: event.start + offset, end: event.end + offset, text: event.text}
+	}
+	return shifted
 }
 
 // titleLengthFromFields returns the display time of a number of fields at

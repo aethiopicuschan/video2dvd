@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 )
 
@@ -377,6 +378,7 @@ func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord
 	binary.BigEndian.PutUint16(ifo[dvdIFOAudioOffset+2:dvdIFOAudioOffset+4], 1)
 	ifo[0x0204] = dvdLPCMAudioAttribute0 // LPCM coding mode, unspecified language.
 	ifo[0x0205] = dvdLPCMAudioAttribute1 // 16-bit, 48 kHz, stereo.
+	putDVDSubtitleAttributes(ifo[dvdIFOAudioOffset+0x54:], title.Subtitles)
 
 	ptt := make([]byte, 16)
 	binary.BigEndian.PutUint16(ptt[0:2], 1)
@@ -391,7 +393,14 @@ func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord
 		post = append(post, dvdConditionalCallVMGPGCCommand(dvdVMGTitleAdvancePGCN(menuPageCount, titleCount, titleIndex)))
 	}
 	post = append(post, dvdCallMenuCommand())
-	pgc := buildDVDVTSProgramChain(playbackTime, records, vobSectors, post...)
+	var pre [][8]byte
+	if len(title.Subtitles) > 0 {
+		// Every start of the title selects the first subtitle stream, shown
+		// or hidden; without the command a player could start with whatever
+		// stream and display state it had.
+		pre = append(pre, dvdSetSubtitleStreamCommand(0, profile.ShowSubtitles))
+	}
+	pgc := buildDVDVTSProgramChain(playbackTime, records, vobSectors, pre, post, dvdTitleSubpictureStreamControl(profile.Aspect, len(title.Subtitles)))
 	pgci := make([]byte, 16+len(pgc))
 	binary.BigEndian.PutUint16(pgci[0:2], 1)
 	binary.BigEndian.PutUint32(pgci[4:8], uint32(len(pgci)-1))
@@ -454,9 +463,14 @@ func buildDVDVTSTimeMap(records []dvdVOBURecord, ticksPerSecond uint32) []byte {
 	return tmap
 }
 
-func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobSectors uint32, postCommands ...[8]byte) []byte {
+// buildDVDVTSProgramChain builds the PGC of a title: one program of one
+// cell that plays every VOBU of records. subpictureControl holds the stream
+// control entry of each subtitle stream; a title with subtitles also gets
+// their colour table.
+func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobSectors uint32, preCommands, postCommands [][8]byte, subpictureControl [][4]byte) []byte {
 	const headerSize = 0xec
-	commandTableSize := 8 + len(postCommands)*8
+	commands := slices.Concat(preCommands, postCommands)
+	commandTableSize := 8 + len(commands)*8
 	const programMapSize = 2 // one program cell number, padded to an even byte count.
 	const cellPlaybackSize = 24
 	const cellPositionSize = 4
@@ -464,14 +478,23 @@ func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobS
 	pgc[2], pgc[3] = 1, 1
 	copy(pgc[4:8], playbackTime[:])
 	pgc[0x0c] = 0x80 // first LPCM stream is available on private_stream_1 substream 0.
+	for i, control := range subpictureControl {
+		copy(pgc[0x1c+i*4:0x20+i*4], control[:])
+	}
+	if len(subpictureControl) > 0 {
+		for i, color := range dvdSubtitlePalette {
+			copy(pgc[0xa4+i*4:0xa8+i*4], color[:])
+		}
+	}
 	binary.BigEndian.PutUint16(pgc[0x00e4:0x00e6], headerSize)
 	binary.BigEndian.PutUint16(pgc[0x00e6:0x00e8], uint16(headerSize+commandTableSize))
 	binary.BigEndian.PutUint16(pgc[0x00e8:0x00ea], uint16(headerSize+commandTableSize+programMapSize))
 	binary.BigEndian.PutUint16(pgc[0x00ea:0x00ec], uint16(headerSize+commandTableSize+programMapSize+cellPlaybackSize))
 	commandTable := pgc[headerSize : headerSize+commandTableSize]
+	binary.BigEndian.PutUint16(commandTable[0:2], uint16(len(preCommands)))
 	binary.BigEndian.PutUint16(commandTable[2:4], uint16(len(postCommands)))
 	binary.BigEndian.PutUint16(commandTable[6:8], uint16(commandTableSize-1))
-	for i, command := range postCommands {
+	for i, command := range commands {
 		copy(commandTable[8+i*8:16+i*8], command[:])
 	}
 	pgc[headerSize+commandTableSize] = 1
@@ -484,6 +507,48 @@ func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobS
 	binary.BigEndian.PutUint16(position[0:2], 1)
 	position[3] = 1
 	return pgc
+}
+
+// putDVDSubtitleAttributes writes the number of subtitle streams of a title
+// and their attributes, as a VTSI stores them from 0x254 on: a 2-bit RLE
+// stream, with its language code when it has one.
+func putDVDSubtitleAttributes(dst []byte, subtitles []EncodedSubtitle) {
+	if len(subtitles) == 0 {
+		return
+	}
+	binary.BigEndian.PutUint16(dst[0:2], uint16(len(subtitles)))
+	for i, subtitle := range subtitles {
+		attribute := dst[2+i*6 : 8+i*6]
+		if subtitle.Language != "" {
+			attribute[0] = 0x01 // the language code is set.
+			copy(attribute[2:4], subtitle.Language)
+		}
+	}
+}
+
+// dvdTitleSubpictureStreamControl returns the PGC subpicture stream control
+// entries of a title's subtitle streams: stream n is decoded from substream
+// 0x20+n in every display mode, as one picture serves 4:3 and 16:9 displays.
+func dvdTitleSubpictureStreamControl(aspect AspectRatio, streams int) [][4]byte {
+	controls := make([][4]byte, streams)
+	for i := range controls {
+		n := byte(i)
+		controls[i] = [4]byte{0x80 | n, 0, 0, 0}
+		if aspect == AspectRatio16x9 {
+			controls[i] = [4]byte{0x80 | n, n, n, n}
+		}
+	}
+	return controls
+}
+
+// dvdSetSubtitleStreamCommand is SetSTN for the subpicture stream: it selects
+// stream (zero-based) and shows or hides it.
+func dvdSetSubtitleStreamCommand(stream int, show bool) [8]byte {
+	value := byte(stream)
+	if show {
+		value |= 0x40
+	}
+	return [8]byte{0x51, 0, 0, 0, 0x80 | value, 0, 0, 0}
 }
 
 func dvdVideoAttribute(title EncodedTitle, profile Profile) uint16 {
@@ -520,6 +585,7 @@ func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint3
 		vtsAttrs[0x101] = byte(dvdVideoAttribute(title, profile))
 		binary.BigEndian.PutUint16(vtsAttrs[0x102:0x104], 1)
 		vtsAttrs[0x104], vtsAttrs[0x105] = dvdLPCMAudioAttribute0, dvdLPCMAudioAttribute1
+		putDVDSubtitleAttributes(vtsAttrs[0x154:], title.Subtitles)
 		base := i * 776
 		binary.BigEndian.PutUint32(attributes[base:base+4], 775)
 		copy(attributes[base+8:base+776], vtsAttrs)

@@ -54,8 +54,9 @@ type compositionRun struct {
 	offset int64
 }
 
-// DemuxMP4 reports every compressed sample from a non-fragmented MP4 in track
-// order. It does not decode samples or convert H.264 length prefixes to Annex B.
+// DemuxMP4 reports every compressed sample of the video and audio tracks of a
+// non-fragmented MP4 in track order. It does not decode samples or convert
+// H.264 length prefixes to Annex B.
 func DemuxMP4(path string, handler SampleHandler) (MP4Info, error) {
 	if handler == nil {
 		return MP4Info{}, errors.New("video2dvd: sample handler is required")
@@ -102,10 +103,10 @@ func demuxMP4Reader(r io.ReaderAt, size int64, handler SampleHandler) (MP4Info, 
 		}
 		track := info.Tracks[trackIndex]
 		trackIndex++
-		if track.Kind == TrackKindOther {
+		if track.Kind != TrackKindVideo && track.Kind != TrackKindAudio {
 			continue
 		}
-		tables, err := parseSampleTables(r, child)
+		tables, err := parseSampleTables(r, child, false)
 		if err != nil {
 			return MP4Info{}, fmt.Errorf("video2dvd: track %d sample tables: %w", trackIndex, err)
 		}
@@ -116,7 +117,10 @@ func demuxMP4Reader(r io.ReaderAt, size int64, handler SampleHandler) (MP4Info, 
 	return info, nil
 }
 
-func parseSampleTables(r io.ReaderAt, trak mp4Box) (sampleTables, error) {
+// parseSampleTables reads the sample tables of a trak box. A sample of zero
+// duration is an error unless zeroDurations is set: timed text marks the
+// end of its last cue with one.
+func parseSampleTables(r io.ReaderAt, trak mp4Box, zeroDurations bool) (sampleTables, error) {
 	trakChildren, err := readMP4Boxes(r, trak.data, trak.end)
 	if err != nil {
 		return sampleTables{}, err
@@ -181,7 +185,7 @@ func parseSampleTables(r io.ReaderAt, trak mp4Box) (sampleTables, error) {
 			tables.chunkMap, err = parseChunkMap(r, box)
 			hasChunkMap = err == nil
 		case "stts":
-			tables.timing, err = parseTimeRuns(r, box)
+			tables.timing, err = parseTimeRuns(r, box, zeroDurations)
 			hasTiming = err == nil
 		case "ctts":
 			tables.composition, err = parseCompositionRuns(r, box)
@@ -301,7 +305,7 @@ func parseChunkMap(r io.ReaderAt, box mp4Box) ([]chunkRun, error) {
 	return runs, nil
 }
 
-func parseTimeRuns(r io.ReaderAt, box mp4Box) ([]timeRun, error) {
+func parseTimeRuns(r io.ReaderAt, box mp4Box, zeroDurations bool) ([]timeRun, error) {
 	data, err := tableData(r, box)
 	if err != nil {
 		return nil, err
@@ -323,7 +327,7 @@ func parseTimeRuns(r io.ReaderAt, box mp4Box) ([]timeRun, error) {
 			count:    binary.BigEndian.Uint32(data[position : position+4]),
 			duration: binary.BigEndian.Uint32(data[position+4 : position+8]),
 		}
-		if runs[i].count == 0 || runs[i].duration == 0 {
+		if runs[i].count == 0 || runs[i].duration == 0 && !zeroDurations {
 			return nil, errors.New("stts run has a zero count or duration")
 		}
 	}

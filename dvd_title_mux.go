@@ -1,12 +1,15 @@
 package video2dvd
 
 import (
+	"cmp"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"slices"
 	"time"
 )
@@ -34,6 +37,12 @@ const (
 	// is sent. 0.2 s of LPCM plus one pack is 40320 bytes, inside the 58 KiB
 	// DVD audio buffer.
 	dvdMuxAudioLead = 18_000
+	// dvdMuxSubtitleLead is how long before its presentation time a
+	// subtitle unit starts to be sent, if the subpicture buffer has room.
+	dvdMuxSubtitleLead = 45_000
+	// dvdSubpictureBufferBytes is the subpicture decoder buffer: a unit is
+	// kept in it until it is presented.
+	dvdSubpictureBufferBytes = 52 * 1024
 
 	dvdVideoPSTDBufferBytes = 232 * 1024
 	dvdVideoPSTDBuffer      = 0x6000 | 232 // 232 KiB in 1024-byte units.
@@ -129,6 +138,33 @@ func muxDVDVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.W
 		return err
 	}
 	defer audioFile.Close()
+	if len(title.Subtitles) > dvdSubtitleMaxStreams {
+		return fmt.Errorf("video2dvd: a title has at most %d subtitle streams", dvdSubtitleMaxStreams)
+	}
+	if len(title.Subtitles) > 0 && len(buttonPages) > 0 {
+		return errors.New("video2dvd: a menu VOB cannot carry subtitles")
+	}
+	subtitleFiles := make([]*os.File, len(title.Subtitles))
+	for i, subtitle := range title.Subtitles {
+		path := subtitle.Path
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(workDir, path)
+		}
+		if subtitleFiles[i], err = os.Open(path); err != nil {
+			return fmt.Errorf("video2dvd: open subtitle stream %d: %w", i+1, err)
+		}
+		defer subtitleFiles[i].Close()
+	}
+	subtitleReaders := func() ([]io.Reader, error) {
+		readers := make([]io.Reader, len(subtitleFiles))
+		for i, file := range subtitleFiles {
+			if _, err := file.Seek(0, io.SeekStart); err != nil {
+				return nil, err
+			}
+			readers[i] = file
+		}
+		return readers, nil
+	}
 
 	// A NAV pack addresses VOBUs up to two minutes ahead and stores the end
 	// time of the VOB, none of which is known while the stream is produced.
@@ -138,7 +174,12 @@ func muxDVDVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.W
 	if err != nil {
 		return err
 	}
+	readers, err := subtitleReaders()
+	if err != nil {
+		return err
+	}
 	planner := newDVDVOBMuxer(ctx, title, highlights, videoFile, audioFile, placement)
+	planner.addSubtitles(readers)
 	if err := planner.run(); err != nil {
 		return err
 	}
@@ -148,10 +189,15 @@ func muxDVDVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.W
 	if _, err := audioFile.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
+	if readers, err = subtitleReaders(); err != nil {
+		return err
+	}
 	writer := newDVDVOBMuxer(ctx, title, highlights, videoFile, audioFile, placement)
+	writer.addSubtitles(readers)
 	writer.dst = dst
 	writer.recordVOBU = recordVOBU
 	writer.plan = planner.vobus
+	writer.spuPlan = planner.spus
 	writer.search = make([]dvdVOBUSearchEntry, len(planner.vobus))
 	for i, vobu := range planner.vobus {
 		writer.search[i] = dvdVOBUSearchEntry{Sector: vobu.StartSector, StartPTM: vobu.StartPTM, EndPTM: vobu.EndPTM}
@@ -245,6 +291,36 @@ type dvdVOBMuxer struct {
 	// target has not been sent yet.
 	recentAudio []dvdMuxAudioPack
 	syncPending int
+
+	// subtitles holds the subtitle streams, stream n on substream 0x20+n.
+	subtitles []*dvdMuxSubtitle
+	// spus lists the subtitle units sent, per stream in presentation
+	// order, and spuPlan those of the planning run, from which NAV packs
+	// take SP_SYNCA.
+	spus    [][]dvdMuxSPU
+	spuPlan [][]dvdMuxSPU
+}
+
+// dvdMuxSubtitle is the state of one subtitle stream.
+type dvdMuxSubtitle struct {
+	reader *dvdSubtitleStreamReader
+	// unit is the next unit to send, with its presentation time on the VOB
+	// clock, and offset the bytes of it already sent; unit is nil once the
+	// stream has ended.
+	unit   *dvdSubtitleUnit
+	offset int
+	// buffer lists the units in the decoder's subpicture buffer, which
+	// leave it at their presentation time.
+	buffer   []dvdMuxBufferedPicture
+	buffered int
+	inVOBU   bool
+}
+
+// dvdMuxSPU records a subtitle unit: when it is shown and hidden, and the
+// VOBU in which its first pack is.
+type dvdMuxSPU struct {
+	pts, end uint64
+	vobu     int
 }
 
 func newDVDVOBMuxer(ctx context.Context, title EncodedTitle, highlights []dvdMenuHighlight, video, audio io.Reader, placement dvdVOBPlacement) *dvdVOBMuxer {
@@ -258,6 +334,68 @@ func newDVDVOBMuxer(ctx context.Context, title EncodedTitle, highlights []dvdMen
 		sector:     uint64(placement.firstSector),
 		vobID:      placement.vobID,
 	}
+}
+
+// addSubtitles adds subtitle streams read from stream files.
+func (m *dvdVOBMuxer) addSubtitles(readers []io.Reader) {
+	for _, reader := range readers {
+		m.subtitles = append(m.subtitles, &dvdMuxSubtitle{reader: newDVDSubtitleStreamReader(reader)})
+	}
+	m.spus = make([][]dvdMuxSPU, len(readers))
+}
+
+// readSubtitle loads the next unit of a subtitle stream.
+func (m *dvdVOBMuxer) readSubtitle(subtitle *dvdMuxSubtitle) error {
+	unit, err := subtitle.reader.next()
+	if err == io.EOF {
+		subtitle.unit = nil
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	unit.pts += m.startTime()
+	subtitle.unit, subtitle.offset = &unit, 0
+	return nil
+}
+
+// subtitlesPending reports whether a subtitle unit remains to be sent.
+func (m *dvdVOBMuxer) subtitlesPending() bool {
+	for _, subtitle := range m.subtitles {
+		if subtitle.unit != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// subtitleReadyAt returns the stream whose next pack may be sent first and
+// the clock value from which it may.
+func (m *dvdVOBMuxer) subtitleReadyAt(now uint64) (int, uint64) {
+	best, bestAt := -1, uint64(dvdMuxNever)
+	for stream, subtitle := range m.subtitles {
+		released := 0
+		for released < len(subtitle.buffer) && subtitle.buffer[released].dts <= now {
+			subtitle.buffered -= subtitle.buffer[released].bytes
+			released++
+		}
+		subtitle.buffer = slices.Delete(subtitle.buffer, 0, released)
+		if subtitle.unit == nil {
+			continue
+		}
+		pts := subtitle.unit.pts
+		at := (pts - min(pts, dvdMuxSubtitleLead)) * mpegSCRExtensionRange
+		if subtitle.offset == 0 && subtitle.buffered+len(subtitle.unit.data) > dvdSubpictureBufferBytes {
+			at = max(at, subtitle.buffer[0].dts)
+		}
+		if subtitle.offset > 0 {
+			at = 0 // a unit that has started is finished first.
+		}
+		if at < bestAt {
+			best, bestAt = stream, at
+		}
+	}
+	return best, bestAt
 }
 
 func (m *dvdVOBMuxer) run() error {
@@ -274,16 +412,22 @@ func (m *dvdVOBMuxer) run() error {
 	if err := m.readAudio(); err != nil {
 		return err
 	}
+	for _, subtitle := range m.subtitles {
+		if err := m.readSubtitle(subtitle); err != nil {
+			return err
+		}
+	}
 	// The VOB must open with a NAV pack, so the first picture goes first.
 	if err := m.writeVideoPack(); err != nil {
 		return err
 	}
-	for m.current != nil || m.audioChunk != nil {
+	for m.current != nil || m.audioChunk != nil || m.subtitlesPending() {
 		if err := m.ctx.Err(); err != nil {
 			return err
 		}
 		now := m.clock.now()
 		m.releaseVideo(now)
+		subtitleStream, subtitleAt := m.subtitleReadyAt(now)
 		audioAt, videoAt := uint64(dvdMuxNever), uint64(dvdMuxNever)
 		if m.audioChunk != nil {
 			pts := m.audioPTS()
@@ -296,14 +440,18 @@ func (m *dvdVOBMuxer) run() error {
 		}
 		// Audio goes first whenever it is due: its packs are small and
 		// evenly spaced, so they interleave with a large picture instead
-		// of waiting behind it.
+		// of waiting behind it. Subtitles are rare and small and come next.
 		switch {
 		case audioAt <= now:
 			err = m.writeAudioPack()
+		case subtitleAt <= now:
+			err = m.writeSubtitlePack(subtitleStream)
 		case videoAt <= now:
 			err = m.writeVideoPack()
+		case audioAt == dvdMuxNever && videoAt == dvdMuxNever && subtitleAt == dvdMuxNever:
+			return errors.New("video2dvd: subtitle units cannot be scheduled")
 		default:
-			m.clock.wait(min(audioAt, videoAt))
+			m.clock.wait(min(audioAt, videoAt, subtitleAt))
 		}
 		if err != nil {
 			return err
@@ -611,6 +759,105 @@ func (m *dvdVOBMuxer) writeAudioPack() error {
 	return m.readAudio()
 }
 
+// writeSubtitlePack sends the next pack of a subtitle stream. The first pack
+// of a unit carries its presentation time.
+func (m *dvdVOBMuxer) writeSubtitlePack(stream int) error {
+	subtitle := m.subtitles[stream]
+	unit := subtitle.unit
+	header := mpegPESHeader{streamID: dvdPrivateStream1ID}
+	if subtitle.offset == 0 {
+		header.hasPTS, header.pts = true, unit.pts
+	}
+	if !subtitle.inVOBU {
+		header.pstdBuffer = dvdSubpicturePSTDBuffer
+		subtitle.inVOBU = true
+	}
+	if m.clock.after(DVDVOBSectorSize) > unit.pts*mpegSCRExtensionRange {
+		return fmt.Errorf("video2dvd: subtitle stream %d cannot reach the decoder before its presentation time", stream+1)
+	}
+	count := min(header.capacity()-1, len(unit.data)-subtitle.offset)
+	payload := append(append(m.payload[:0], dvdMenuSubpictureSubstream+byte(stream)), unit.data[subtitle.offset:subtitle.offset+count]...)
+	m.payload = payload
+	if subtitle.offset == 0 {
+		end, ok := dvdSubtitleUnitEnd(unit.data)
+		spu := dvdMuxSPU{pts: unit.pts, end: unit.pts + end, vobu: len(m.vobus) - 1}
+		if !ok {
+			spu.end = dvdMuxNever
+		}
+		m.spus[stream] = append(m.spus[stream], spu)
+		subtitle.buffer = append(subtitle.buffer, dvdMuxBufferedPicture{dts: unit.pts * mpegSCRExtensionRange, bytes: len(unit.data)})
+		subtitle.buffered += len(unit.data)
+	}
+	if err := m.writePack(func(scr uint64) ([]byte, error) {
+		return buildMPEGPESPack(scr, defaultProgramMuxRate/50, header, payload)
+	}); err != nil {
+		return err
+	}
+	subtitle.offset += count
+	if subtitle.offset < len(unit.data) {
+		return nil
+	}
+	return m.readSubtitle(subtitle)
+}
+
+// dvdSubtitleUnitEnd returns how long after its presentation time a
+// subtitle unit hides its picture: the delay of the control sequence that
+// holds STP_DSP. It reports false for a unit that never does.
+func dvdSubtitleUnitEnd(unit []byte) (uint64, bool) {
+	offset, visited := int(binary.BigEndian.Uint16(unit[2:4])), 0
+	for offset+4 <= len(unit) && visited < 64 {
+		visited++
+		delay := uint64(binary.BigEndian.Uint16(unit[offset:])) * dvdSubtitleDelayTicks
+		next := int(binary.BigEndian.Uint16(unit[offset+2:]))
+		for position := offset + 4; position < len(unit); {
+			command := unit[position]
+			if command == 0x02 {
+				return delay, true
+			}
+			size, ok := map[byte]int{0x00: 1, 0x01: 1, 0x03: 3, 0x04: 3, 0x05: 7, 0x06: 5}[command]
+			if !ok {
+				break // CMD_END, or a command whose size is not fixed.
+			}
+			position += size
+		}
+		if next == offset {
+			break
+		}
+		offset = next
+	}
+	return 0, false
+}
+
+// dvdSubpictureSync returns SP_SYNCA of one subtitle stream for VOBU index,
+// following dvdauthor: the offset to the VOBU holding the first pack of the
+// unit shown at the start of the VOBU, or else of the unit that comes up
+// next during the VOBU, with bit 31 set for an earlier VOBU. A unit in this
+// VOBU, or none to point at, is DVDNAVSubpictureSyncCurrent.
+func (m *dvdVOBMuxer) dvdSubpictureSync(stream, index int) uint32 {
+	vobu := m.plan[index]
+	start, end := uint64(vobu.StartPTM), uint64(vobu.EndPTM)
+	spus := m.spuPlan[stream]
+	// spus[following] is the first unit presented after the VOBU starts.
+	following, _ := slices.BinarySearchFunc(spus, start+1, func(spu dvdMuxSPU, pts uint64) int {
+		return cmp.Compare(spu.pts, pts)
+	})
+	target := -1
+	switch {
+	case following > 0 && spus[following-1].end > start:
+		target = spus[following-1].vobu
+	case following < len(spus) && spus[following].pts < end:
+		target = spus[following].vobu
+	}
+	if target < 0 || target == index {
+		return DVDNAVSubpictureSyncCurrent
+	}
+	here, there := m.plan[index].StartSector, m.plan[target].StartSector
+	if there < here {
+		return (here - there) | 0x80000000
+	}
+	return there - here
+}
+
 // dvdAudioSyncOffset encodes A_SYNCA for an audio pack relative to a NAV pack.
 func dvdAudioSyncOffset(audioSector, navSector uint32) uint16 {
 	const maxOffset = 0x1fff
@@ -668,6 +915,9 @@ func (m *dvdVOBMuxer) startVOBU(picture *dvdMuxPicture) error {
 	}
 	m.vobus = append(m.vobus, vobu)
 	m.vobuHasVideo, m.vobuHasAudio = false, false
+	for _, subtitle := range m.subtitles {
+		subtitle.inVOBU = false
+	}
 	if err := m.writePack(func(uint64) ([]byte, error) { return m.buildNAVPack(index) }); err != nil {
 		return err
 	}
@@ -757,6 +1007,9 @@ func (m *dvdVOBMuxer) buildNAVPack(index int) ([]byte, error) {
 		for stream := range highlight.subpictures {
 			info.SubpictureSync[stream] = DVDNAVSubpictureSyncCurrent
 		}
+	}
+	for stream := range m.subtitles {
+		info.SubpictureSync[stream] = m.dvdSubpictureSync(stream, index)
 	}
 	// A title is a single cell. Menu VOBUs are separate cells, and search
 	// pointers never cross a cell boundary.

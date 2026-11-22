@@ -20,6 +20,7 @@ import (
 	"github.com/thesyncim/goav/av"
 	"github.com/thesyncim/goav/bundle"
 	"github.com/thesyncim/goav/component"
+	"github.com/thesyncim/goav/container/matroska"
 	"github.com/thesyncim/goav/container/webm"
 )
 
@@ -83,8 +84,15 @@ func isWebMFile(header []byte, path string) bool {
 	return len(header) >= 4 && bytes.Equal(header[:4], []byte{0x1a, 0x45, 0xdf, 0xa3}) && bytes.Contains(header, []byte("webm"))
 }
 
-func probeWebMReader(r io.Reader) (MP4Info, error) {
-	demuxer, err := webm.NewDemuxer(r, webm.DemuxerOptions{MaxLacePayload: maxWebMPacketBytes})
+func probeWebMReader(r io.ReadSeeker) (MP4Info, error) {
+	codecIDs, err := webMTrackCodecIDs(r)
+	if err != nil {
+		return MP4Info{}, fmt.Errorf("video2dvd: parse WebM: %w", err)
+	}
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return MP4Info{}, fmt.Errorf("video2dvd: rewind WebM: %w", err)
+	}
+	demuxer, err := openWebMDemuxer(r)
 	if err != nil {
 		return MP4Info{}, fmt.Errorf("video2dvd: parse WebM: %w", err)
 	}
@@ -99,6 +107,11 @@ func probeWebMReader(r io.Reader) (MP4Info, error) {
 			CodecConfig: append([]byte(nil), source.CodecPrivate...),
 			Duration:    info.Duration,
 			TimeScale:   1_000_000_000,
+			Language:    source.LanguageBCP47,
+			Name:        source.Name,
+		}
+		if track.Language == "" {
+			track.Language = source.Language
 		}
 		if source.DefaultDurationNS > 0 {
 			track.DefaultDuration = time.Duration(source.DefaultDurationNS)
@@ -140,9 +153,14 @@ func probeWebMReader(r io.Reader) (MP4Info, error) {
 			default:
 				track.Codec = source.CodecName
 			}
+		case matroska.TrackSubtitle:
+			// Subtitle tracks report their Matroska codec ID, such as
+			// D_WEBVTT/SUBTITLES.
+			track.Kind = TrackKindSubtitle
+			track.Codec = codecIDs[uint64(source.ID)]
 		default:
 			track.Kind = TrackKindOther
-			track.Codec = source.CodecName
+			track.Codec = codecIDs[uint64(source.ID)]
 		}
 		info.Tracks = append(info.Tracks, track)
 	}
@@ -356,7 +374,7 @@ func DecodeWebMVideo(ctx context.Context, path string, trackIndex *int, handler 
 	}
 	if track.Codec == "vp8" || track.Codec == "av1" {
 		resolver := newWebMFrameDurationResolver(track.DefaultDuration, handler)
-		err := decodeWebMWithGoAV(ctx, path, track.Index, true, func(frame *av.Frame) error {
+		err := decodeWebMWithGoAV(ctx, path, info, track.Index, true, func(frame *av.Frame) error {
 			decoded, err := copyGoAVVideoFrame(frame)
 			if err != nil {
 				return err
@@ -480,7 +498,7 @@ func DecodeWebMAudio(ctx context.Context, path string, trackIndex *int, handler 
 	if track.Codec != "opus" {
 		return fmt.Errorf("video2dvd: WebM audio codec %q is not supported by the built-in decoder", track.Codec)
 	}
-	return decodeWebMWithGoAV(ctx, path, track.Index, false, func(frame *av.Frame) error {
+	return decodeWebMWithGoAV(ctx, path, info, track.Index, false, func(frame *av.Frame) error {
 		chunk, err := copyGoAVPCMFrame(frame)
 		if err != nil {
 			return err
@@ -495,7 +513,7 @@ func decodeWebMVP9(ctx context.Context, path string, track TrackInfo, handler fu
 		return fmt.Errorf("video2dvd: open WebM: %w", err)
 	}
 	defer f.Close()
-	demuxer, err := webm.NewDemuxer(f, webm.DemuxerOptions{MaxLacePayload: maxWebMPacketBytes})
+	demuxer, err := openWebMDemuxer(f)
 	if err != nil {
 		return fmt.Errorf("video2dvd: parse WebM: %w", err)
 	}
@@ -687,13 +705,21 @@ func hasVP9Superframe(packet []byte) bool {
 	return indexSize <= len(packet) && packet[len(packet)-indexSize] == marker
 }
 
-func decodeWebMWithGoAV(ctx context.Context, path string, streamIndex int, video bool, handler func(*av.Frame) error) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("video2dvd: open WebM: %w", err)
+// decodeWebMWithGoAV decodes one stream of a WebM file with the goav
+// pipeline. info is the file's probe result: a file with tracks other than
+// video and audio is read through the Matroska demuxer (webMMatroskaInput).
+func decodeWebMWithGoAV(ctx context.Context, path string, info MP4Info, streamIndex int, video bool, handler func(*av.Frame) error) error {
+	var in goav.InputSpec
+	if webMHasOnlyMediaTracks(info) {
+		f, err := os.Open(path)
+		if err != nil {
+			return fmt.Errorf("video2dvd: open WebM: %w", err)
+		}
+		defer f.Close()
+		in = goav.FileInput(path, f)
+	} else {
+		in = goav.Input(webMMatroskaInput{path: path})
 	}
-	defer f.Close()
-	in := goav.FileInput(path, f)
 	var stream goav.Stream
 	selection := goav.StreamIndex(streamIndex)
 	if video {

@@ -105,6 +105,10 @@ type dvdMenuGlyph struct {
 // one-pixel strokes are faint on a television.
 type dvdMenuText struct {
 	font *MenuFont
+	// scale enlarges all text by a whole factor: bitmap glyphs repeat
+	// every pixel scale times in both directions and outlines are set with
+	// an em scale times larger. Menus use 1 and subtitles 2.
+	scale int
 	// Outlines are scaled horizontally by scaleNumerator/scaleDenominator,
 	// the inverse of the pixel aspect ratio, so that they have their
 	// natural proportions on the display.
@@ -115,7 +119,13 @@ type dvdMenuText struct {
 }
 
 func newDVDMenuText(profile Profile) *dvdMenuText {
-	text := &dvdMenuText{font: profile.MenuFont, glyphs: map[rune]dvdMenuGlyph{}}
+	return newDVDScaledText(profile, 1)
+}
+
+// newDVDScaledText returns a text drawer whose glyphs are scale times the
+// size of the menu's.
+func newDVDScaledText(profile Profile, scale int) *dvdMenuText {
+	text := &dvdMenuText{font: profile.MenuFont, scale: scale, glyphs: map[rune]dvdMenuGlyph{}}
 	text.scaleDenominator, text.scaleNumerator = dvdMenuPixelAspect(profile)
 	return text
 }
@@ -162,10 +172,10 @@ func (t *dvdMenuText) outlineGlyph(char rune) (glyph dvdMenuGlyph, ok bool) {
 	}
 	// A glyph without an outline, such as a bitmap or a colour glyph, is
 	// treated like a missing one.
-	if _, err := t.font.font.LoadGlyph(&t.buffer, index, fixed.I(dvdMenuOutlineEm), nil); err != nil {
+	if _, err := t.font.font.LoadGlyph(&t.buffer, index, fixed.I(dvdMenuOutlineEm*t.scale), nil); err != nil {
 		return dvdMenuGlyph{}, false
 	}
-	advance, err := t.font.font.GlyphAdvance(&t.buffer, index, fixed.I(dvdMenuOutlineEm), font.HintingNone)
+	advance, err := t.font.font.GlyphAdvance(&t.buffer, index, fixed.I(dvdMenuOutlineEm*t.scale), font.HintingNone)
 	if err != nil {
 		return dvdMenuGlyph{}, false
 	}
@@ -181,18 +191,18 @@ func (t *dvdMenuText) glyph(char rune) dvdMenuGlyph {
 	if !ok {
 		var small [7]byte
 		if small, ok = dvdMenuFont[upperASCIILetter(char)]; ok {
-			glyph = dvdMenuGlyph{kind: dvdMenuGlyphSmall, advance: fixed.I(dvdMenuCharWidth), small: small}
+			glyph = dvdMenuGlyph{kind: dvdMenuGlyphSmall, advance: fixed.I(dvdMenuCharWidth * t.scale), small: small}
 		}
 	}
 	if !ok {
 		var japanese dvdMenuBitmapGlyph
 		if japanese, ok = lookupDVDMenuJapaneseGlyph(char); ok {
-			glyph = dvdMenuGlyph{kind: dvdMenuGlyphJapanese, advance: fixed.I(japanese.width()), japanese: japanese}
+			glyph = dvdMenuGlyph{kind: dvdMenuGlyphJapanese, advance: fixed.I(japanese.width() * t.scale), japanese: japanese}
 		}
 	}
 	if !ok {
 		if glyph, ok = t.outlineGlyph('?'); !ok {
-			glyph = dvdMenuGlyph{kind: dvdMenuGlyphSmall, advance: fixed.I(dvdMenuCharWidth), small: dvdMenuFont['?']}
+			glyph = dvdMenuGlyph{kind: dvdMenuGlyphSmall, advance: fixed.I(dvdMenuCharWidth * t.scale), small: dvdMenuFont['?']}
 		}
 	}
 	t.glyphs[char] = glyph
@@ -223,12 +233,18 @@ func (t *dvdMenuText) truncate(text string, maxWidth int) string {
 
 // draw draws text with its top left corner at (x, y). Only pixels inside
 // clip and the frame are changed. Bitmap glyphs set pixels to luma; outline
-// glyphs blend towards it by their coverage of each pixel.
+// glyphs blend towards it by their coverage of each pixel. A bitmap pixel
+// covers scale by scale frame pixels.
 func (t *dvdMenuText) draw(frame *DecodedVideoFrame, x, y int, text string, luma byte, clip image.Rectangle) {
 	clip = clip.Intersect(image.Rect(0, 0, frame.Width, frame.Height))
+	scale := t.scale
 	set := func(x, y int) {
-		if image.Pt(x, y).In(clip) {
-			frame.Y[y*frame.Width+x] = luma
+		for dy := range scale {
+			for dx := range scale {
+				if p := image.Pt(x+dx, y+dy); p.In(clip) {
+					frame.Y[p.Y*frame.Width+p.X] = luma
+				}
+			}
 		}
 	}
 	pen := fixed.I(x)
@@ -248,13 +264,13 @@ func (t *dvdMenuText) draw(frame *DecodedVideoFrame, x, y int, text string, luma
 				for column := range 5 {
 					if bits&(1<<(4-column)) != 0 {
 						for offset := range 4 {
-							set(left+column*2+offset%2, y+row*2+offset/2)
+							set(left+(column*2+offset%2)*scale, y+(row*2+offset/2)*scale)
 						}
 					}
 				}
 			}
 		case dvdMenuGlyphJapanese:
-			top, width := y-(dvdMenuJapaneseFontHeight-14)/2, glyph.japanese.width()
+			top, width := y-(dvdMenuJapaneseFontHeight-14)/2*scale, glyph.japanese.width()
 			for row := range dvdMenuJapaneseFontHeight {
 				// Bit width-1-column is the pixel of a column; the bold
 				// row also has column -1.
@@ -265,18 +281,18 @@ func (t *dvdMenuText) draw(frame *DecodedVideoFrame, x, y int, text string, luma
 				bits := glyph.japanese.boldRow(row, neighbour)
 				for column := -1; column < width; column++ {
 					if bits&(1<<(width-1-column)) != 0 {
-						set(left+column, top+row)
+						set(left+column*scale, top+row*scale)
 					}
 				}
 			}
 			japanese := glyph.japanese
-			previous, previousEnd = &japanese, left+width
+			previous, previousEnd = &japanese, left+width*scale
 		case dvdMenuGlyphOutline:
-			segments, err := t.font.font.LoadGlyph(&t.buffer, glyph.outline, fixed.I(dvdMenuOutlineEm), nil)
+			segments, err := t.font.font.LoadGlyph(&t.buffer, glyph.outline, fixed.I(dvdMenuOutlineEm*scale), nil)
 			if err != nil {
 				break // glyph loaded this outline before.
 			}
-			origin := fixed.Point26_6{X: pen, Y: fixed.I(y + dvdMenuOutlineBaseline)}
+			origin := fixed.Point26_6{X: pen, Y: fixed.I(y + dvdMenuOutlineBaseline*scale)}
 			t.rasterizer.setOutline(segments, origin, t.scaleNumerator, t.scaleDenominator)
 			t.rasterizer.draw(clip, func(x, y int, coverage uint8) {
 				pixel := &frame.Y[y*frame.Width+x]
