@@ -109,7 +109,8 @@ func TestInProcessAuthorerWritesNavigableMultiTitleDVD(t *testing.T) {
 	menuPGCOffset := int(binary.BigEndian.Uint32(menuUnit[12:16]))
 	menuPGC := menuUnit[menuPGCOffset:]
 	menuCellPlaybackOffset := int(binary.BigEndian.Uint16(menuPGC[0x00e8:0x00ea]))
-	if !bytes.Equal(menuPGC[4:8], []byte{0, 0, 1, 0xc0}) ||
+	// The menu page is 15 NTSC frames: 00:00:00.15 at 30 fps (rate code 3).
+	if !bytes.Equal(menuPGC[4:8], []byte{0, 0, 0, 0xd5}) ||
 		!bytes.Equal(menuPGC[4:8], menuPGC[menuCellPlaybackOffset+4:menuCellPlaybackOffset+8]) {
 		t.Fatal("VMG menu PGC duration does not match its cell playback duration")
 	}
@@ -342,8 +343,9 @@ func TestDVDMenuPGCIContainsPagePGCs(t *testing.T) {
 				page+1, first, lastVOBU, last, records[page].StartSector, records[page].StartSector, records[page].EndSector)
 		}
 		positionOffset := int(binary.BigEndian.Uint16(pgc[0x00ea:0x00ec]))
-		if got, want := pgc[positionOffset+3], byte(page+1); got != want {
-			t.Fatalf("menu page %d cell ID = %d, want %d", page+1, got, want)
+		// Every page is a VOB of its own: cell 1 of VOB page+1.
+		if vobID, cellID := binary.BigEndian.Uint16(pgc[positionOffset:positionOffset+2]), pgc[positionOffset+3]; int(vobID) != page+1 || cellID != 1 {
+			t.Fatalf("menu page %d cell position = VOB %d cell %d, want VOB %d cell 1", page+1, vobID, cellID, page+1)
 		}
 	}
 	if got := unit[8+2*8]; got != 0 {

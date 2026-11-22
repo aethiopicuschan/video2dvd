@@ -616,15 +616,17 @@ func TestDVDMenuTitleWithJapaneseNamesAndMenuFont(t *testing.T) {
 				titles[i] = EncodedTitle{Name: fmt.Sprintf("夏休みの思い出 Part%d", i+1)}
 			}
 			dir := t.TempDir()
-			menu, pages, err := ExportCreateDVDMenuTitle(context.Background(), titles, profile, dir)
+			menu, pages, err := ExportCreateDVDMenuPages(context.Background(), titles, profile, dir)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(pages) != 2 || len(pages[0]) != 36 {
-				t.Fatalf("menu has %d pages and %d buttons on the first, want 2 and 36", len(pages), len(pages[0]))
+			if len(menu) != 2 || len(pages) != 2 || len(pages[0]) != 36 {
+				t.Fatalf("menu has %d pages and %d buttons on the first, want 2 and 36", len(menu), len(pages[0]))
 			}
-			if info, err := os.Stat(menu.VideoPath); err != nil || info.Size() == 0 {
-				t.Errorf("menu video: %v", err)
+			for _, page := range menu {
+				if info, err := os.Stat(page.VideoPath); err != nil || info.Size() == 0 {
+					t.Errorf("menu video: %v", err)
+				}
 			}
 		})
 	}

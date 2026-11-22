@@ -18,3 +18,7 @@ var (
 func ExportMuxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.Writer, record func(TestDVDVOBURecord) error, buttonPages [][]DVDNAVButton) error {
 	return muxDVDTitleVOB(ctx, title, workDir, dst, record, buttonPages)
 }
+
+func ExportMuxDVDMenuVOB(ctx context.Context, pages []EncodedTitle, buttonPages [][]DVDNAVButton, workDir string, dst io.Writer, record func(TestDVDVOBURecord) error) error {
+	return muxDVDMenuVOB(ctx, pages, buttonPages, workDir, dst, record)
+}

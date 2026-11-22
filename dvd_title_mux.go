@@ -61,7 +61,9 @@ func MuxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 }
 
 // dvdVOBURecord locates one written VOBU. Sectors are relative to the start
-// of the VOB and EndSector is the last sector of the VOBU. The presentation
+// of the VOB set, which is the start of the VOB unless the VOB was placed
+// after others (dvdVOBPlacement), and EndSector is the last sector of the
+// VOBU. The presentation
 // times are those stored in the VOBU's NAV pack.
 type dvdVOBURecord struct {
 	StartSector uint32
@@ -70,7 +72,25 @@ type dvdVOBURecord struct {
 	EndPTM      uint32
 }
 
+// dvdVOBPlacement locates a VOB inside its VOB set: the sector of the set at
+// which the VOB starts, which NAV packs and VOBU records count from, and the
+// VOB ID that its NAV packs carry.
+type dvdVOBPlacement struct {
+	firstSector uint32
+	vobID       uint16
+}
+
+// dvdFirstVOB is the placement of a VOB that starts its VOB set.
+var dvdFirstVOB = dvdVOBPlacement{firstSector: 0, vobID: 1}
+
 func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.Writer, recordVOBU func(dvdVOBURecord) error, buttonPages [][]DVDNAVButton) error {
+	return muxDVDVOB(ctx, title, workDir, dst, recordVOBU, buttonPages, dvdFirstVOB)
+}
+
+func muxDVDVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.Writer, recordVOBU func(dvdVOBURecord) error, buttonPages [][]DVDNAVButton, placement dvdVOBPlacement) error {
+	if placement.vobID == 0 {
+		return errors.New("video2dvd: VOB ID must not be zero")
+	}
 	if ctx == nil {
 		return errors.New("video2dvd: context must not be nil")
 	}
@@ -118,7 +138,7 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 	if err != nil {
 		return err
 	}
-	planner := newDVDVOBMuxer(ctx, title, highlights, videoFile, audioFile)
+	planner := newDVDVOBMuxer(ctx, title, highlights, videoFile, audioFile, placement)
 	if err := planner.run(); err != nil {
 		return err
 	}
@@ -128,7 +148,7 @@ func muxDVDTitleVOB(ctx context.Context, title EncodedTitle, workDir string, dst
 	if _, err := audioFile.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	writer := newDVDVOBMuxer(ctx, title, highlights, videoFile, audioFile)
+	writer := newDVDVOBMuxer(ctx, title, highlights, videoFile, audioFile, placement)
 	writer.dst = dst
 	writer.recordVOBU = recordVOBU
 	writer.plan = planner.vobus
@@ -196,8 +216,11 @@ type dvdVOBMuxer struct {
 	plan       []dvdMuxVOBU
 	search     []dvdVOBUSearchEntry
 
-	clock  mpegSystemClock
-	sector uint64 // sectors produced so far.
+	clock mpegSystemClock
+	// sector is the VOB set sector of the next pack: the VOB's first sector
+	// plus the sectors produced so far.
+	sector uint64
+	vobID  uint16
 	vobus  []dvdMuxVOBU
 
 	current    *dvdMuxPicture // next picture data to send.
@@ -224,7 +247,7 @@ type dvdVOBMuxer struct {
 	syncPending int
 }
 
-func newDVDVOBMuxer(ctx context.Context, title EncodedTitle, highlights []dvdMenuHighlight, video, audio io.Reader) *dvdVOBMuxer {
+func newDVDVOBMuxer(ctx context.Context, title EncodedTitle, highlights []dvdMenuHighlight, video, audio io.Reader, placement dvdVOBPlacement) *dvdVOBMuxer {
 	return &dvdVOBMuxer{
 		ctx:        ctx,
 		title:      title,
@@ -232,6 +255,8 @@ func newDVDVOBMuxer(ctx context.Context, title EncodedTitle, highlights []dvdMen
 		audio:      audio,
 		pictures:   mpeg2PictureReader{ctx: ctx, src: video},
 		clock:      newMPEGSystemClock(defaultProgramMuxRate),
+		sector:     uint64(placement.firstSector),
+		vobID:      placement.vobID,
 	}
 }
 
@@ -714,7 +739,7 @@ func (m *dvdVOBMuxer) buildNAVPack(index int) ([]byte, error) {
 		FirstReferenceEndAddress:  vobu.ReferenceEnds[0],
 		SecondReferenceEndAddress: vobu.ReferenceEnds[1],
 		ThirdReferenceEndAddress:  vobu.ReferenceEnds[2],
-		VOBID:                     1,
+		VOBID:                     m.vobID,
 		CellID:                    vobu.CellID,
 		StartPTM:                  vobu.StartPTM,
 		EndPTM:                    vobu.EndPTM,

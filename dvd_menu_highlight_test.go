@@ -50,35 +50,42 @@ func TestMuxDVDMenuVOBUsCarryHighlightSubpictures(t *testing.T) {
 				titles[i].Name = fmt.Sprintf("clip-%d", i+1)
 			}
 			dir := t.TempDir()
-			menu, pages, err := ExportCreateDVDMenuTitle(context.Background(), titles, profile, dir)
+			menu, pages, err := ExportCreateDVDMenuPages(context.Background(), titles, profile, dir)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(pages) != tc.wantPages {
-				t.Fatalf("menu has %d pages, want %d", len(pages), tc.wantPages)
+			if len(pages) != tc.wantPages || len(menu) != tc.wantPages {
+				t.Fatalf("menu has %d pages and %d button pages, want %d", len(menu), len(pages), tc.wantPages)
 			}
 			var vob bytes.Buffer
 			var records []TestDVDVOBURecord
-			if err := ExportMuxDVDTitleVOB(context.Background(), menu, dir, &vob, func(record TestDVDVOBURecord) error {
+			if err := ExportMuxDVDMenuVOB(context.Background(), menu, pages, dir, &vob, func(record TestDVDVOBURecord) error {
 				records = append(records, record)
 				return nil
-			}, pages); err != nil {
+			}); err != nil {
 				t.Fatal(err)
 			}
-			packs := parseTestVOB(t, vob.Bytes())
 			sectors := vob.Len() / DVDVOBSectorSize
 			if len(records) != len(pages) || records[0].StartSector != 0 || int(records[len(records)-1].EndSector) != sectors-1 {
 				t.Fatalf("VOBU records %+v do not cover the %d pages in %d sectors", records, len(pages), sectors)
 			}
+			// Every page is a VOB of its own with its own clock; packs
+			// are numbered by their sector in the whole menu VOB.
+			packs := make([]testVOBPack, sectors)
 			subpicturePacks := 0
-			for i, pack := range packs {
-				if pack.streamID == 0xbd && pack.payload[0]&0xe0 == 0x20 {
-					subpicturePacks++
-				}
-				// The system clock is the byte clock: it never runs
-				// backwards and two packs never share a value.
-				if i > 0 && pack.scr <= packs[i-1].scr {
-					t.Fatalf("sector %d SCR %d does not follow %d", pack.sector, pack.scr, packs[i-1].scr)
+			for _, record := range records {
+				pagePacks := parseTestVOB(t, vob.Bytes()[int(record.StartSector)*DVDVOBSectorSize:int(record.EndSector+1)*DVDVOBSectorSize])
+				for i, pack := range pagePacks {
+					if pack.streamID == 0xbd && pack.payload[0]&0xe0 == 0x20 {
+						subpicturePacks++
+					}
+					// The system clock is the byte clock: it never runs
+					// backwards and two packs never share a value.
+					if i > 0 && pack.scr <= pagePacks[i-1].scr {
+						t.Fatalf("sector %d SCR %d does not follow %d", pack.sector, pack.scr, pagePacks[i-1].scr)
+					}
+					pack.sector += int(record.StartSector)
+					packs[pack.sector] = pack
 				}
 			}
 			if subpicturePacks != len(pages)*tc.wantStreams {

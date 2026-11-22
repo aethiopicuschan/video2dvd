@@ -168,7 +168,7 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 		return fmt.Errorf("video2dvd: create menu work directory: %w", err)
 	}
 	defer os.RemoveAll(menuWorkDir)
-	menuTitle, menuButtonPages, err := createDVDMenuTitle(ctx, titles, profile, menuWorkDir)
+	menuPages, menuButtonPages, err := createDVDMenuPages(ctx, titles, profile, menuWorkDir)
 	if err != nil {
 		return err
 	}
@@ -178,10 +178,10 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 		return fmt.Errorf("video2dvd: create VIDEO_TS.VOB: %w", err)
 	}
 	menu := dvdAuthoredMenu{records: make([]dvdVOBURecord, 0, len(menuButtonPages))}
-	if err := muxDVDTitleVOB(ctx, menuTitle, menuWorkDir, menuFile, func(record dvdVOBURecord) error {
+	if err := muxDVDMenuVOB(ctx, menuPages, menuButtonPages, menuWorkDir, menuFile, func(record dvdVOBURecord) error {
 		menu.records = append(menu.records, record)
 		return nil
-	}, menuButtonPages); err != nil {
+	}); err != nil {
 		_ = menuFile.Close()
 		return fmt.Errorf("video2dvd: mux title menu: %w", err)
 	}
@@ -196,12 +196,12 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 		return errors.New("video2dvd: generated title menu does not have one VOBU per page")
 	}
 	menu.sectors = uint32(menuInfo.Size() / DVDVOBSectorSize)
-	menu.pageTime, err = dvdIFOTime(time.Second, profile.Standard)
+	menu.pageTime, err = dvdMenuPageTime(menu.records, profile.Standard)
 	if err != nil {
 		return err
 	}
 	// The muxer stores a highlight subpicture in the VOBU of every page.
-	menu.subpictureControl = dvdMenuSubpictureStreamControl(menuTitle.Aspect)
+	menu.subpictureControl = dvdMenuSubpictureStreamControl(profile.Aspect)
 	vmgPlaceholder, vmgSectors, err := buildDVDVMGI(titles, profile, nil, menu)
 	if err != nil {
 		return err
@@ -277,6 +277,23 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 		return err
 	}
 	return ctx.Err()
+}
+
+// dvdMenuPageTime returns the playback time of a menu page cell: the time
+// its VOBU presents, which must be the same for every page. A cell whose
+// playback time disagrees with its VOBUs is not something players are
+// required to cope with.
+func dvdMenuPageTime(records []dvdVOBURecord, standard VideoStandard) ([4]byte, error) {
+	if len(records) == 0 {
+		return [4]byte{}, errors.New("video2dvd: title menu has no VOBU")
+	}
+	span := records[0].EndPTM - records[0].StartPTM
+	for _, record := range records {
+		if record.EndPTM < record.StartPTM || record.EndPTM-record.StartPTM != span {
+			return [4]byte{}, errors.New("video2dvd: title menu pages differ in length")
+		}
+	}
+	return dvdIFOTime(time.Duration(span)*time.Second/90_000, standard)
 }
 
 func validateAuthoringProfile(profile Profile) error {
@@ -590,17 +607,20 @@ func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint3
 	return image, vmgSectors, nil
 }
 
+// buildDVDCellAddressTable builds the C_ADT of the title menu, whose page n
+// is cell 1 of VOB n.
 func buildDVDCellAddressTable(records []dvdVOBURecord, vobSectors uint32) []byte {
 	if len(records) == 0 {
 		records = []dvdVOBURecord{{StartSector: 0, EndSector: vobSectors - 1}}
 	}
 	table := make([]byte, 8+12*len(records))
+	// The first field counts the VOBs of the VOB set.
 	binary.BigEndian.PutUint16(table[0:2], uint16(len(records)))
 	binary.BigEndian.PutUint32(table[4:8], uint32(len(table)-1))
 	for i, record := range records {
 		entry := table[8+i*12 : 20+i*12]
-		binary.BigEndian.PutUint16(entry[0:2], 1) // one VOB ID.
-		entry[2] = byte(i + 1)
+		binary.BigEndian.PutUint16(entry[0:2], uint16(i+1)) // VOB ID.
+		entry[2] = 1                                        // cell ID.
 		binary.BigEndian.PutUint32(entry[4:8], record.StartSector)
 		binary.BigEndian.PutUint32(entry[8:12], record.EndSector)
 	}
@@ -676,16 +696,17 @@ func buildDVDVMGMenuPGCI(menu dvdAuthoredMenu, titleCount int) []byte {
 		copy(cmd[16:24], loop[:])
 		pgc[programMapOffset] = 1
 		cell := pgc[cellPlaybackOffset:]
-		// Menu pages contain a single still frame. Keep that frame visible
-		// until the user chooses a button instead of letting navigation
-		// immediately execute the PGC post command and loop the menu cell.
+		// A menu page is a still cell: after its 15 pictures the last one
+		// stays visible until the user chooses a button, instead of
+		// navigation executing the PGC post command and looping the cell.
 		cell[2] = 0xff
 		copy(cell[4:8], menu.pageTime[:])
 		binary.BigEndian.PutUint32(cell[8:12], menuRecords[page].StartSector)
 		binary.BigEndian.PutUint32(cell[16:20], menuRecords[page].StartSector) // the page's only VOBU.
 		binary.BigEndian.PutUint32(cell[20:24], menuRecords[page].EndSector)
-		binary.BigEndian.PutUint16(cell[24:26], 1)
-		cell[27] = byte(page + 1)
+		// The cell position: the page is cell 1 of VOB page+1.
+		binary.BigEndian.PutUint16(cell[24:26], uint16(page+1))
+		cell[27] = 1
 		pgcs = append(pgcs, pgc)
 	}
 	// Dedicated PLAY ALL PGC: set GPRM0 and jump to title 1.

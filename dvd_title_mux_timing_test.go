@@ -576,8 +576,12 @@ func TestMuxDVDTitleVOBFitsEightMegabitVideo(t *testing.T) {
 	}
 }
 
-func TestMuxDVDTitleVOBMenuPagesAreSeparateCells(t *testing.T) {
-	// Two I pictures: one VOBU, and so one cell, per menu page.
+// The muxer can still put several highlight pages into one VOB as cells 1, 2,
+// and so on. The authorer does not do so for the title menu (each page is a
+// VOB of its own, see TestAuthoredMenuPagesAreSelfContainedVOBs), but a VOB
+// with several highlight cells must stay well formed.
+func TestMuxDVDVOBHighlightPagesAreSeparateCells(t *testing.T) {
+	// Two I pictures: one VOBU, and so one cell, per page.
 	input := newTestMuxInput(t, VideoStandardNTSC, []int{9_000, 9_000}, 1, 1)
 	pages := [][]DVDNAVButton{
 		{{XStart: 10, YStart: 10, XEnd: 100, YEnd: 30, Up: 1, Down: 1, Left: 1, Right: 1}},

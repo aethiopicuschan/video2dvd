@@ -29,7 +29,9 @@ var (
 	ExportBuildDVDVTSTimeMap       = buildDVDVTSTimeMap
 	ExportLetterboxDVDMenuButtons  = letterboxDVDMenuButtons
 	ExportDVDMenuSubpictureControl = dvdMenuSubpictureStreamControl
-	ExportCreateDVDMenuTitle       = createDVDMenuTitle
+	ExportCreateDVDMenuPages       = createDVDMenuPages
+	ExportDVDMenuPageDuration      = dvdMenuPageDuration
+	ExportDVDMenuPageAudioSamples  = dvdMenuPageAudioSamples
 	ExportDVDMenuTitleName         = dvdMenuTitleName
 )
 

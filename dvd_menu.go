@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -43,6 +45,16 @@ const (
 	// dvdMenuControlGap is the least distance between two control buttons.
 	dvdMenuControlGap = 2
 
+	// dvdMenuPagePictures is the number of pictures of a menu page: the page
+	// is shown for that long, as one closed GOP and therefore one VOBU, and
+	// silent audio of the same length plays with it. The cell is a still
+	// cell, so the last picture stays on screen until a button is chosen.
+	// macOS DVD Player needs both: its screen stayed black for a menu of
+	// one picture, with 2 ms of audio or with audio as long as the
+	// picture, and for 15 pictures with 2 ms of audio; it showed 15
+	// pictures with audio as long as them.
+	dvdMenuPagePictures = 15
+
 	// dvdMenuSubpictureSubstream is the private_stream_1 substream of the
 	// first DVD subpicture stream.
 	dvdMenuSubpictureSubstream = 0x20
@@ -77,7 +89,11 @@ type dvdMenuPage struct {
 	titles []dvdMenuEntry
 }
 
-func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Profile, workDir string) (EncodedTitle, [][]DVDNAVButton, error) {
+// createDVDMenuPages draws and encodes the pages of the title menu. Every
+// page is a title of its own, with its own MPEG-2 sequence and its own
+// silent LPCM audio, so that each can be multiplexed as a separate VOB. It
+// returns the pages and the highlight buttons of each.
+func createDVDMenuPages(ctx context.Context, titles []EncodedTitle, profile Profile, workDir string) ([]EncodedTitle, [][]DVDNAVButton, error) {
 	maxButtons := dvdMenuMaxButtons
 	if profile.Aspect == AspectRatio16x9 {
 		maxButtons = dvdMenuRowsPerColumn
@@ -89,7 +105,7 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 		maxButtons -= 2
 	}
 	if len(titles) == 0 {
-		return EncodedTitle{}, nil, errors.New("video2dvd: automatically generated menu requires at least one title")
+		return nil, nil, errors.New("video2dvd: automatically generated menu requires at least one title")
 	}
 	pages := (len(titles) + maxButtons - 1) / maxButtons
 	// PGCs are ordered as menu pages, PLAY ALL, then one title launcher per
@@ -100,49 +116,99 @@ func createDVDMenuTitle(ctx context.Context, titles []EncodedTitle, profile Prof
 		names[i] = dvdMenuTitleName(title)
 	}
 	text := newDVDMenuText(profile)
-	videoPath := filepath.Join(workDir, "menu.m2v")
-	videoFile, err := os.Create(videoPath)
-	if err != nil {
-		return EncodedTitle{}, nil, err
-	}
+	// Every page has the same silent audio.
+	silence := make([]byte, dvdMenuPageAudioSamples(profile.Standard)*dvdLPCMStereoSampleBytes)
+	menuPages := make([]EncodedTitle, 0, pages)
 	buttonPages := make([][]DVDNAVButton, 0, pages)
 	for page := range pages {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		start := page * maxButtons
 		end := min(len(titles), start+maxButtons)
 		layout := layoutDVDMenuPage(text, names[start:end], start, profile.Aspect, page, pages, titleLaunchBase)
 		var encoded bytes.Buffer
-		encoder, encodeErr := NewMPEG2VideoEncoder(&encoded, profile)
-		if encodeErr == nil {
-			encodeErr = encoder.WriteFrame(newDVDMenuFrame(profile, layout, text))
+		encoder, err := NewMPEG2VideoEncoder(&encoded, profile)
+		if err != nil {
+			return nil, nil, err
 		}
-		if encodeErr == nil {
-			encodeErr = encoder.Close()
+		frame := newDVDMenuFrame(profile, layout, text)
+		for range dvdMenuPagePictures {
+			if err := encoder.WriteFrame(frame); err != nil {
+				return nil, nil, err
+			}
 		}
-		if encodeErr != nil {
-			_ = videoFile.Close()
-			return EncodedTitle{}, nil, encodeErr
+		if err := encoder.Close(); err != nil {
+			return nil, nil, err
 		}
-		if _, err := videoFile.Write(encoded.Bytes()); err != nil {
-			_ = videoFile.Close()
-			return EncodedTitle{}, nil, err
+		videoPath := filepath.Join(workDir, fmt.Sprintf("menu-%02d.m2v", page+1))
+		if err := os.WriteFile(videoPath, encoded.Bytes(), 0o600); err != nil {
+			return nil, nil, err
 		}
+		audioPath := filepath.Join(workDir, fmt.Sprintf("menu-%02d.lpcm", page+1))
+		if err := os.WriteFile(audioPath, silence, 0o600); err != nil {
+			return nil, nil, err
+		}
+		menuPages = append(menuPages, EncodedTitle{
+			VideoPath: videoPath, AudioPath: audioPath,
+			VideoCodec: VideoCodecMPEG2, AudioCodec: AudioCodecLPCM,
+			Aspect: profile.Aspect, Width: profile.FrameWidth, Height: profile.FrameHeight,
+			FrameRateNumerator:   menuFrameRateNumerator(profile.Standard),
+			FrameRateDenominator: menuFrameRateDenominator(profile.Standard),
+			Duration:             dvdMenuPageDuration(profile.Standard),
+		})
 		buttonPages = append(buttonPages, layout.buttons())
 	}
-	if closeErr := videoFile.Close(); closeErr != nil {
-		return EncodedTitle{}, nil, closeErr
+	return menuPages, buttonPages, nil
+}
+
+// muxDVDMenuVOB writes the menu pages to dst one after the other, each as a
+// VOB of its own: page n is VOB n of the menu VOB set and its single cell is
+// cell 1 of that VOB. A page is played by itself, as a still cell reached
+// through its own PGC, so each VOB carries all of the page's audio and its
+// own clock, just as the menu of a one-page disc does. In one continuous VOB
+// the audio of a page's last fraction of a second would be multiplexed into
+// the next page, behind its NAV pack. recordVOBU receives the VOBU of every
+// page in order.
+func muxDVDMenuVOB(ctx context.Context, pages []EncodedTitle, buttonPages [][]DVDNAVButton, workDir string, dst io.Writer, recordVOBU func(dvdVOBURecord) error) error {
+	if len(pages) != len(buttonPages) {
+		return errors.New("video2dvd: menu pages and button pages differ in number")
 	}
-	audioPath := filepath.Join(workDir, "menu.lpcm")
-	if err := os.WriteFile(audioPath, []byte{0, 0, 0, 0}, 0o600); err != nil {
-		return EncodedTitle{}, nil, err
+	if len(pages) > math.MaxUint16 {
+		return errors.New("video2dvd: menu has more pages than a VOB set has VOB IDs")
 	}
-	return EncodedTitle{
-		VideoPath: videoPath, AudioPath: audioPath,
-		VideoCodec: VideoCodecMPEG2, AudioCodec: AudioCodecLPCM,
-		Aspect: profile.Aspect, Width: profile.FrameWidth, Height: profile.FrameHeight,
-		FrameRateNumerator:   menuFrameRateNumerator(profile.Standard),
-		FrameRateDenominator: menuFrameRateDenominator(profile.Standard),
-		Duration:             time.Duration(pages) * time.Second,
-	}, buttonPages, ctx.Err()
+	var nextSector uint32
+	for page, title := range pages {
+		records := 0
+		err := muxDVDVOB(ctx, title, workDir, dst, func(record dvdVOBURecord) error {
+			records++
+			nextSector = record.EndSector + 1
+			return recordVOBU(record)
+		}, buttonPages[page:page+1], dvdVOBPlacement{firstSector: nextSector, vobID: uint16(page + 1)})
+		if err != nil {
+			return fmt.Errorf("menu page %d: %w", page+1, err)
+		}
+		if records != 1 {
+			return fmt.Errorf("menu page %d is %d VOBUs, want one", page+1, records)
+		}
+	}
+	return nil
+}
+
+// dvdLPCMStereoSampleBytes is the size of one 16-bit stereo LPCM sample.
+const dvdLPCMStereoSampleBytes = 4
+
+// dvdMenuPageDuration returns how long the pictures of one menu page last.
+func dvdMenuPageDuration(standard VideoStandard) time.Duration {
+	numerator, denominator := menuFrameRateNumerator(standard), menuFrameRateDenominator(standard)
+	return time.Duration(dvdMenuPagePictures*denominator) * time.Second / time.Duration(numerator)
+}
+
+// dvdMenuPageAudioSamples returns the number of 48 kHz samples that last as
+// long as the pictures of one menu page: 24024 for NTSC and 28800 for PAL.
+func dvdMenuPageAudioSamples(standard VideoStandard) int {
+	numerator, denominator := menuFrameRateNumerator(standard), menuFrameRateDenominator(standard)
+	return dvdMenuPagePictures * denominator * 48_000 / numerator
 }
 
 // dvdMenuTitleName returns the name shown for a title: its Name, or else the
