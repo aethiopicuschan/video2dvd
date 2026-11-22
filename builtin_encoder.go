@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -70,6 +72,9 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 	if err := validateEncoderProfile(profile); err != nil {
 		return EncodedTitle{}, err
 	}
+	if rate := profileVideoBitrate(profile); rate < mpeg2MinVideoBitrate || rate > mpeg2MaxVideoBitrate {
+		return EncodedTitle{}, fmt.Errorf("video2dvd: video bitrate must be between %d and %d bit/s", mpeg2MinVideoBitrate, mpeg2MaxVideoBitrate)
+	}
 	// Subtitles are read and drawn before any video is encoded, so that a
 	// track that cannot be read fails the title early and their size counts
 	// towards the estimate below.
@@ -81,17 +86,6 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 	if err != nil {
 		return EncodedTitle{}, fmt.Errorf("video2dvd: prepare DVD subtitles: %w", err)
 	}
-	// The container duration only feeds the up-front capacity estimate; live
-	// WebM has none, and the title length comes from the frames encoded below.
-	estimatedDuration := info.Duration
-	if estimatedDuration <= 0 {
-		estimatedDuration = videoTrack.Duration
-	}
-	if estimatedDuration > 0 {
-		if err := checkEstimatedTitleSize(estimatedDuration, encoderOutputLimit(profile)-subtitleSectors*DVDVOBSectorSize, effectiveMPEG2VideoBitrate(profile)); err != nil {
-			return EncodedTitle{}, err
-		}
-	}
 	audioInfo := info
 	if input.AudioPath != input.VideoPath {
 		audioInfo, err = ProbeMedia(input.AudioPath)
@@ -99,12 +93,64 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 			return EncodedTitle{}, fmt.Errorf("video2dvd: inspect audio source: %w", err)
 		}
 	}
-	audioTrack, hasAudio := firstSupportedAudioTrack(audioInfo, input.AudioTrackIndex)
-	if !hasAudio && hasAnyAudioTrack(audioInfo) {
-		return EncodedTitle{}, errors.New("video2dvd: prepare DVD audio: input has audio tracks but none are supported by the built-in decoder (MP4 AAC-LC/AC-3, WebM Opus)")
+	// audioTracks lists the tracks of the title's audio streams; a nil
+	// entry is a stream of silence, for an input without audio.
+	var audioTracks []*TrackInfo
+	if input.AudioTracks != nil {
+		if input.AudioTrackIndex != nil {
+			return EncodedTitle{}, errors.New("video2dvd: AudioTrackIndex and AudioTracks cannot both be set")
+		}
+		indexes, err := selectInputAudioTracks(audioInfo, input.AudioTracks, false)
+		if err != nil {
+			return EncodedTitle{}, fmt.Errorf("video2dvd: prepare DVD audio: %w", err)
+		}
+		for _, index := range indexes {
+			audioTracks = append(audioTracks, &audioInfo.Tracks[index])
+		}
+	} else {
+		audioTrack, hasAudio := firstSupportedAudioTrack(audioInfo, input.AudioTrackIndex)
+		if !hasAudio && hasAnyAudioTrack(audioInfo) {
+			return EncodedTitle{}, errors.New("video2dvd: prepare DVD audio: input has audio tracks but none are supported by the built-in decoder (MP4 AAC-LC/AC-3, WebM Opus)")
+		}
+		if hasAudio {
+			if err := validateInputAudioChannels(audioTrack); err != nil {
+				return EncodedTitle{}, err
+			}
+			audioTracks = []*TrackInfo{&audioTrack}
+		} else {
+			audioTracks = []*TrackInfo{nil}
+		}
 	}
-	if hasAudio {
-		if err := validateInputAudioChannels(audioTrack); err != nil {
+	audioCodec := titleAudioCodec(profile.AudioFormat, len(audioTracks))
+	audioCodecs := slices.Repeat([]string{audioCodec}, len(audioTracks))
+	ac3Bitrate := profile.AC3Bitrate
+	if ac3Bitrate == 0 {
+		ac3Bitrate = DefaultAC3Bitrate
+	}
+	if !slices.Contains(ac3Bitrates, ac3Bitrate) {
+		return EncodedTitle{}, fmt.Errorf("%w: AC-3 bitrate %d is not one of %v", ErrInvalidProfile, ac3Bitrate, ac3Bitrates)
+	}
+	// Audio streams beyond one LPCM stream may leave the video less room.
+	videoBitrate, err := titleVideoBitrate(profile, audioCodecs)
+	if err != nil {
+		return EncodedTitle{}, err
+	}
+	videoProfile := profile
+	if videoBitrate < effectiveMPEG2VideoBitrate(profile) {
+		videoProfile.VideoBitrate = videoBitrate
+	}
+	// The container duration only feeds the up-front capacity estimate; live
+	// WebM has none, and the title length comes from the frames encoded below.
+	estimatedDuration := info.Duration
+	if estimatedDuration <= 0 {
+		estimatedDuration = videoTrack.Duration
+	}
+	if estimatedDuration > 0 {
+		var audioBytesPerSecond int64
+		for _, codec := range audioCodecs {
+			audioBytesPerSecond += int64(dvdAudioStreamBitrate(codec, ac3Bitrate) / 8)
+		}
+		if err := checkEstimatedTitleSize(estimatedDuration, encoderOutputLimit(profile)-subtitleSectors*DVDVOBSectorSize, videoBitrate, audioBytesPerSecond); err != nil {
 			return EncodedTitle{}, err
 		}
 	}
@@ -112,19 +158,15 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		return EncodedTitle{}, fmt.Errorf("video2dvd: create encoder work directory: %w", err)
 	}
 	videoPath := filepath.Join(workDir, "video.m2v")
-	audioPath := filepath.Join(workDir, "audio.lpcm")
-	videoCreated, audioCreated := false, false
-	var subtitlePaths []string
+	videoCreated := false
+	var audioPaths, subtitlePaths []string
 	cleanup := true
 	defer func() {
 		if cleanup {
 			if videoCreated {
 				_ = os.Remove(videoPath)
 			}
-			if audioCreated {
-				_ = os.Remove(audioPath)
-			}
-			for _, path := range subtitlePaths {
+			for _, path := range slices.Concat(audioPaths, subtitlePaths) {
 				_ = os.Remove(path)
 			}
 		}
@@ -162,9 +204,9 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 	}
 	videoWriter := &sizeLimitedWriter{dst: videoFile, limit: encoderOutputLimit(profile)}
 	if film {
-		videoEncoder, err = NewMPEG2SoftTelecineEncoder(videoWriter, profile)
+		videoEncoder, err = NewMPEG2SoftTelecineEncoder(videoWriter, videoProfile)
 	} else {
-		videoEncoder, err = NewMPEG2VideoEncoder(videoWriter, profile)
+		videoEncoder, err = NewMPEG2VideoEncoder(videoWriter, videoProfile)
 	}
 	if err != nil {
 		_ = videoFile.Close()
@@ -221,33 +263,29 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		return EncodedTitle{}, err
 	}
 
-	audioFile, err := os.OpenFile(audioPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return EncodedTitle{}, fmt.Errorf("video2dvd: create LPCM output: %w", err)
-	}
-	audioCreated = true
-	audioWriter := &sizeLimitedWriter{dst: audioFile, limit: encoderOutputLimit(profile)}
-	audioTimeline, err := newPCMWindowWriterSamples(audioWriter, audioSamples, audioOffset)
-	if err != nil {
-		_ = audioFile.Close()
-		return EncodedTitle{}, err
-	}
-	if hasAudio {
-		if audioTrack.Codec == "opus" {
-			err = DecodeWebMAudio(ctx, input.AudioPath, &audioTrack.Index, audioTimeline.WriteChunk)
-		} else {
-			err = DecodeMP4Audio(ctx, input.AudioPath, &audioTrack.Index, audioTimeline.WriteChunk)
+	// Every stream is placed on the title timeline like the single stream
+	// of a title always was, and cut or padded to the title's length.
+	encodedAudio := make([]EncodedAudio, 0, len(audioTracks))
+	for i, track := range audioTracks {
+		name := "audio.lpcm"
+		if audioCodec == AudioCodecAC3 {
+			name = fmt.Sprintf("audio-%02d.ac3", i+1)
+		} else if i > 0 {
+			name = fmt.Sprintf("audio-%02d.lpcm", i+1)
 		}
-	}
-	if err == nil {
-		err = audioTimeline.Finish()
-	}
-	closeAudioErr := audioFile.Close()
-	if err != nil {
-		return EncodedTitle{}, fmt.Errorf("video2dvd: prepare DVD audio: %w", err)
-	}
-	if closeAudioErr != nil {
-		return EncodedTitle{}, fmt.Errorf("video2dvd: close LPCM output: %w", closeAudioErr)
+		path := filepath.Join(workDir, name)
+		if err := encodeTitleAudioStream(ctx, path, input.AudioPath, track, audioCodec, ac3Bitrate, audioSamples, audioOffset, encoderOutputLimit(profile)); err != nil {
+			if !errors.Is(err, os.ErrExist) {
+				audioPaths = append(audioPaths, path)
+			}
+			return EncodedTitle{}, err
+		}
+		audioPaths = append(audioPaths, path)
+		stream := EncodedAudio{Path: name, Codec: audioCodec}
+		if track != nil && input.AudioTracks != nil {
+			stream.Language = DVDLanguageCode(track.Language)
+		}
+		encodedAudio = append(encodedAudio, stream)
 	}
 	if err := ctx.Err(); err != nil {
 		return EncodedTitle{}, err
@@ -276,9 +314,9 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 	cleanup = false
 	return EncodedTitle{
 		VideoPath:            "video.m2v",
-		AudioPath:            "audio.lpcm",
+		AudioPath:            encodedAudio[0].Path,
 		VideoCodec:           VideoCodecMPEG2,
-		AudioCodec:           AudioCodecLPCM,
+		AudioCodec:           audioCodec,
 		Aspect:               profile.Aspect,
 		Width:                profile.FrameWidth,
 		Height:               profile.FrameHeight,
@@ -286,7 +324,65 @@ func (e *InProcessEncoder) EncodeStreams(ctx context.Context, input MediaInput, 
 		FrameRateDenominator: fpsD,
 		Duration:             duration,
 		Subtitles:            encodedSubtitles,
+		Audio:                titleAudioList(encodedAudio, input.AudioTracks != nil),
 	}, nil
+}
+
+// titleAudioList returns the Audio list of an encoded title: nil for the
+// single stream of a title whose tracks were not chosen with
+// MediaInput.AudioTracks or Options.IncludeAllAudio, which keeps such a
+// title as it always was.
+func titleAudioList(streams []EncodedAudio, chosen bool) []EncodedAudio {
+	if !chosen && len(streams) == 1 {
+		return nil
+	}
+	return streams
+}
+
+// encodeTitleAudioStream decodes one audio track, or makes silence for a nil
+// track, places it on the title timeline (offset, length in samples) and
+// writes it to path as LPCM or AC-3.
+func encodeTitleAudioStream(ctx context.Context, path, source string, track *TrackInfo, codec string, ac3Bitrate int, samples int64, offset time.Duration, limit int64) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("video2dvd: create audio output: %w", err)
+	}
+	limited := &sizeLimitedWriter{dst: file, limit: limit}
+	var pcm io.Writer = limited
+	var ac3 *ac3Writer
+	if codec == AudioCodecAC3 {
+		if ac3, err = newAC3Writer(limited, ac3Bitrate); err != nil {
+			_ = file.Close()
+			return err
+		}
+		pcm = ac3
+	}
+	timeline, err := newPCMWindowWriterSamples(pcm, samples, offset)
+	if err != nil {
+		_ = file.Close()
+		return err
+	}
+	if track != nil {
+		if track.Codec == "opus" {
+			err = DecodeWebMAudio(ctx, source, &track.Index, timeline.WriteChunk)
+		} else {
+			err = DecodeMP4Audio(ctx, source, &track.Index, timeline.WriteChunk)
+		}
+	}
+	if err == nil {
+		err = timeline.Finish()
+	}
+	if err == nil && ac3 != nil {
+		err = ac3.Close()
+	}
+	closeErr := file.Close()
+	if err != nil {
+		return fmt.Errorf("video2dvd: prepare DVD audio: %w", err)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("video2dvd: close audio output: %w", closeErr)
+	}
+	return nil
 }
 
 // inputSubtitle is a subtitle track read for a title: its events on the
@@ -360,20 +456,38 @@ func titleLengthFromFields(fields int64, fpsN, fpsD int) (time.Duration, int64, 
 }
 
 // validateInputAudioChannels rejects layouts the built-in decoders cannot
-// downmix before any video is encoded.
+// decode to stereo before any video is encoded. AC-3 is decoded and
+// downmixed by go-264 for every acmod, with or without LFE. Opus with more
+// than two channels is downmixed when it uses channel mapping family 1. The
+// pure-Go AAC decoders (go-264 and aac-go) only parse mono and stereo
+// channel configurations, so multichannel AAC stays rejected.
 func validateInputAudioChannels(track TrackInfo) error {
-	channels := track.Channels
-	if track.Codec == "mp4a" && len(track.CodecConfig) >= 2 {
-		// The AudioSpecificConfig is authoritative; the sample entry's
-		// channel count is often left at 2.
-		objectType := track.CodecConfig[0] >> 3
-		frequencyIndex := (track.CodecConfig[0]&0x07)<<1 | track.CodecConfig[1]>>7
-		if configured := int(track.CodecConfig[1]>>3) & 0x0f; configured != 0 && objectType != 31 && frequencyIndex != 15 {
-			channels = configured
+	switch track.Codec {
+	case "mp4a":
+		channels := track.Channels
+		if len(track.CodecConfig) >= 2 {
+			// The AudioSpecificConfig is authoritative; the sample entry's
+			// channel count is often left at 2.
+			objectType := track.CodecConfig[0] >> 3
+			frequencyIndex := (track.CodecConfig[0]&0x07)<<1 | track.CodecConfig[1]>>7
+			if configured := int(track.CodecConfig[1]>>3) & 0x0f; configured != 0 && objectType != 31 && frequencyIndex != 15 {
+				channels = configured
+			}
 		}
-	}
-	if (track.Codec == "mp4a" || track.Codec == "opus") && channels > 2 {
-		return fmt.Errorf("video2dvd: prepare DVD audio: %d-channel %s audio is not supported by the built-in decoder (mono or stereo only)", channels, track.Codec)
+		if channels > 2 {
+			return fmt.Errorf("video2dvd: prepare DVD audio: %d-channel AAC audio is not supported by the built-in AAC decoder (mono or stereo only; multichannel AC-3 and Opus are downmixed)", channels)
+		}
+	case "opus":
+		if opusTrackChannels(track) <= 2 {
+			return nil
+		}
+		head, err := parseOpusHead(track.CodecConfig)
+		if err != nil {
+			return fmt.Errorf("video2dvd: prepare DVD audio: %d-channel Opus audio cannot be downmixed: %s", track.Channels, strings.TrimPrefix(err.Error(), "video2dvd: "))
+		}
+		if _, err := opusDownmixLayout(head); err != nil {
+			return fmt.Errorf("video2dvd: prepare DVD audio: %s", strings.TrimPrefix(err.Error(), "video2dvd: "))
+		}
 	}
 	return nil
 }
@@ -413,12 +527,58 @@ func firstSupportedAudioTrack(info MP4Info, requested *int) (TrackInfo, bool) {
 		}
 		return TrackInfo{}, false
 	}
-	for _, track := range info.Tracks {
-		if track.Kind == TrackKindAudio && supportedInputAudioCodec(track.Codec) {
-			return track, true
+	// The default-marked track is only preferred when it can be decoded,
+	// so that a file whose marked track is multichannel AAC still converts
+	// with another one; when no track can, the first supported one is
+	// returned and its validation explains why.
+	if track, ok := selectDefaultTrack(info, func(track TrackInfo) bool {
+		return track.Kind == TrackKindAudio && supportedInputAudioCodec(track.Codec) && validateInputAudioChannels(track) == nil
+	}); ok {
+		return track, true
+	}
+	return selectDefaultTrack(info, func(track TrackInfo) bool {
+		return track.Kind == TrackKindAudio && supportedInputAudioCodec(track.Codec)
+	})
+}
+
+// hasDefaultMark reports whether a track of info is marked as a default
+// track: an MP4 track that is enabled, or a WebM track whose FlagDefault is
+// 1. A WebM track without the element, which Matroska makes a default
+// track, counts only when another track of the same kind is marked as not
+// default: ffmpeg writes FlagDefault only for the tracks that are not, while
+// in files from tools that write no FlagDefault at all every track would
+// otherwise be marked.
+func hasDefaultMark(info MP4Info, track TrackInfo) bool {
+	if !track.Default {
+		return false
+	}
+	if !track.defaultImplied {
+		return true
+	}
+	for _, other := range info.Tracks {
+		if other.Kind == track.Kind && !other.Default {
+			return true
 		}
 	}
-	return TrackInfo{}, false
+	return false
+}
+
+// selectDefaultTrack returns the first track that matches and carries a
+// default mark, or else the first track that matches.
+func selectDefaultTrack(info MP4Info, matches func(TrackInfo) bool) (TrackInfo, bool) {
+	first, found := TrackInfo{}, false
+	for _, track := range info.Tracks {
+		if !matches(track) {
+			continue
+		}
+		if hasDefaultMark(info, track) {
+			return track, true
+		}
+		if !found {
+			first, found = track, true
+		}
+	}
+	return first, found
 }
 
 func selectInputVideoTrack(info MP4Info, requested *int) (TrackInfo, error) {
@@ -521,12 +681,15 @@ func encoderOutputLimit(profile Profile) int64 {
 	return DVD5CapacityBytes
 }
 
-func checkEstimatedTitleSize(duration time.Duration, capacity int64, videoBitrate int) error {
+// checkEstimatedTitleSize refuses a title whose video and audio, at the
+// given rates, would not fit capacity. One LPCM stream is 192000 bytes a
+// second.
+func checkEstimatedTitleSize(duration time.Duration, capacity int64, videoBitrate int, audioBytesPerSecond int64) error {
 	videoBytes, err := estimateRateBytes(duration, int64(videoBitrate)/8)
 	if err != nil {
 		return err
 	}
-	audioBytes, err := estimateRateBytes(duration, 192_000) // 48 kHz, 16-bit stereo LPCM.
+	audioBytes, err := estimateRateBytes(duration, audioBytesPerSecond)
 	if err != nil {
 		return err
 	}

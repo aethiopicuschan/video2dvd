@@ -59,6 +59,8 @@ type testWebMTrack struct {
 	name                    string
 	private                 []byte
 	width, height           int
+	// flagDefault, when not empty, is written as FlagDefault: "0" or "1".
+	flagDefault string
 }
 
 // testWebMBlock is one block of a test WebM file. A block with a duration
@@ -97,6 +99,9 @@ func writeTestWebM(t *testing.T, name string, tracks []testWebMTrack, blocks []t
 		}
 		if track.private != nil {
 			fields = append(fields, testEBMLElement(0x63a2, track.private))
+		}
+		if track.flagDefault != "" {
+			fields = append(fields, testEBMLUint(0x88, uint64(track.flagDefault[0]-'0')))
 		}
 		switch track.trackType {
 		case 1:

@@ -63,7 +63,33 @@ type Profile struct {
 	DisableSoftTelecine bool
 	// ShowSubtitles is Options.ShowSubtitles.
 	ShowSubtitles bool
+	// AudioFormat and AC3Bitrate are Options.AudioFormat and
+	// Options.AC3Bitrate; zero values select the defaults.
+	AudioFormat AudioFormat
+	AC3Bitrate  int
 }
+
+// AudioFormat selects how the built-in encoder codes the audio streams of
+// a title.
+type AudioFormat uint8
+
+const (
+	// AudioFormatAuto codes a title with one audio stream as LPCM and a
+	// title with several as AC-3: two LPCM streams beside full-rate video
+	// exceed the DVD multiplex rate.
+	AudioFormatAuto AudioFormat = iota
+	// AudioFormatLPCM codes every stream as 16-bit 48 kHz stereo LPCM. With
+	// several streams the video bitrate is lowered so that video and audio
+	// fit the multiplex rate; see Options.AudioFormat.
+	AudioFormatLPCM
+	// AudioFormatAC3 codes every stream as 48 kHz stereo AC-3 at
+	// Options.AC3Bitrate.
+	AudioFormatAC3
+)
+
+// DefaultAC3Bitrate is the AC-3 bitrate used when Options.AC3Bitrate is
+// zero, in bit/s.
+const DefaultAC3Bitrate = 192_000
 
 // Options controls conversion and DVD authoring. The zero value selects NTSC,
 // 16:9, and the full-resolution DVD raster for that standard.
@@ -104,15 +130,47 @@ type Options struct {
 	// DVD subtitles, which the viewer turns on and off and chooses between
 	// with the player's subtitle button. For each input whose
 	// MediaInput.SubtitleTracks is nil, every track of its video file that
-	// ReadSubtitleCues can read becomes a subtitle stream, in track order and
-	// up to the 32 streams of a title; other subtitle tracks are skipped. An
+	// ReadSubtitleCues can read becomes a subtitle stream, up to the 32
+	// streams of a title: the one that carries a default mark (see
+	// TrackInfo.Default) first and the others in track order; other subtitle
+	// tracks are skipped. An
 	// input without such tracks gets no subtitles. Subtitles are drawn as
 	// WriteDVDSubtitleStream describes, with MenuFont when it is set.
 	IncludeSubtitles bool
 	// ShowSubtitles turns the first subtitle stream of a title on when the
 	// title starts playing. By default a title with subtitles starts with
-	// them hidden. It has no effect on titles without subtitles.
+	// them hidden. It has no effect on titles without subtitles, and
+	// ShowDefaultSubtitles and MediaInput.ShowSubtitles take precedence.
 	ShowSubtitles bool
+	// ShowDefaultSubtitles starts a title with its first subtitle stream
+	// shown when the track it comes from carries the container's default
+	// mark (TrackInfo.Default; for WebM a track without a FlagDefault element
+	// counts only when another subtitle track has FlagDefault 0, as ffmpeg
+	// writes it), and hidden otherwise, instead of following
+	// ShowSubtitles. MediaInput.ShowSubtitles takes precedence over it.
+	ShowDefaultSubtitles bool
+	// IncludeAllAudio records every audio track of an input that the
+	// built-in decoders read, up to the 8 audio streams of a title, for
+	// each input whose MediaInput.AudioTracks and AudioTrackIndex are nil;
+	// tracks they cannot decode, such as multichannel AAC, are skipped. The track that
+	// carries a default mark (or else the first) becomes audio stream 1,
+	// which players start with; the others follow in track order. Each
+	// stream is labelled with its track's language (see DVDLanguageCode).
+	IncludeAllAudio bool
+	// AudioFormat selects LPCM or AC-3 for the audio; the zero value,
+	// AudioFormatAuto, keeps a single stream LPCM and codes several as AC-3.
+	// With AudioFormatLPCM and several streams the video bitrate is lowered
+	// to make room: LPCM takes 1.536 Mbit/s per stream, and video and audio
+	// together may take 9.036 Mbit/s, the share of a 7.5 Mbit/s video and
+	// one LPCM stream. A title whose video would get less than 2 Mbit/s that
+	// way, which is the case from five LPCM streams on, is refused before
+	// anything is encoded. AC-3 streams take their bitrate from that share
+	// as well, so eight streams at 448 kbit/s leave 5.45 Mbit/s to video.
+	AudioFormat AudioFormat
+	// AC3Bitrate is the bitrate of every AC-3 stream in bit/s: 192000,
+	// 224000, 256000, 320000, 384000 or 448000. Zero selects
+	// DefaultAC3Bitrate.
+	AC3Bitrate int
 }
 
 func (o Options) profile() (Profile, error) {
@@ -131,12 +189,21 @@ func (o Options) profile() (Profile, error) {
 	if o.DiscCapacityBytes == 0 {
 		o.DiscCapacityBytes = DVD5CapacityBytes
 	}
+	if o.AudioFormat > AudioFormatAC3 {
+		return Profile{}, ErrInvalidProfile
+	}
+	if o.AC3Bitrate == 0 {
+		o.AC3Bitrate = DefaultAC3Bitrate
+	}
+	if !slices.Contains(ac3Bitrates, o.AC3Bitrate) {
+		return Profile{}, fmt.Errorf("%w: AC-3 bitrate %d is not one of %v", ErrInvalidProfile, o.AC3Bitrate, ac3Bitrates)
+	}
 
 	switch o.Standard {
 	case VideoStandardNTSC:
-		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 480, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma, MenuFont: o.MenuFont, VideoBitrate: o.VideoBitrate, DisableSoftTelecine: o.DisableSoftTelecine, ShowSubtitles: o.ShowSubtitles}, nil
+		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 480, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma, MenuFont: o.MenuFont, VideoBitrate: o.VideoBitrate, DisableSoftTelecine: o.DisableSoftTelecine, ShowSubtitles: o.ShowSubtitles, AudioFormat: o.AudioFormat, AC3Bitrate: o.AC3Bitrate}, nil
 	case VideoStandardPAL:
-		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 576, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma, MenuFont: o.MenuFont, VideoBitrate: o.VideoBitrate, DisableSoftTelecine: o.DisableSoftTelecine, ShowSubtitles: o.ShowSubtitles}, nil
+		return Profile{Standard: o.Standard, Aspect: o.Aspect, FrameWidth: 720, FrameHeight: 576, DiscCapacityBytes: o.DiscCapacityBytes, MenuTitle: o.MenuTitle, MenuBackgroundLuma: o.MenuBackgroundLuma, MenuTextLuma: o.MenuTextLuma, MenuFont: o.MenuFont, VideoBitrate: o.VideoBitrate, DisableSoftTelecine: o.DisableSoftTelecine, ShowSubtitles: o.ShowSubtitles, AudioFormat: o.AudioFormat, AC3Bitrate: o.AC3Bitrate}, nil
 	default:
 		return Profile{}, ErrInvalidProfile
 	}
@@ -173,6 +240,33 @@ type EncodedTitle struct {
 	// stream order. Their files may be empty; a stream without units has no
 	// subtitles to show.
 	Subtitles []EncodedSubtitle
+	// ShowSubtitles, if not nil, decides for this title whether its first
+	// subtitle stream is shown when it starts, instead of
+	// Profile.ShowSubtitles. The Converter sets it from
+	// MediaInput.ShowSubtitles and Options.ShowDefaultSubtitles unless the
+	// encoder did.
+	ShowSubtitles *bool
+	// Audio lists the audio streams of the title, at most 8, in DVD stream
+	// order; the first is the one players start with. When it is empty the
+	// title has the one stream of AudioPath and AudioCodec. When it is set,
+	// AudioPath and AudioCodec are those of its first stream (the Converter
+	// fills them in when they are empty). The built-in authorer multiplexes
+	// LPCM and AC-3 streams.
+	Audio []EncodedAudio
+}
+
+// EncodedAudio is one audio stream of an EncodedTitle.
+type EncodedAudio struct {
+	// Path is the stream: big-endian 16-bit 48 kHz stereo samples for
+	// LPCM, as WriteDVDLPCM writes them, or AC-3 syncframes at 48 kHz.
+	// Relative paths are resolved from the work directory.
+	Path string
+	// Codec is AudioCodecLPCM or AudioCodecAC3.
+	Codec string
+	// Language is the ISO 639-1 code of the stream, such as "ja", which
+	// players show when switching audio (see DVDLanguageCode); empty marks
+	// it as unspecified.
+	Language string
 }
 
 // EncodedSubtitle is one DVD subtitle stream of an EncodedTitle.
@@ -200,7 +294,19 @@ type EncodedSubtitle struct {
 // read, and a title has at most 32 streams. Nil leaves the choice to
 // Options.IncludeSubtitles; an empty, non-nil list records no subtitles.
 // Subtitles follow the video: they keep their place on the timeline of
-// VideoPath, whatever AudioOffset is.
+// VideoPath, whatever AudioOffset is. ShowSubtitles, if not nil, decides
+// whether the title's first subtitle stream is shown when it starts, over
+// Options.ShowDefaultSubtitles and Options.ShowSubtitles.
+//
+// AudioTracks lists the audio tracks to record as the title's audio
+// streams, in stream order: the first is audio stream 1, which players
+// start with. They are tracks of AudioPath, or of VideoPath when AudioPath
+// is empty, at most 8, each of a codec the built-in decoders read; all are
+// placed on the timeline like a single audio track, including AudioOffset.
+// It cannot be combined with AudioTrackIndex. Nil leaves the choice to
+// Options.IncludeAllAudio and otherwise records one track: AudioTrackIndex,
+// or the first supported track that carries a default mark
+// (TrackInfo.Default), or the first supported track.
 type MediaInput struct {
 	VideoPath       string
 	AudioPath       string
@@ -208,6 +314,8 @@ type MediaInput struct {
 	AudioTrackIndex *int
 	AudioOffset     time.Duration
 	SubtitleTracks  []int
+	ShowSubtitles   *bool
+	AudioTracks     []int
 }
 
 const (
@@ -286,7 +394,7 @@ func (c *Converter) ConvertSources(ctx context.Context, inputs []MediaInput, out
 		return err
 	}
 
-	mediaInputs, err := validateMediaInputs(inputs, options.IncludeSubtitles)
+	mediaInputs, err := validateMediaInputs(inputs, options, profile)
 	if err != nil {
 		return err
 	}
@@ -334,13 +442,16 @@ func (c *Converter) ConvertSources(ctx context.Context, inputs []MediaInput, out
 		var title EncodedTitle
 		if streamEncoder, ok := c.encoder.(StreamEncoder); ok {
 			title, err = streamEncoder.EncodeStreams(ctx, input, workDir, profile)
-		} else if input.AudioPath == input.VideoPath && input.VideoTrackIndex == nil && input.AudioTrackIndex == nil && input.AudioOffset == 0 && len(input.SubtitleTracks) == 0 {
+		} else if input.AudioPath == input.VideoPath && input.VideoTrackIndex == nil && input.AudioTrackIndex == nil && input.AudioOffset == 0 && len(input.SubtitleTracks) == 0 && input.AudioTracks == nil {
 			title, err = c.encoder.Encode(ctx, input.VideoPath, workDir, profile)
 		} else {
-			err = errors.New("video2dvd: encoder does not support separate media streams, track selection or subtitles")
+			err = errors.New("video2dvd: encoder does not support separate media streams, track selection, several audio tracks or subtitles")
 		}
 		if err != nil {
 			return fmt.Errorf("video2dvd: encode input %d (%q): %w", i+1, input.VideoPath, err)
+		}
+		if len(title.Audio) > 0 && title.AudioPath == "" && title.AudioCodec == "" {
+			title.AudioPath, title.AudioCodec = title.Audio[0].Path, title.Audio[0].Codec
 		}
 		if err := validateTitle(title, workDir, profile); err != nil {
 			return fmt.Errorf("video2dvd: invalid encoded title for input %d (%q): %w", i+1, input.VideoPath, err)
@@ -349,9 +460,23 @@ func (c *Converter) ConvertSources(ctx context.Context, inputs []MediaInput, out
 		if err != nil {
 			return fmt.Errorf("video2dvd: resolve encoded video for input %d: %w", i+1, err)
 		}
+		title.Audio = slices.Clone(title.Audio)
+		for j := range title.Audio {
+			title.Audio[j].Path, err = validateGeneratedFile(title.Audio[j].Path, workDir, "audio")
+			if err != nil {
+				return fmt.Errorf("video2dvd: resolve encoded audio stream %d for input %d: %w", j+1, i+1, err)
+			}
+		}
+		if len(title.Audio) > 0 {
+			title.AudioPath, title.AudioCodec = title.Audio[0].Path, title.Audio[0].Codec
+		}
 		title.AudioPath, err = validateGeneratedFile(title.AudioPath, workDir, "audio")
 		if err != nil {
 			return fmt.Errorf("video2dvd: resolve encoded audio for input %d: %w", i+1, err)
+		}
+		if title.ShowSubtitles == nil && input.ShowSubtitles != nil {
+			show := *input.ShowSubtitles
+			title.ShowSubtitles = &show
 		}
 		title.Subtitles = slices.Clone(title.Subtitles)
 		for j := range title.Subtitles {
@@ -366,7 +491,11 @@ func (c *Converter) ConvertSources(ctx context.Context, inputs []MediaInput, out
 		titles = append(titles, title)
 		// Fail before encoding the remaining inputs once the streams so far
 		// can no longer fit; multiplexing only adds to their size.
-		for _, path := range []string{title.VideoPath, title.AudioPath} {
+		paths := []string{title.VideoPath}
+		for _, audio := range titleAudioStreams(title) {
+			paths = append(paths, audio.Path)
+		}
+		for _, path := range paths {
 			stat, err := os.Stat(path)
 			if err != nil {
 				return fmt.Errorf("video2dvd: measure encoded input %d: %w", i+1, err)
@@ -491,7 +620,11 @@ func mediaTitleName(videoPath string) string {
 	return strings.TrimSuffix(name, filepath.Ext(name))
 }
 
-func validateMediaInputs(inputs []MediaInput, includeSubtitles bool) ([]MediaInput, error) {
+// validateMediaInputs checks the inputs and resolves what the options leave
+// to them: the audio and subtitle tracks to record and whether subtitles
+// start shown. Each input's audio must leave the video enough of the
+// multiplex rate.
+func validateMediaInputs(inputs []MediaInput, options Options, profile Profile) ([]MediaInput, error) {
 	validated := make([]MediaInput, len(inputs))
 	seen := make(map[string]struct{}, len(inputs))
 	for i, input := range inputs {
@@ -522,16 +655,36 @@ func validateMediaInputs(inputs []MediaInput, includeSubtitles bool) ([]MediaInp
 				return nil, fmt.Errorf("video2dvd: inspect audio input %d (%q): %w", i+1, input.AudioPath, err)
 			}
 		}
+		if input.AudioTrackIndex != nil && input.AudioTracks != nil {
+			return nil, fmt.Errorf("video2dvd: audio input %d sets both AudioTrackIndex and AudioTracks", i+1)
+		}
 		if input.AudioTrackIndex != nil || audioPath != videoPath {
-			if _, err := selectInputAudioTrack(audioInfo, input.AudioTrackIndex); err != nil {
+			if _, err := selectInputAudioTrack(audioInfo, input.AudioTrackIndex); err != nil && input.AudioTracks == nil {
 				return nil, fmt.Errorf("video2dvd: audio input %d (%q): %w", i+1, audioPath, err)
 			}
 		}
-		subtitles, err := selectInputSubtitleTracks(videoInfo, input.SubtitleTracks, includeSubtitles)
+		// An input that names its one track keeps it whatever IncludeAllAudio
+		// says.
+		audioTracks, err := selectInputAudioTracks(audioInfo, input.AudioTracks, options.IncludeAllAudio && input.AudioTrackIndex == nil)
+		if err != nil {
+			return nil, fmt.Errorf("video2dvd: audio input %d (%q): %w", i+1, audioPath, err)
+		}
+		input.AudioTracks = audioTracks
+		if streams := len(audioTracks); streams > 1 {
+			codecs := slices.Repeat([]string{titleAudioCodec(profile.AudioFormat, streams)}, streams)
+			if _, err := titleVideoBitrate(profile, codecs); err != nil {
+				return nil, fmt.Errorf("video2dvd: input %d: %w", i+1, err)
+			}
+		}
+		subtitles, err := selectInputSubtitleTracks(videoInfo, input.SubtitleTracks, options.IncludeSubtitles)
 		if err != nil {
 			return nil, fmt.Errorf("video2dvd: video input %d (%q): %w", i+1, input.VideoPath, err)
 		}
 		input.SubtitleTracks = subtitles
+		if input.ShowSubtitles == nil && options.ShowDefaultSubtitles {
+			show := len(subtitles) > 0 && hasDefaultMark(videoInfo, videoInfo.Tracks[subtitles[0]])
+			input.ShowSubtitles = &show
+		}
 		key := videoPath + "\x00" + audioPath
 		if _, ok := seen[key]; ok {
 			return nil, fmt.Errorf("video2dvd: input %d duplicates an earlier video/audio source pair", i+1)
@@ -601,6 +754,38 @@ func validateTitle(title EncodedTitle, workDir string, profile Profile) error {
 	}
 	if videoPath == audioPath {
 		return errors.New("video and audio streams must be separate files")
+	}
+	if len(title.Audio) > dvdMaxAudioStreams {
+		return fmt.Errorf("a title has at most %d audio streams, got %d", dvdMaxAudioStreams, len(title.Audio))
+	}
+	for i, audio := range title.Audio {
+		if audio.Codec != AudioCodecLPCM && audio.Codec != AudioCodecAC3 {
+			return fmt.Errorf("audio stream %d codec must be %q or %q, got %q", i+1, AudioCodecLPCM, AudioCodecAC3, audio.Codec)
+		}
+		if !validDVDLanguage(audio.Language) {
+			return fmt.Errorf("audio stream %d language %q is not an ISO 639-1 code", i+1, audio.Language)
+		}
+		path, err := validateGeneratedFile(audio.Path, workDir, "audio")
+		if err != nil {
+			return fmt.Errorf("audio stream %d: %w", i+1, err)
+		}
+		if path == videoPath {
+			return errors.New("video and audio streams must be separate files")
+		}
+		if i == 0 && (path != audioPath || audio.Codec != title.AudioCodec) {
+			return errors.New("AudioPath and AudioCodec must be those of the first stream of Audio")
+		}
+		if audio.Codec == AudioCodecAC3 {
+			f, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			_, _, err = probeAC3Stream(f)
+			_ = f.Close()
+			if err != nil {
+				return fmt.Errorf("audio stream %d: %w", i+1, err)
+			}
+		}
 	}
 	if len(title.Subtitles) > dvdSubtitleMaxStreams {
 		return fmt.Errorf("a title has at most %d subtitle streams, got %d", dvdSubtitleMaxStreams, len(title.Subtitles))

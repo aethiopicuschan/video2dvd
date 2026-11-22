@@ -427,7 +427,8 @@ func cleanSubtitleText(text string) string {
 // selectInputSubtitleTracks returns the subtitle tracks to record for an
 // input: the requested ones, which must be readable text subtitle tracks,
 // or with requested nil and includeAll set every readable one, up to the
-// streams of a title.
+// streams of a title: the first that carries a default mark comes first
+// (see hasDefaultMark), the others follow in track order.
 func selectInputSubtitleTracks(info MP4Info, requested []int, includeAll bool) ([]int, error) {
 	readable := func(track TrackInfo) bool {
 		return track.Kind == TrackKindSubtitle && SupportedSubtitleCodec(track.Codec)
@@ -437,8 +438,12 @@ func selectInputSubtitleTracks(info MP4Info, requested []int, includeAll bool) (
 			return nil, nil
 		}
 		var all []int
+		first, found := selectDefaultTrack(info, readable)
+		if found {
+			all = append(all, first.Index)
+		}
 		for _, track := range info.Tracks {
-			if readable(track) && len(all) < dvdSubtitleMaxStreams {
+			if readable(track) && !(found && track.Index == first.Index) && len(all) < dvdSubtitleMaxStreams {
 				all = append(all, track.Index)
 			}
 		}

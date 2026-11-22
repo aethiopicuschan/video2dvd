@@ -17,9 +17,11 @@ type TestMP4Box = mp4Box
 type TestBitReader = bitReader
 
 var (
-	TestMakeAACADTSHeader                   = makeAACADTSHeader
-	ExportTrackDisplayAspect                = trackDisplayAspect
-	ExportCheckEstimatedTitleSize           = checkEstimatedTitleSize
+	TestMakeAACADTSHeader         = makeAACADTSHeader
+	ExportTrackDisplayAspect      = trackDisplayAspect
+	ExportCheckEstimatedTitleSize = func(duration time.Duration, capacity int64, videoBitrate int) error {
+		return checkEstimatedTitleSize(duration, capacity, videoBitrate, dvdLPCMBitrate/8)
+	}
 	ExportDVDCellElapsedTime                = dvdCellElapsedTime
 	ExportSelectAudioTrack                  = selectAudioTrack
 	ExportSelectWebMVideoTrack              = selectWebMVideoTrack

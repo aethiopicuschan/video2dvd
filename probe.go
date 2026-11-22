@@ -36,6 +36,13 @@ const (
 // H.264 VUI of the first SPS or else the colr box, for WebM the Colour
 // element. Untagged tracks report ColorMatrixUnspecified.
 //
+// Default is the container's mark of a track to be played by default: the
+// track_enabled flag of an MP4 track header, or a WebM track's FlagDefault.
+// Matroska makes a track without a FlagDefault element a default track, so
+// a WebM file that writes no such element reports every track as Default.
+// The converter only follows such an implied mark when another track of the
+// same kind has FlagDefault 0, as ffmpeg writes it (see hasDefaultMark).
+//
 // Language is the language the container states for the track: the BCP 47
 // tag of an MP4 elng box or of a WebM LanguageBCP47 element if there is one,
 // else the ISO 639-2 code of the MP4 media header or of the WebM Language
@@ -59,8 +66,12 @@ type TrackInfo struct {
 	Color                 VideoColor
 	Language              string
 	Name                  string
+	Default               bool
 
 	edit mp4EditList
+	// defaultImplied marks a WebM track whose Default comes from the absence
+	// of FlagDefault rather than from the element.
+	defaultImplied bool
 	// trackID is the track_ID of an MP4 track header.
 	trackID uint32
 }
@@ -367,6 +378,7 @@ func parseTrack(r io.ReaderAt, box mp4Box) (TrackInfo, error) {
 	var mdia *mp4Box
 	var edit mp4EditList
 	var trackID uint32
+	var enabled bool
 	for i := range children {
 		switch children[i].kind {
 		case "tkhd":
@@ -378,6 +390,7 @@ func parseTrack(r io.ReaderAt, box mp4Box) (TrackInfo, error) {
 					offset = 20
 				}
 				trackID = binary.BigEndian.Uint32(data[offset : offset+4])
+				enabled = data[3]&0x01 != 0
 			}
 		case "mdia":
 			if mdia == nil {
@@ -423,7 +436,7 @@ func parseTrack(r io.ReaderAt, box mp4Box) (TrackInfo, error) {
 	if handler == "" {
 		return TrackInfo{}, errors.New("track has no handler type")
 	}
-	track := TrackInfo{Duration: duration, TimeScale: timeScale, edit: edit, trackID: trackID, Language: language, Name: handlerName}
+	track := TrackInfo{Duration: duration, TimeScale: timeScale, edit: edit, trackID: trackID, Language: language, Name: handlerName, Default: enabled}
 	if languageTag != "" {
 		track.Language = languageTag
 	}

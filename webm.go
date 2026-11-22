@@ -109,6 +109,9 @@ func probeWebMReader(r io.ReadSeeker) (MP4Info, error) {
 			TimeScale:   1_000_000_000,
 			Language:    source.LanguageBCP47,
 			Name:        source.Name,
+			// Matroska defaults FlagDefault to 1.
+			Default:        source.FlagDefault || !source.FlagDefaultSet,
+			defaultImplied: !source.FlagDefaultSet,
 		}
 		if track.Language == "" {
 			track.Language = source.Language
@@ -479,7 +482,10 @@ func (r *webMFrameDurationResolver) Finish() error {
 }
 
 // DecodeWebMAudio sends 48 kHz stereo Opus PCM chunks from a WebM file. The
-// selected stream index is zero-based in the container track list.
+// selected stream index is zero-based in the container track list. Tracks
+// with three to eight channels in channel mapping family 1 (Vorbis order) are
+// downmixed to stereo with the ITU-R BS.775 coefficients: centre and
+// surrounds at 0.7071, LFE discarded, normalised so the mix cannot clip.
 func DecodeWebMAudio(ctx context.Context, path string, trackIndex *int, handler func(PCMChunk) error) error {
 	if ctx == nil {
 		return errors.New("video2dvd: context must not be nil")
@@ -497,6 +503,9 @@ func DecodeWebMAudio(ctx context.Context, path string, trackIndex *int, handler 
 	}
 	if track.Codec != "opus" {
 		return fmt.Errorf("video2dvd: WebM audio codec %q is not supported by the built-in decoder", track.Codec)
+	}
+	if opusTrackChannels(track) > 2 {
+		return decodeWebMOpusMultichannel(ctx, path, track, handler)
 	}
 	return decodeWebMWithGoAV(ctx, path, info, track.Index, false, func(frame *av.Frame) error {
 		chunk, err := copyGoAVPCMFrame(frame)

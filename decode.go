@@ -155,6 +155,14 @@ func DecodeMP4Video(ctx context.Context, path string, trackIndex *int, handler f
 // edit becomes silence and the first media edit's start and length are applied
 // rounded to whole samples. Later edits are not applied.
 //
+// AAC must be mono or stereo. AC-3 with more channels is downmixed by the
+// go-264 decoder with the stream's own centre and surround mix levels (cmixlev,
+// surmixlev), LFE discarded, scaled down by the larger output's coefficient sum
+// so that it cannot clip. At the -3 dB levels this is the ITU-R BS.775 downmix
+// for the modes with two surround channels (2/2, 3/2); a single surround
+// channel (2/1, 3/1) is added to both outputs at the full surround level
+// rather than split between them at -3 dB.
+//
 // If the primary decoder rejects an AAC access unit because of non-zero
 // byte-alignment padding, the AAC-LC fallback decoder finishes the track. When
 // that happens after chunks were already delivered, the fallback's output is

@@ -212,14 +212,20 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 	}
 
 	authored := make([]authoredTitle, len(titles))
+	titleAudio := make([][]dvdAudioAttribute, len(titles))
 	nextTitleSetSector := uint64(vmgSectors)*2 + uint64(menu.sectors)
 	for i, title := range titles {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if title.VideoCodec != VideoCodecMPEG2 || title.AudioCodec != AudioCodecLPCM {
-			return fmt.Errorf("video2dvd: built-in authorer requires MPEG-2 video and LPCM audio for title %d", i+1)
+		if title.VideoCodec != VideoCodecMPEG2 {
+			return fmt.Errorf("video2dvd: built-in authorer requires MPEG-2 video for title %d", i+1)
 		}
+		audio, err := dvdTitleAudioAttributes(title, filepath.Dir(title.VideoPath))
+		if err != nil {
+			return fmt.Errorf("video2dvd: title %d: %w", i+1, err)
+		}
+		titleAudio[i] = audio
 		if title.Aspect != profile.Aspect || title.Width != profile.FrameWidth || title.Height != profile.FrameHeight {
 			return fmt.Errorf("video2dvd: title %d metadata does not match the authoring profile", i+1)
 		}
@@ -252,7 +258,7 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 			return fmt.Errorf("video2dvd: title %d VOB has an invalid sector count", i+1)
 		}
 		vobSectors := uint32(vob.total / DVDVOBSectorSize)
-		ifo, ifoSectors, err := buildDVDVTSIFO(title, profile, records, vobSectors, len(menu.records), i, len(titles))
+		ifo, ifoSectors, err := buildDVDVTSIFO(title, profile, titleAudio[i], records, vobSectors, len(menu.records), i, len(titles))
 		if err != nil {
 			return fmt.Errorf("video2dvd: build title %d IFO: %w", i+1, err)
 		}
@@ -267,7 +273,7 @@ func (a *InProcessAuthorer) Author(ctx context.Context, titles []EncodedTitle, o
 	for i := range authored {
 		starts[i] = authored[i].titleSetBase
 	}
-	vmg, finalVMGSectors, err := buildDVDVMGI(titles, profile, starts, menu)
+	vmg, finalVMGSectors, err := buildDVDVMGIAudio(titles, titleAudio, profile, starts, menu)
 	if err != nil {
 		return err
 	}
@@ -316,7 +322,7 @@ func validateAuthoringProfile(profile Profile) error {
 
 // buildDVDVTSIFO builds the VTSI for one title. vobSectors is the size of the
 // whole title VOB stream, summed over its VOB files.
-func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord, vobSectors uint32, menuPageCount, titleIndex, titleCount int) ([]byte, uint32, error) {
+func buildDVDVTSIFO(title EncodedTitle, profile Profile, audio []dvdAudioAttribute, records []dvdVOBURecord, vobSectors uint32, menuPageCount, titleIndex, titleCount int) ([]byte, uint32, error) {
 	if len(records) == 0 || records[0].StartSector != 0 || records[len(records)-1].EndSector+1 != vobSectors {
 		return nil, 0, errors.New("VOBU records do not cover the title VOB")
 	}
@@ -375,9 +381,7 @@ func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord
 	binary.BigEndian.PutUint32(ifo[0x00E4:0x00E8], admapSector) // VTS_VOBU_ADMAP
 	videoAttr := dvdVideoAttribute(title, profile)
 	binary.BigEndian.PutUint16(ifo[dvdIFOAudioOffset:dvdIFOAudioOffset+2], videoAttr)
-	binary.BigEndian.PutUint16(ifo[dvdIFOAudioOffset+2:dvdIFOAudioOffset+4], 1)
-	ifo[0x0204] = dvdLPCMAudioAttribute0 // LPCM coding mode, unspecified language.
-	ifo[0x0205] = dvdLPCMAudioAttribute1 // 16-bit, 48 kHz, stereo.
+	putDVDAudioAttributes(ifo[dvdIFOAudioOffset+2:], audio)
 	putDVDSubtitleAttributes(ifo[dvdIFOAudioOffset+0x54:], title.Subtitles)
 
 	ptt := make([]byte, 16)
@@ -398,9 +402,13 @@ func buildDVDVTSIFO(title EncodedTitle, profile Profile, records []dvdVOBURecord
 		// Every start of the title selects the first subtitle stream, shown
 		// or hidden; without the command a player could start with whatever
 		// stream and display state it had.
-		pre = append(pre, dvdSetSubtitleStreamCommand(0, profile.ShowSubtitles))
+		show := profile.ShowSubtitles
+		if title.ShowSubtitles != nil {
+			show = *title.ShowSubtitles
+		}
+		pre = append(pre, dvdSetSubtitleStreamCommand(0, show))
 	}
-	pgc := buildDVDVTSProgramChain(playbackTime, records, vobSectors, pre, post, dvdTitleSubpictureStreamControl(profile.Aspect, len(title.Subtitles)))
+	pgc := buildDVDVTSProgramChain(playbackTime, records, vobSectors, audio, pre, post, dvdTitleSubpictureStreamControl(profile.Aspect, len(title.Subtitles)))
 	pgci := make([]byte, 16+len(pgc))
 	binary.BigEndian.PutUint16(pgci[0:2], 1)
 	binary.BigEndian.PutUint32(pgci[4:8], uint32(len(pgci)-1))
@@ -467,7 +475,7 @@ func buildDVDVTSTimeMap(records []dvdVOBURecord, ticksPerSecond uint32) []byte {
 // cell that plays every VOBU of records. subpictureControl holds the stream
 // control entry of each subtitle stream; a title with subtitles also gets
 // their colour table.
-func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobSectors uint32, preCommands, postCommands [][8]byte, subpictureControl [][4]byte) []byte {
+func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobSectors uint32, audio []dvdAudioAttribute, preCommands, postCommands [][8]byte, subpictureControl [][4]byte) []byte {
 	const headerSize = 0xec
 	commands := slices.Concat(preCommands, postCommands)
 	commandTableSize := 8 + len(commands)*8
@@ -477,7 +485,11 @@ func buildDVDVTSProgramChain(playbackTime [4]byte, records []dvdVOBURecord, vobS
 	pgc := make([]byte, headerSize+commandTableSize+programMapSize+cellPlaybackSize+cellPositionSize)
 	pgc[2], pgc[3] = 1, 1
 	copy(pgc[4:8], playbackTime[:])
-	pgc[0x0c] = 0x80 // first LPCM stream is available on private_stream_1 substream 0.
+	// Each audio stream is available and decoded from the substream of its
+	// number within its codec.
+	for i, stream := range audio {
+		pgc[0x0c+2*i] = 0x80 | stream.number
+	}
 	for i, control := range subpictureControl {
 		copy(pgc[0x1c+i*4:0x20+i*4], control[:])
 	}
@@ -570,6 +582,16 @@ func dvdIFOTime(duration time.Duration, standard VideoStandard) ([4]byte, error)
 }
 
 func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint32, menu dvdAuthoredMenu) ([]byte, uint32, error) {
+	audio := make([][]dvdAudioAttribute, len(titles))
+	for i := range audio {
+		audio[i] = []dvdAudioAttribute{{codec: AudioCodecLPCM, channels: 2}}
+	}
+	return buildDVDVMGIAudio(titles, audio, profile, titleSetStarts, menu)
+}
+
+// buildDVDVMGIAudio builds the VMGI for titles whose audio streams are
+// described by titleAudio.
+func buildDVDVMGIAudio(titles []EncodedTitle, titleAudio [][]dvdAudioAttribute, profile Profile, titleSetStarts []uint32, menu dvdAuthoredMenu) ([]byte, uint32, error) {
 	if len(titles) == 0 || len(titles) > dvdMaxTitles {
 		return nil, 0, errors.New("video2dvd: VMGI requires between 1 and 99 titles")
 	}
@@ -583,8 +605,7 @@ func buildDVDVMGI(titles []EncodedTitle, profile Profile, titleSetStarts []uint3
 		// attributes begin at file offset 0x200, hence offset 0x100 here.
 		vtsAttrs[0x100] = byte(dvdVideoAttribute(title, profile) >> 8)
 		vtsAttrs[0x101] = byte(dvdVideoAttribute(title, profile))
-		binary.BigEndian.PutUint16(vtsAttrs[0x102:0x104], 1)
-		vtsAttrs[0x104], vtsAttrs[0x105] = dvdLPCMAudioAttribute0, dvdLPCMAudioAttribute1
+		putDVDAudioAttributes(vtsAttrs[0x102:], titleAudio[i])
 		putDVDSubtitleAttributes(vtsAttrs[0x154:], title.Subtitles)
 		base := i * 776
 		binary.BigEndian.PutUint32(attributes[base:base+4], 775)

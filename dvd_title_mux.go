@@ -106,8 +106,17 @@ func muxDVDVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.W
 	if dst == nil {
 		return errors.New("video2dvd: VOB destination writer is required")
 	}
-	if title.VideoCodec != VideoCodecMPEG2 || title.AudioCodec != AudioCodecLPCM {
-		return errors.New("video2dvd: VOB muxer requires MPEG-2 video and LPCM audio")
+	audioStreams := titleAudioStreams(title)
+	if title.VideoCodec != VideoCodecMPEG2 {
+		return errors.New("video2dvd: VOB muxer requires MPEG-2 video")
+	}
+	if len(audioStreams) == 0 || len(audioStreams) > dvdMaxAudioStreams {
+		return fmt.Errorf("video2dvd: a VOB has 1 to %d audio streams, not %d", dvdMaxAudioStreams, len(audioStreams))
+	}
+	for i, audio := range audioStreams {
+		if audio.Codec != AudioCodecLPCM && audio.Codec != AudioCodecAC3 {
+			return fmt.Errorf("video2dvd: VOB muxer requires LPCM or AC-3 audio, stream %d is %q", i+1, audio.Codec)
+		}
 	}
 	if err := checkDVDFrameRate(title.FrameRateNumerator, title.FrameRateDenominator); err != nil {
 		return fmt.Errorf("video2dvd: %w", err)
@@ -116,9 +125,11 @@ func muxDVDVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.W
 	if err != nil {
 		return err
 	}
-	audioPath, err := validateGeneratedFile(title.AudioPath, workDir, "audio")
-	if err != nil {
-		return err
+	audioPaths := make([]string, len(audioStreams))
+	for i, audio := range audioStreams {
+		if audioPaths[i], err = validateGeneratedFile(audio.Path, workDir, "audio"); err != nil {
+			return err
+		}
 	}
 	videoInfo, err := ProbeMPEG2Video(videoPath)
 	if err != nil {
@@ -133,11 +144,23 @@ func muxDVDVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.W
 		return err
 	}
 	defer videoFile.Close()
-	audioFile, err := os.Open(audioPath)
-	if err != nil {
-		return err
+	audioFiles := make([]*os.File, len(audioPaths))
+	for i, path := range audioPaths {
+		if audioFiles[i], err = os.Open(path); err != nil {
+			return err
+		}
+		defer audioFiles[i].Close()
 	}
-	defer audioFile.Close()
+	audioSources := func() ([]dvdMuxAudioSource, error) {
+		sources := make([]dvdMuxAudioSource, len(audioFiles))
+		for i, file := range audioFiles {
+			if _, err := file.Seek(0, io.SeekStart); err != nil {
+				return nil, err
+			}
+			sources[i] = dvdMuxAudioSource{codec: audioStreams[i].Codec, reader: file}
+		}
+		return sources, nil
+	}
 	if len(title.Subtitles) > dvdSubtitleMaxStreams {
 		return fmt.Errorf("video2dvd: a title has at most %d subtitle streams", dvdSubtitleMaxStreams)
 	}
@@ -178,7 +201,11 @@ func muxDVDVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.W
 	if err != nil {
 		return err
 	}
-	planner := newDVDVOBMuxer(ctx, title, highlights, videoFile, audioFile, placement)
+	sources, err := audioSources()
+	if err != nil {
+		return err
+	}
+	planner := newDVDVOBMuxer(ctx, title, highlights, videoFile, sources, placement)
 	planner.addSubtitles(readers)
 	if err := planner.run(); err != nil {
 		return err
@@ -186,13 +213,13 @@ func muxDVDVOB(ctx context.Context, title EncodedTitle, workDir string, dst io.W
 	if _, err := videoFile.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	if _, err := audioFile.Seek(0, io.SeekStart); err != nil {
+	if sources, err = audioSources(); err != nil {
 		return err
 	}
 	if readers, err = subtitleReaders(); err != nil {
 		return err
 	}
-	writer := newDVDVOBMuxer(ctx, title, highlights, videoFile, audioFile, placement)
+	writer := newDVDVOBMuxer(ctx, title, highlights, videoFile, sources, placement)
 	writer.addSubtitles(readers)
 	writer.dst = dst
 	writer.recordVOBU = recordVOBU
@@ -217,7 +244,8 @@ type dvdMuxVOBU struct {
 	CellElapsed    [4]byte
 	ReferenceEnds  [3]uint32
 	ReferenceCount int
-	AudioSync      uint16
+	// AudioSync holds A_SYNCA of every audio stream.
+	AudioSync [8]uint16
 }
 
 type dvdMuxPicture struct {
@@ -254,7 +282,7 @@ type dvdVOBMuxer struct {
 	// highlights holds the button highlight of each leading VOBU of a menu
 	// VOB, one menu page per VOBU; it is empty for a title.
 	highlights []dvdMenuHighlight
-	audio      io.Reader
+	audio      []*dvdMuxAudio
 	pictures   mpeg2PictureReader
 
 	dst        io.Writer
@@ -281,16 +309,6 @@ type dvdVOBMuxer struct {
 	videoBuffer   []dvdMuxBufferedPicture
 	videoBuffered int
 	vobuHasVideo  bool
-	vobuHasAudio  bool
-
-	audioChunk   []byte // next LPCM packet payload; nil once audio has ended.
-	audioStorage [dvdLPCMPrivateHeaderLen + dvdLPCMPacketBytes]byte
-	audioFrames  int64 // LPCM frames already sent.
-	// recentAudio lists sent audio packs that may still be the A_SYNCA target
-	// of a VOBU that has not started; syncPending is the first VOBU whose
-	// target has not been sent yet.
-	recentAudio []dvdMuxAudioPack
-	syncPending int
 
 	// subtitles holds the subtitle streams, stream n on substream 0x20+n.
 	subtitles []*dvdMuxSubtitle
@@ -323,17 +341,89 @@ type dvdMuxSPU struct {
 	vobu     int
 }
 
-func newDVDVOBMuxer(ctx context.Context, title EncodedTitle, highlights []dvdMenuHighlight, video, audio io.Reader, placement dvdVOBPlacement) *dvdVOBMuxer {
-	return &dvdVOBMuxer{
+func newDVDVOBMuxer(ctx context.Context, title EncodedTitle, highlights []dvdMenuHighlight, video io.Reader, audio []dvdMuxAudioSource, placement dvdVOBPlacement) *dvdVOBMuxer {
+	m := &dvdVOBMuxer{
 		ctx:        ctx,
 		title:      title,
 		highlights: highlights,
-		audio:      audio,
 		pictures:   mpeg2PictureReader{ctx: ctx, src: video},
 		clock:      newMPEGSystemClock(defaultProgramMuxRate),
 		sector:     uint64(placement.firstSector),
 		vobID:      placement.vobID,
 	}
+	// Streams are numbered within their codec: LPCM from substream 0xa0 and
+	// AC-3 from 0x80 on, which is also the number the PGC's audio control
+	// gives each of them.
+	var lpcm, ac3 byte
+	for _, source := range audio {
+		stream := &dvdMuxAudio{codec: source.codec, reader: source.reader}
+		if source.codec == AudioCodecAC3 {
+			stream.substream = dvdAC3SubstreamID + ac3
+			stream.ac3 = &ac3StreamReader{r: source.reader}
+			ac3++
+		} else {
+			stream.substream = dvdLPCMSubstreamID + lpcm
+			lpcm++
+		}
+		m.audio = append(m.audio, stream)
+	}
+	return m
+}
+
+// titleAudioStreams returns the audio streams of a title: its Audio list, or
+// the single stream of AudioPath and AudioCodec.
+func titleAudioStreams(title EncodedTitle) []EncodedAudio {
+	if len(title.Audio) > 0 {
+		return title.Audio
+	}
+	return []EncodedAudio{{Path: title.AudioPath, Codec: title.AudioCodec}}
+}
+
+// dvdMuxAudioSource is the data of one audio stream to multiplex.
+type dvdMuxAudioSource struct {
+	codec  string
+	reader io.Reader
+}
+
+// dvdMuxAudio is the state of one audio stream of a VOB.
+type dvdMuxAudio struct {
+	codec     string
+	substream byte
+	reader    io.Reader
+	inVOBU    bool
+
+	// LPCM: chunk is the next packet payload behind room for its private
+	// header, nil once the stream has ended; frames counts the LPCM frames
+	// already sent.
+	chunk   []byte
+	storage [dvdLPCMPrivateHeaderLen + dvdLPCMPacketBytes]byte
+	frames  int64
+
+	// AC-3: queue holds the syncframes read ahead, the first of them
+	// syncframe number first; offset bytes of it are sent. buffer models
+	// the decoder's input buffer, which a syncframe leaves at its
+	// presentation time.
+	ac3      *ac3StreamReader
+	queue    [][]byte
+	first    int64
+	offset   int
+	ended    bool
+	buffer   []dvdMuxBufferedPicture
+	buffered int
+
+	// recent lists sent packs that may still be the A_SYNCA target of a
+	// VOBU that has not started; syncPending is the first VOBU whose target
+	// has not been sent yet.
+	recent      []dvdMuxAudioPack
+	syncPending int
+}
+
+// pending reports whether data of the stream remains to be sent.
+func (a *dvdMuxAudio) pending() bool {
+	if a.codec == AudioCodecAC3 {
+		return len(a.queue) > 0
+	}
+	return a.chunk != nil
 }
 
 // addSubtitles adds subtitle streams read from stream files.
@@ -409,8 +499,10 @@ func (m *dvdVOBMuxer) run() error {
 	if m.following, err = m.readPicture(); err != nil {
 		return err
 	}
-	if err := m.readAudio(); err != nil {
-		return err
+	for _, audio := range m.audio {
+		if err := m.readAudio(audio); err != nil {
+			return err
+		}
 	}
 	for _, subtitle := range m.subtitles {
 		if err := m.readSubtitle(subtitle); err != nil {
@@ -421,18 +513,15 @@ func (m *dvdVOBMuxer) run() error {
 	if err := m.writeVideoPack(); err != nil {
 		return err
 	}
-	for m.current != nil || m.audioChunk != nil || m.subtitlesPending() {
+	for m.current != nil || m.audioPending() || m.subtitlesPending() {
 		if err := m.ctx.Err(); err != nil {
 			return err
 		}
 		now := m.clock.now()
 		m.releaseVideo(now)
 		subtitleStream, subtitleAt := m.subtitleReadyAt(now)
-		audioAt, videoAt := uint64(dvdMuxNever), uint64(dvdMuxNever)
-		if m.audioChunk != nil {
-			pts := m.audioPTS()
-			audioAt = (pts - min(pts, dvdMuxAudioLead)) * mpegSCRExtensionRange
-		}
+		audioStream, audioAt := m.audioReadyAt(now)
+		videoAt := uint64(dvdMuxNever)
 		if m.current != nil {
 			if videoAt, err = m.videoReadyAt(now); err != nil {
 				return err
@@ -443,7 +532,7 @@ func (m *dvdVOBMuxer) run() error {
 		// of waiting behind it. Subtitles are rare and small and come next.
 		switch {
 		case audioAt <= now:
-			err = m.writeAudioPack()
+			err = m.writeAudioPack(audioStream)
 		case subtitleAt <= now:
 			err = m.writeSubtitlePack(subtitleStream)
 		case videoAt <= now:
@@ -527,10 +616,63 @@ func (m *dvdVOBMuxer) timePicture(picture *dvdMuxPicture, fields int64) {
 	m.lastFields = fields
 }
 
-// audioPTS is the presentation time of the next audio packet. An LPCM frame
-// of 80 samples lasts exactly 150 ticks.
-func (m *dvdVOBMuxer) audioPTS() uint64 {
-	return m.startTime() + uint64(m.audioFrames)*dvdLPCMFrameTicks
+// audioPTS is the presentation time of the next LPCM packet of a stream. An
+// LPCM frame of 80 samples lasts exactly 150 ticks.
+func (m *dvdVOBMuxer) audioPTS(audio *dvdMuxAudio) uint64 {
+	return m.startTime() + uint64(audio.frames)*dvdLPCMFrameTicks
+}
+
+// ac3PTS is the presentation time of AC-3 syncframe number frame. A
+// syncframe of 1536 samples lasts exactly 2880 ticks, and the stream starts
+// dvdAC3PresentationLead before the first picture: its first 256 samples
+// are the encoder's silent block, so that the audio itself starts with the
+// first picture, like LPCM.
+func (m *dvdVOBMuxer) ac3PTS(frame int64) uint64 {
+	return m.startTime() - dvdAC3PresentationLead + uint64(frame)*ac3SyncFrameTicks
+}
+
+// audioPending reports whether any audio remains to be sent.
+func (m *dvdVOBMuxer) audioPending() bool {
+	for _, audio := range m.audio {
+		if audio.pending() {
+			return true
+		}
+	}
+	return false
+}
+
+// audioReadyAt returns the audio stream whose next pack may be sent first
+// and the clock value from which it may. A pack is sent dvdMuxAudioLead
+// before the audio it starts with is presented; an AC-3 pack also waits
+// until the decoder's buffer has room for it.
+func (m *dvdVOBMuxer) audioReadyAt(now uint64) (int, uint64) {
+	best, bestAt := -1, uint64(dvdMuxNever)
+	for index, audio := range m.audio {
+		if !audio.pending() {
+			continue
+		}
+		var at uint64
+		if audio.codec == AudioCodecAC3 {
+			released := 0
+			for released < len(audio.buffer) && audio.buffer[released].dts <= now {
+				audio.buffered -= audio.buffer[released].bytes
+				released++
+			}
+			audio.buffer = slices.Delete(audio.buffer, 0, released)
+			pts := m.ac3PTS(audio.first)
+			at = (pts - min(pts, dvdMuxAudioLead)) * mpegSCRExtensionRange
+			if size := m.ac3PackLayout(audio).size; audio.buffered+size > dvdAC3BufferBytes && len(audio.buffer) > 0 {
+				at = max(at, audio.buffer[0].dts)
+			}
+		} else {
+			pts := m.audioPTS(audio)
+			at = (pts - min(pts, dvdMuxAudioLead)) * mpegSCRExtensionRange
+		}
+		if at < bestAt {
+			best, bestAt = index, at
+		}
+	}
+	return best, bestAt
 }
 
 func (m *dvdVOBMuxer) readPicture() (*dvdMuxPicture, error) {
@@ -568,12 +710,32 @@ func (m *dvdVOBMuxer) readPicture() (*dvdMuxPicture, error) {
 }
 
 // readAudio loads the next LPCM packet payload behind room for its private
-// header, padding a final partial audio frame with silence.
-func (m *dvdVOBMuxer) readAudio() error {
-	data := m.audioStorage[dvdLPCMPrivateHeaderLen:]
-	n, err := io.ReadFull(m.audio, data)
+// header, padding a final partial audio frame with silence, or for AC-3
+// reads syncframes ahead until a pack's worth is queued.
+func (m *dvdVOBMuxer) readAudio(audio *dvdMuxAudio) error {
+	if audio.codec == AudioCodecAC3 {
+		queued := -audio.offset
+		for _, frame := range audio.queue {
+			queued += len(frame)
+		}
+		for !audio.ended && queued < DVDVOBSectorSize {
+			frame, err := audio.ac3.next()
+			if err == io.EOF {
+				audio.ended = true
+				break
+			}
+			if err != nil {
+				return err
+			}
+			audio.queue = append(audio.queue, frame)
+			queued += len(frame)
+		}
+		return nil
+	}
+	data := audio.storage[dvdLPCMPrivateHeaderLen:]
+	n, err := io.ReadFull(audio.reader, data)
 	if err == io.EOF {
-		m.audioChunk = nil
+		audio.chunk = nil
 		return nil
 	}
 	if err != nil && err != io.ErrUnexpectedEOF {
@@ -584,7 +746,7 @@ func (m *dvdVOBMuxer) readAudio() error {
 	}
 	padded := (n + dvdLPCMFrameBytes - 1) / dvdLPCMFrameBytes * dvdLPCMFrameBytes
 	clear(data[n:padded])
-	m.audioChunk = m.audioStorage[:dvdLPCMPrivateHeaderLen+padded]
+	audio.chunk = audio.storage[:dvdLPCMPrivateHeaderLen+padded]
 	return nil
 }
 
@@ -718,45 +880,148 @@ func (m *dvdVOBMuxer) finishPicture(picture *dvdMuxPicture) {
 	}
 }
 
-func (m *dvdVOBMuxer) writeAudioPack() error {
-	pts := m.audioPTS()
-	frames := (len(m.audioChunk) - dvdLPCMPrivateHeaderLen) / dvdLPCMFrameBytes
+func (m *dvdVOBMuxer) writeAudioPack(index int) error {
+	audio := m.audio[index]
+	if audio.codec == AudioCodecAC3 {
+		return m.writeAC3Pack(index)
+	}
+	pts := m.audioPTS(audio)
+	frames := (len(audio.chunk) - dvdLPCMPrivateHeaderLen) / dvdLPCMFrameBytes
 	end := pts + uint64(frames)*dvdLPCMFrameTicks
 	if m.clock.after(DVDVOBSectorSize) > pts*mpegSCRExtensionRange {
 		return errors.New("video2dvd: LPCM audio cannot reach the decoder before its presentation time")
 	}
 	header := mpegPESHeader{streamID: dvdPrivateStream1ID, hasPTS: true, pts: pts}
-	if !m.vobuHasAudio {
+	if !audio.inVOBU {
 		header.pstdBuffer = dvdAudioPSTDBuffer
-		m.vobuHasAudio = true
+		audio.inVOBU = true
 	}
-	putDVDLPCMPrivateHeader(m.audioChunk, dvdLPCMSubstreamID, frames, m.audioFrames)
+	putDVDLPCMPrivateHeader(audio.chunk, audio.substream, frames, audio.frames)
 	sector := uint32(m.sector)
+	chunk := audio.chunk
 	if err := m.writePack(func(scr uint64) ([]byte, error) {
-		return buildMPEGPESPack(scr, defaultProgramMuxRate/50, header, m.audioChunk)
+		return buildMPEGPESPack(scr, defaultProgramMuxRate/50, header, chunk)
 	}); err != nil {
 		return err
 	}
-	m.audioFrames += int64(frames)
+	audio.frames += int64(frames)
+	m.recordAudioPack(index, pts, end, sector)
+	return m.readAudio(audio)
+}
 
-	for m.syncPending < len(m.vobus) {
-		vobu := &m.vobus[m.syncPending]
-		if vobu.AudioSync == DVDNAVAudioSyncNone {
+// recordAudioPack notes a sent pack of an audio stream that starts the
+// audio presented from pts until end, for the A_SYNCA of the VOBUs.
+func (m *dvdVOBMuxer) recordAudioPack(index int, pts, end uint64, sector uint32) {
+	audio := m.audio[index]
+	for audio.syncPending < len(m.vobus) {
+		vobu := &m.vobus[audio.syncPending]
+		if vobu.AudioSync[index] == DVDNAVAudioSyncNone {
 			if uint64(vobu.StartPTM) >= end {
 				break
 			}
-			vobu.AudioSync = dvdAudioSyncOffset(sector, vobu.StartSector)
+			vobu.AudioSync[index] = dvdAudioSyncOffset(sector, vobu.StartSector)
 		}
-		m.syncPending++
+		audio.syncPending++
 	}
 	// A later VOBU starts at most a few packs behind the audio, so a short
 	// history is enough to find the pack presented at its start.
 	const history = 1024
-	if len(m.recentAudio) >= history {
-		m.recentAudio = slices.Delete(m.recentAudio, 0, history/2)
+	if len(audio.recent) >= history {
+		audio.recent = slices.Delete(audio.recent, 0, history/2)
 	}
-	m.recentAudio = append(m.recentAudio, dvdMuxAudioPack{pts: pts, end: end, sector: sector})
-	return m.readAudio()
+	audio.recent = append(audio.recent, dvdMuxAudioPack{pts: pts, end: end, sector: sector})
+}
+
+// dvdAC3PackLayout describes the next pack of an AC-3 stream.
+type dvdAC3PackLayout struct {
+	header mpegPESHeader
+	// size is the audio data it carries, starts the number of syncframes
+	// that begin in it and lead the bytes before the first of them.
+	size, starts, lead int
+}
+
+// ac3PackLayout plans the next pack of an AC-3 stream. A pack in which a
+// syncframe begins carries the PTS of that syncframe; a pack in which none
+// does carries none, and is cut short instead of letting a syncframe begin
+// in the five bytes the PTS would have taken.
+func (m *dvdVOBMuxer) ac3PackLayout(audio *dvdMuxAudio) dvdAC3PackLayout {
+	layout := dvdAC3PackLayout{header: mpegPESHeader{streamID: dvdPrivateStream1ID}}
+	if !audio.inVOBU {
+		layout.header.pstdBuffer = dvdAC3PSTDBuffer
+	}
+	remaining := -audio.offset
+	for _, frame := range audio.queue {
+		remaining += len(frame)
+	}
+	// The first syncframe that begins in the pack, relative to its data.
+	firstStart := 0
+	if audio.offset > 0 {
+		firstStart = len(audio.queue[0]) - audio.offset
+	}
+	withPTS := layout.header
+	withPTS.hasPTS = true
+	capacity := withPTS.capacity() - dvdAC3PrivateHeaderLen
+	if firstStart < min(capacity, remaining) {
+		layout.header.hasPTS = true
+		layout.header.pts = m.ac3PTS(audio.first + int64(min(audio.offset, 1)))
+	} else {
+		capacity = min(layout.header.capacity()-dvdAC3PrivateHeaderLen, firstStart)
+	}
+	layout.size = min(capacity, remaining)
+	layout.lead = firstStart
+	for position, frame := firstStart, int64(0); position < layout.size && int(frame)+min(audio.offset, 1) < len(audio.queue); frame++ {
+		layout.starts++
+		position += len(audio.queue[int(frame)+min(audio.offset, 1)])
+	}
+	return layout
+}
+
+// writeAC3Pack sends the next pack of an AC-3 stream. Its private header
+// counts the syncframes that begin in it and points at the first: the
+// pointer counts from its own last byte, so a syncframe that directly
+// follows the header is at 1.
+func (m *dvdVOBMuxer) writeAC3Pack(index int) error {
+	audio := m.audio[index]
+	layout := m.ac3PackLayout(audio)
+	audio.inVOBU = true
+	if m.clock.after(DVDVOBSectorSize) > m.ac3PTS(audio.first)*mpegSCRExtensionRange {
+		return fmt.Errorf("video2dvd: AC-3 audio stream %d cannot reach the decoder before its presentation time", index+1)
+	}
+	payload := make([]byte, dvdAC3PrivateHeaderLen, dvdAC3PrivateHeaderLen+layout.size)
+	payload[0] = audio.substream
+	payload[1] = byte(layout.starts)
+	if layout.starts > 0 {
+		binary.BigEndian.PutUint16(payload[2:4], uint16(layout.lead+1))
+	}
+	firstPTS := m.ac3PTS(audio.first + int64(min(audio.offset, 1)))
+	lastStart := audio.first + int64(min(audio.offset, 1)) + int64(layout.starts) - 1
+	for need := layout.size; need > 0; {
+		frame := audio.queue[0]
+		count := min(need, len(frame)-audio.offset)
+		payload = append(payload, frame[audio.offset:audio.offset+count]...)
+		// The bytes stay in the decoder's buffer until their syncframe is
+		// presented.
+		audio.buffer = append(audio.buffer, dvdMuxBufferedPicture{frame: audio.first, dts: m.ac3PTS(audio.first) * mpegSCRExtensionRange, bytes: count})
+		audio.buffered += count
+		audio.offset += count
+		need -= count
+		if audio.offset == len(frame) {
+			audio.queue = audio.queue[1:]
+			audio.first++
+			audio.offset = 0
+		}
+	}
+	header := layout.header
+	sector := uint32(m.sector)
+	if err := m.writePack(func(scr uint64) ([]byte, error) {
+		return buildMPEGPESPack(scr, defaultProgramMuxRate/50, header, payload)
+	}); err != nil {
+		return err
+	}
+	if layout.starts > 0 {
+		m.recordAudioPack(index, firstPTS, m.ac3PTS(lastStart)+ac3SyncFrameTicks, sector)
+	}
+	return m.readAudio(audio)
 }
 
 // writeSubtitlePack sends the next pack of a subtitle stream. The first pack
@@ -891,7 +1156,6 @@ func (m *dvdVOBMuxer) startVOBU(picture *dvdMuxPicture) error {
 		EndPTM:        uint32(start),
 		CellID:        1,
 		ReferenceEnds: [3]uint32{math.MaxUint32, math.MaxUint32, math.MaxUint32},
-		AudioSync:     DVDNAVAudioSyncNone,
 	}
 	elapsed := start - m.startTime()
 	if index < len(m.highlights) {
@@ -907,14 +1171,18 @@ func (m *dvdVOBMuxer) startVOBU(picture *dvdMuxPicture) error {
 	if err != nil {
 		return err
 	}
-	for len(m.recentAudio) > 0 && m.recentAudio[0].end <= start {
-		m.recentAudio = m.recentAudio[1:]
-	}
-	if len(m.recentAudio) > 0 && m.recentAudio[0].pts <= start {
-		vobu.AudioSync = dvdAudioSyncOffset(m.recentAudio[0].sector, vobu.StartSector)
+	for index, audio := range m.audio {
+		vobu.AudioSync[index] = DVDNAVAudioSyncNone
+		for len(audio.recent) > 0 && audio.recent[0].end <= start {
+			audio.recent = audio.recent[1:]
+		}
+		if len(audio.recent) > 0 && audio.recent[0].pts <= start {
+			vobu.AudioSync[index] = dvdAudioSyncOffset(audio.recent[0].sector, vobu.StartSector)
+		}
+		audio.inVOBU = false
 	}
 	m.vobus = append(m.vobus, vobu)
-	m.vobuHasVideo, m.vobuHasAudio = false, false
+	m.vobuHasVideo = false
 	for _, subtitle := range m.subtitles {
 		subtitle.inVOBU = false
 	}
@@ -997,7 +1265,7 @@ func (m *dvdVOBMuxer) buildNAVPack(index int) ([]byte, error) {
 		VOBStartPTM:               m.plan[0].StartPTM,
 		VOBEndPTM:                 m.plan[len(m.plan)-1].EndPTM,
 		CellElapsedTime:           vobu.CellElapsed,
-		AudioSync:                 [8]uint16{vobu.AudioSync},
+		AudioSync:                 vobu.AudioSync,
 	}
 	if index < len(m.highlights) {
 		highlight := m.highlights[index]
