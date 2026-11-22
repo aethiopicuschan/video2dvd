@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/rcarmo/go-264/audio/pcm"
+	"github.com/aethiopicuschan/go-264/audio/pcm"
 )
 
 type ExportAACPCMFileSource = aacPCMFileSource

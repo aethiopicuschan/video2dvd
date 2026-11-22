@@ -5,3 +5,5 @@
 - `x-image-LICENSE.txt`: [golang.org/x/image v0.48.0](https://pkg.go.dev/golang.org/x/image), whose `font/sfnt` package reads the TrueType or OpenType font of `Options.MenuFont`. Licensed under the BSD 3-Clause License. The same license, with the same text, covers [golang.org/x/text](https://pkg.go.dev/golang.org/x/text), which `font/sfnt` uses.
 
 The `go-vp9` module was already a dependency of this project and is now used for both supported VP9 profiles. Its BSD 2-Clause license and attribution notice are distributed with the module source; this project does not copy its implementation into this repository.
+
+The H.264, AAC and AC-3 decoders come from [github.com/aethiopicuschan/go-264](https://github.com/aethiopicuschan/go-264), a fork of [github.com/rcarmo/go-264](https://github.com/rcarmo/go-264) that adds multichannel AAC-LC decoding (proposed upstream in [rcarmo/go-264#26](https://github.com/rcarmo/go-264/pull/26)) and is otherwise the upstream code under its own module path. It is licensed under the MIT License, whose text and copyright notice are distributed with the module source; this project does not copy its implementation into this repository.

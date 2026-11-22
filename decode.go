@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
-	pcmdecoder "github.com/rcarmo/go-264/audio"
-	"github.com/rcarmo/go-264/audio/pcm"
-	h264decode "github.com/rcarmo/go-264/decode"
-	h264frame "github.com/rcarmo/go-264/frame"
+	pcmdecoder "github.com/aethiopicuschan/go-264/audio"
+	"github.com/aethiopicuschan/go-264/audio/pcm"
+	h264decode "github.com/aethiopicuschan/go-264/decode"
+	h264frame "github.com/aethiopicuschan/go-264/frame"
 )
 
 const maxCompressedAccessUnit = 64 << 20
@@ -155,7 +155,12 @@ func DecodeMP4Video(ctx context.Context, path string, trackIndex *int, handler f
 // edit becomes silence and the first media edit's start and length are applied
 // rounded to whole samples. Later edits are not applied.
 //
-// AAC must be mono or stereo. AC-3 with more channels is downmixed by the
+// AAC-LC with channel configurations 3 to 7 is downmixed to stereo by the
+// go-264 decoder with the ITU-R BS.775 coefficients (centre and surround at
+// -3 dB, LFE discarded, normalized so that it cannot clip); AAC whose
+// channels a program config element describes is not decoded, and the
+// AAC-LC fallback decoder handles mono and stereo only. AC-3 with more
+// channels is downmixed by the
 // go-264 decoder with the stream's own centre and surround mix levels (cmixlev,
 // surmixlev), LFE discarded, scaled down by the larger output's coefficient sum
 // so that it cannot clip. At the -3 dB levels this is the ITU-R BS.775 downmix

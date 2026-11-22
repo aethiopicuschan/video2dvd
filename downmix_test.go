@@ -133,7 +133,11 @@ func TestValidateInputAudioChannelsMultichannel(t *testing.T) {
 		{"Opus head overrides the container", TrackInfo{Codec: "opus", Channels: 2, CodecConfig: testMultichannelOpusHead(6, 255, 6, 0, []byte{0, 1, 2, 3, 4, 5})}, "mapping family 255"},
 		{"ambisonic Opus", TrackInfo{Codec: "opus", Channels: 4, CodecConfig: testMultichannelOpusHead(4, 2, 4, 0, []byte{0, 1, 2, 3})}, "mapping family 2"},
 		{"Opus without a header", TrackInfo{Codec: "opus", Channels: 6}, "6-channel Opus audio cannot be downmixed"},
-		{"5.1 AAC", TrackInfo{Codec: "mp4a", Channels: 2, CodecConfig: []byte{0x11, 0xb0}}, "6-channel AAC audio is not supported"},
+		{"5.1 AAC-LC", TrackInfo{Codec: "mp4a", Channels: 2, CodecConfig: []byte{0x11, 0xb0}}, ""},
+		{"7.1 AAC-LC", TrackInfo{Codec: "mp4a", Channels: 2, CodecConfig: []byte{0x11, 0xb8}}, ""},
+		{"AAC with a program config element", TrackInfo{Codec: "mp4a", Channels: 6, CodecConfig: []byte{0x11, 0x80}}, "program config element"},
+		{"5.1 HE-AAC", TrackInfo{Codec: "mp4a", Channels: 6, CodecConfig: []byte{0x2b, 0x30}}, "object type 5"},
+		{"AAC channel configuration 11", TrackInfo{Codec: "mp4a", Channels: 7, CodecConfig: []byte{0x11, 0xd8}}, "channel configuration 11"},
 		{"5.1 AC-3", TrackInfo{Codec: "ac-3", Channels: 6}, ""},
 	}
 	for _, c := range cases {

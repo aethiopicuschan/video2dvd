@@ -1,11 +1,11 @@
+github.com/aethiopicuschan/go-264 v0.1.0 h1:iAmMxmP/bSD+MsxyPP0Fp7UfEGLqCfGGpz3LKq8NK0I=
+github.com/aethiopicuschan/go-264 v0.1.0/go.mod h1:gwDNcjV23TeDIzydgKUamkvgkNmKXJ/T0lQadX9freQ=
 github.com/aethiopicuschan/go-vp9 v0.0.0-20261121015925-4aa516dbdfd3 h1:+IyWVWX+GzVf08GdkNbnHa2ilUm5FcPfz0aAUxGXTYQ=
 github.com/aethiopicuschan/go-vp9 v0.0.0-20261121015925-4aa516dbdfd3/go.mod h1:00alyc82DTPTC8zwGk9kM2u1r8FP/WSiFWXdWAMbP7s=
 github.com/arabian9ts/aac-go v0.1.0 h1:e298pHWu+Xcv6VPU2hmS1UTmOq5C9KHD38eQcJR4K8c=
 github.com/arabian9ts/aac-go v0.1.0/go.mod h1:nQwjBOjeee+zm6JSmEd9yk1uUoyYFrvhJXYnWDsNXpU=
 github.com/deploymenttheory/go-sdk-winmediafoundry v0.8.0 h1:WzDwjZY/Vz3VCJBJ5kjonavRWmyEukgr3QRl56L6lLQ=
 github.com/deploymenttheory/go-sdk-winmediafoundry v0.8.0/go.mod h1:j6ONF9OAZUEPOA4bHc64tdhJbkNJv4G4/wOja3w4tUs=
-github.com/rcarmo/go-264 v0.0.0-20260913215118-afd03f5c69ed h1:pyW5AHeXClSDg7tw3Jd4TMLC4yGmW7tpQsMD7RtGpck=
-github.com/rcarmo/go-264 v0.0.0-20260913215118-afd03f5c69ed/go.mod h1:DfT0hsjYj65x9Y1WRU9gNO/yvZZlvCorI8t4gQxQMX4=
 github.com/thesyncim/goav v0.0.0-20261021065620-74e15627cd11 h1:G2j81zaBALgictQMbuD+ps+/P82iSTS9tvCCT41bYCk=
 github.com/thesyncim/goav v0.0.0-20261021065620-74e15627cd11/go.mod h1:ICfAxq0XvxGaJjUFD7deTm/lctQ8DDCpXNek4Js9ono=
 github.com/thesyncim/goav1 v0.0.0-20261017161534-cf11a8d2fa8c h1:Y6f8Qx3j5wCUFGEjmNlvpiGmmRrrpuJKscnIUSQz81k=

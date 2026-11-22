@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	mp4audio "github.com/rcarmo/go-264/audio/mp4"
+	mp4audio "github.com/aethiopicuschan/go-264/audio/mp4"
 )
 
 // These optional full-file regressions use user-supplied media and keep those

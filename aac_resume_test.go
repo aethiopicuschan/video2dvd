@@ -15,7 +15,7 @@ import (
 
 	. "github.com/aethiopicuschan/video2dvd"
 
-	"github.com/rcarmo/go-264/audio/pcm"
+	"github.com/aethiopicuschan/go-264/audio/pcm"
 )
 
 // errAlignmentPadding has the shape of the primary decoder's rejection as

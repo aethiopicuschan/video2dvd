@@ -223,9 +223,10 @@ func TestTitleLengthFromFrames(t *testing.T) {
 }
 
 func TestValidateInputAudioChannels(t *testing.T) {
-	// AAC-LC, 48 kHz, channel configuration 6 (5.1) and 2 (stereo).
-	if err := ExportValidateInputAudioChannels(TrackInfo{Codec: "mp4a", Channels: 2, CodecConfig: []byte{0x11, 0xb0}}); err == nil {
-		t.Fatal("5.1 AAC must be rejected")
+	// AAC-LC, 48 kHz: six channels described by a program config element
+	// (channel configuration 0) are refused, stereo is accepted.
+	if err := ExportValidateInputAudioChannels(TrackInfo{Codec: "mp4a", Channels: 6, CodecConfig: []byte{0x11, 0x80}}); err == nil {
+		t.Fatal("AAC with a program config element must be rejected")
 	}
 	if err := ExportValidateInputAudioChannels(TrackInfo{Codec: "mp4a", Channels: 2, CodecConfig: []byte{0x11, 0x90}}); err != nil {
 		t.Fatal(err)

@@ -152,7 +152,7 @@ type Options struct {
 	// IncludeAllAudio records every audio track of an input that the
 	// built-in decoders read, up to the 8 audio streams of a title, for
 	// each input whose MediaInput.AudioTracks and AudioTrackIndex are nil;
-	// tracks they cannot decode, such as multichannel AAC, are skipped. The track that
+	// tracks they cannot decode, such as AAC with a program config element, are skipped. The track that
 	// carries a default mark (or else the first) becomes audio stream 1,
 	// which players start with; the others follow in track order. Each
 	// stream is labelled with its track's language (see DVDLanguageCode).

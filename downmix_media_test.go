@@ -223,8 +223,41 @@ func TestDecodeMP4AudioDownmixesAC3Layouts(t *testing.T) {
 	}
 }
 
-// The encoder turns a WebM with 5.1 Opus into DVD LPCM carrying the same
-// downmix, and still refuses 5.1 AAC with a message naming the codec.
+// AAC-LC with channel configurations 3 to 7 is downmixed by the go-264
+// decoder with the BS.775 coefficients; 5.1(side), which ffmpeg describes
+// with a program config element, is refused before encoding.
+func TestDecodeMP4AudioDownmixesMultichannelAAC(t *testing.T) {
+	aac := []string{"-c:a", "aac", "-b:a", "512k"}
+	sources := []downmixSource{
+		downmixSource51,
+		{"5.0", []string{"FL", "FR", "FC", "BL", "BR"}, []float64{440, 620, 830, 1050, 1290}},
+		{"3.0", []string{"FL", "FR", "FC"}, []float64{440, 620, 830}},
+	}
+	for _, source := range sources {
+		path := makeDownmixInput(t, "tones-"+source.layout+".mp4", source, true, downmixToneAmplitude, aac...)
+		checkDownmixTones(t, decodeDownmixStereo(t, path, false), source, bs775, bs775)
+	}
+	// AAC's own coding error lets the loud in-phase source overshoot its
+	// level by a few percent, so this only checks that nothing clips.
+	peak := 0
+	for _, sample := range decodeDownmixStereo(t, makeDownmixInput(t, "loud.mp4", downmixSource51, false, 0.9, aac...), false) {
+		peak = max(peak, int(math.Abs(float64(sample))))
+	}
+	if peak >= 32767 || float64(peak) < 0.85*0.9*32768 {
+		t.Fatalf("downmix peak %d, want about %.0f without clipping", peak, 0.9*32768)
+	}
+	side := downmixSource{"5.1(side)", []string{"FL", "FR", "FC", "LFE", "SL", "SR"}, []float64{440, 620, 830, 70, 1050, 1290}}
+	info, err := ProbeMedia(makeDownmixInput(t, "side.mp4", side, true, downmixToneAmplitude, aac...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ExportValidateInputAudioChannels(info.Tracks[0]); err == nil || !strings.Contains(err.Error(), "program config element") {
+		t.Fatalf("5.1(side) AAC error %v, want the program config element rejection", err)
+	}
+}
+
+// The encoder turns a WebM with 5.1 Opus and an MP4 with 5.1 AAC into DVD
+// LPCM carrying the same downmix.
 func TestEncodeStreamsDownmixes51Opus(t *testing.T) {
 	ffmpeg, err := exec.LookPath("ffmpeg")
 	if err != nil {
@@ -262,8 +295,17 @@ func TestEncodeStreamsDownmixes51Opus(t *testing.T) {
 	checkDownmixTones(t, samples, downmixSource51, bs775, bs775)
 
 	aac := makeDownmixInput(t, "audio.mp4", downmixSource51, true, downmixToneAmplitude, "-c:a", "aac", "-b:a", "384k")
-	_, err = NewInProcessEncoder().EncodeStreams(context.Background(), MediaInput{VideoPath: video, AudioPath: aac}, filepath.Join(dir, "work-aac"), profile)
-	if err == nil || !strings.Contains(err.Error(), "6-channel AAC audio is not supported") {
-		t.Fatalf("5.1 AAC error %v, want the AAC channel rejection", err)
+	workAAC := filepath.Join(dir, "work-aac")
+	title, err = NewInProcessEncoder().EncodeStreams(context.Background(), MediaInput{VideoPath: video, AudioPath: aac}, workAAC, profile)
+	if err != nil {
+		t.Fatalf("5.1 AAC: %v", err)
 	}
+	if data, err = os.ReadFile(filepath.Join(workAAC, title.AudioPath)); err != nil {
+		t.Fatal(err)
+	}
+	samples = make([]int16, len(data)/2)
+	for i := range samples {
+		samples[i] = int16(binary.BigEndian.Uint16(data[i*2:]))
+	}
+	checkDownmixTones(t, samples, downmixSource51, bs775, bs775)
 }

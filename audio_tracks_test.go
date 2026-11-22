@@ -272,21 +272,22 @@ func TestConvertSeveralAC3Streams(t *testing.T) {
 	}
 }
 
-// Tracks the decoders cannot downmix, such as 5.1 AAC, are passed over by
+// Tracks the decoders cannot downmix, such as AAC whose channels a program
+// config element describes, are passed over by
 // the automatic choices instead of failing the input; an explicit request
 // for one still fails.
 func TestAutomaticAudioChoiceSkipsUndecodableTracks(t *testing.T) {
 	stereo := TrackInfo{Index: 1, Kind: TrackKindAudio, Codec: "mp4a", Channels: 2, CodecConfig: []byte{0x11, 0x90}}
-	surround := TrackInfo{Index: 2, Kind: TrackKindAudio, Codec: "mp4a", Channels: 6, CodecConfig: []byte{0x11, 0xb0}, Default: true}
+	surround := TrackInfo{Index: 2, Kind: TrackKindAudio, Codec: "mp4a", Channels: 6, CodecConfig: []byte{0x11, 0x80}, Default: true}
 	info := MP4Info{Tracks: []TrackInfo{{Index: 0, Kind: TrackKindVideo, Codec: "avc1"}, stereo, surround}}
 	if track, ok := ExportFirstSupportedAudioTrack(info, nil); !ok || track.Index != 1 {
-		t.Fatalf("chose track %d, want the stereo track 1 over the marked 5.1 track", track.Index)
+		t.Fatalf("chose track %d, want the stereo track 1 over the marked undecodable track", track.Index)
 	}
 	if tracks, err := ExportSelectInputAudioTracks(info, nil, true); err != nil || !slices.Equal(tracks, []int{1}) {
 		t.Fatalf("all tracks %v (%v), want [1]", tracks, err)
 	}
 	if _, err := ExportSelectInputAudioTracks(info, []int{2}, false); err == nil {
-		t.Fatal("an explicit request for 5.1 AAC was accepted")
+		t.Fatal("an explicit request for AAC with a program config element was accepted")
 	}
 }
 

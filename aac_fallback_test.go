@@ -10,8 +10,8 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/aethiopicuschan/go-264/audio/pcm"
 	"github.com/arabian9ts/aac-go/adts"
-	"github.com/rcarmo/go-264/audio/pcm"
 )
 
 func TestMakeAACADTSHeaderFromMP4AudioSpecificConfig(t *testing.T) {

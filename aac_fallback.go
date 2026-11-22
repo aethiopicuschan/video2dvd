@@ -10,11 +10,11 @@ import (
 	"os"
 	"time"
 
+	"github.com/aethiopicuschan/go-264/audio/convert"
+	mp4audio "github.com/aethiopicuschan/go-264/audio/mp4"
+	"github.com/aethiopicuschan/go-264/audio/pcm"
+	"github.com/aethiopicuschan/go-264/audio/resample"
 	aac "github.com/arabian9ts/aac-go"
-	"github.com/rcarmo/go-264/audio/convert"
-	mp4audio "github.com/rcarmo/go-264/audio/mp4"
-	"github.com/rcarmo/go-264/audio/pcm"
-	"github.com/rcarmo/go-264/audio/resample"
 )
 
 const aacFallbackDecodedFramesPerSample = 1024

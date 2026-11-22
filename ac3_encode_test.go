@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/rcarmo/go-264/audio/ac3"
+	"github.com/aethiopicuschan/go-264/audio/ac3"
 
 	. "github.com/aethiopicuschan/video2dvd"
 )

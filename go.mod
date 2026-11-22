@@ -3,10 +3,10 @@ module github.com/aethiopicuschan/video2dvd
 go 1.27.4
 
 require (
+	github.com/aethiopicuschan/go-264 v0.1.0
 	github.com/aethiopicuschan/go-vp9 v0.0.0-20261121015925-4aa516dbdfd3
 	github.com/arabian9ts/aac-go v0.1.0
 	github.com/deploymenttheory/go-sdk-winmediafoundry v0.8.0
-	github.com/rcarmo/go-264 v0.0.0-20260913215118-afd03f5c69ed
 	github.com/thesyncim/goav v0.0.0-20261021065620-74e15627cd11
 	github.com/thesyncim/gopus v0.2.3-0.20261017175526-c210548e8a92
 	github.com/thesyncim/govpx v0.0.0-20261017170224-928b4e082477

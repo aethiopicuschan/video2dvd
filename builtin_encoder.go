@@ -457,25 +457,36 @@ func titleLengthFromFields(fields int64, fpsN, fpsD int) (time.Duration, int64, 
 
 // validateInputAudioChannels rejects layouts the built-in decoders cannot
 // decode to stereo before any video is encoded. AC-3 is decoded and
-// downmixed by go-264 for every acmod, with or without LFE. Opus with more
-// than two channels is downmixed when it uses channel mapping family 1. The
-// pure-Go AAC decoders (go-264 and aac-go) only parse mono and stereo
-// channel configurations, so multichannel AAC stays rejected.
+// downmixed by go-264 for every acmod, with or without LFE, and so is AAC-LC
+// with channel configurations 3 to 7 (from 3.0 to 7.1). AAC whose channels
+// are described by a program config element (channel configuration 0, which
+// ffmpeg writes for layouts such as 5.1(side)) and multichannel HE-AAC are
+// refused, as go-264 cannot decode them. Opus with more than two channels is
+// downmixed when it uses channel mapping family 1.
 func validateInputAudioChannels(track TrackInfo) error {
 	switch track.Codec {
 	case "mp4a":
-		channels := track.Channels
+		channels, objectType, configuration := track.Channels, 0, -1
 		if len(track.CodecConfig) >= 2 {
 			// The AudioSpecificConfig is authoritative; the sample entry's
 			// channel count is often left at 2.
-			objectType := track.CodecConfig[0] >> 3
+			objectType = int(track.CodecConfig[0] >> 3)
 			frequencyIndex := (track.CodecConfig[0]&0x07)<<1 | track.CodecConfig[1]>>7
-			if configured := int(track.CodecConfig[1]>>3) & 0x0f; configured != 0 && objectType != 31 && frequencyIndex != 15 {
-				channels = configured
+			if objectType != 31 && frequencyIndex != 15 {
+				configuration = int(track.CodecConfig[1]>>3) & 0x0f
+				if configuration != 0 {
+					channels = map[int]int{1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 8}[configuration]
+				}
 			}
 		}
-		if channels > 2 {
-			return fmt.Errorf("video2dvd: prepare DVD audio: %d-channel AAC audio is not supported by the built-in AAC decoder (mono or stereo only; multichannel AC-3 and Opus are downmixed)", channels)
+		switch {
+		case configuration > 7:
+			return fmt.Errorf("video2dvd: prepare DVD audio: AAC channel configuration %d is not supported by the built-in AAC decoder (1 to 7 are)", configuration)
+		case channels <= 2:
+		case configuration == 0:
+			return fmt.Errorf("video2dvd: prepare DVD audio: %d-channel AAC audio described by a program config element is not supported by the built-in AAC decoder (channel configurations 1 to 7 are)", channels)
+		case objectType != 2:
+			return fmt.Errorf("video2dvd: prepare DVD audio: %d-channel AAC audio of object type %d is not supported by the built-in AAC decoder (multichannel AAC must be AAC-LC)", channels, objectType)
 		}
 	case "opus":
 		if opusTrackChannels(track) <= 2 {
@@ -528,7 +539,7 @@ func firstSupportedAudioTrack(info MP4Info, requested *int) (TrackInfo, bool) {
 		return TrackInfo{}, false
 	}
 	// The default-marked track is only preferred when it can be decoded,
-	// so that a file whose marked track is multichannel AAC still converts
+	// so that a file whose marked track cannot be downmixed still converts
 	// with another one; when no track can, the first supported one is
 	// returned and its validation explains why.
 	if track, ok := selectDefaultTrack(info, func(track TrackInfo) bool {
